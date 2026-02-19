@@ -1,0 +1,246 @@
+using MsDos.Core.Cpu;
+using MsDos.Core.Memory;
+
+namespace MsDos.Tests;
+
+public class Cpu8086Tests
+{
+    private readonly MemoryBus _mem = new();
+    private readonly Cpu8086 _cpu;
+
+    public Cpu8086Tests()
+    {
+        _cpu = new Cpu8086(_mem);
+        // Set up for COM file execution at segment 0x1000
+        _cpu.Regs.CS = 0x1000;
+        _cpu.Regs.DS = 0x1000;
+        _cpu.Regs.ES = 0x1000;
+        _cpu.Regs.SS = 0x1000;
+        _cpu.Regs.SP = 0xFFFE;
+        _cpu.Regs.IP = 0x0100;
+        _cpu.Regs.Flags = CpuFlags.Interrupt;
+    }
+
+    private void LoadCode(params byte[] code)
+    {
+        _mem.LoadData(_cpu.Regs.CS, _cpu.Regs.IP, code);
+    }
+
+    [Fact]
+    public void Nop_DoesNotChangeState()
+    {
+        LoadCode(0x90); // NOP
+        ushort origIP = _cpu.Regs.IP;
+        _cpu.Step();
+        Assert.Equal((ushort)(origIP + 1), _cpu.Regs.IP);
+    }
+
+    [Fact]
+    public void MovRegImm16_LoadsValue()
+    {
+        LoadCode(0xB8, 0x34, 0x12); // MOV AX, 0x1234
+        _cpu.Step();
+        Assert.Equal((ushort)0x1234, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void MovRegImm8_LoadsValue()
+    {
+        LoadCode(0xB0, 0x42); // MOV AL, 0x42
+        _cpu.Step();
+        Assert.Equal(0x42, _cpu.Regs.AL);
+    }
+
+    [Fact]
+    public void AddRegImm_ComputesSum()
+    {
+        _cpu.Regs.AX = 0x0010;
+        LoadCode(0x05, 0x20, 0x00); // ADD AX, 0x0020
+        _cpu.Step();
+        Assert.Equal((ushort)0x0030, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void SubRegImm_ComputesDifference()
+    {
+        _cpu.Regs.AX = 0x0050;
+        LoadCode(0x2D, 0x20, 0x00); // SUB AX, 0x0020
+        _cpu.Step();
+        Assert.Equal((ushort)0x0030, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void Cmp_SetsZeroFlag()
+    {
+        _cpu.Regs.AX = 0x0042;
+        LoadCode(0x3D, 0x42, 0x00); // CMP AX, 0x0042
+        _cpu.Step();
+        Assert.True((_cpu.Regs.Flags & CpuFlags.Zero) != 0);
+    }
+
+    [Fact]
+    public void Cmp_ClearsZeroFlagWhenNotEqual()
+    {
+        _cpu.Regs.AX = 0x0042;
+        LoadCode(0x3D, 0x43, 0x00); // CMP AX, 0x0043
+        _cpu.Step();
+        Assert.False((_cpu.Regs.Flags & CpuFlags.Zero) != 0);
+    }
+
+    [Fact]
+    public void JmpShort_ChangesIP()
+    {
+        LoadCode(0xEB, 0x05); // JMP short +5
+        ushort expectedIP = (ushort)(_cpu.Regs.IP + 2 + 5);
+        _cpu.Step();
+        Assert.Equal(expectedIP, _cpu.Regs.IP);
+    }
+
+    [Fact]
+    public void Jz_JumpsWhenZero()
+    {
+        _cpu.Regs.Flags |= CpuFlags.Zero;
+        LoadCode(0x74, 0x04); // JZ +4
+        ushort expectedIP = (ushort)(_cpu.Regs.IP + 2 + 4);
+        _cpu.Step();
+        Assert.Equal(expectedIP, _cpu.Regs.IP);
+    }
+
+    [Fact]
+    public void Jz_DoesNotJumpWhenNotZero()
+    {
+        _cpu.Regs.Flags &= ~CpuFlags.Zero;
+        LoadCode(0x74, 0x04); // JZ +4
+        ushort expectedIP = (ushort)(_cpu.Regs.IP + 2);
+        _cpu.Step();
+        Assert.Equal(expectedIP, _cpu.Regs.IP);
+    }
+
+    [Fact]
+    public void PushPop_PreservesValue()
+    {
+        _cpu.Regs.AX = 0xBEEF;
+        LoadCode(
+            0x50,       // PUSH AX
+            0x31, 0xC0, // XOR AX, AX
+            0x58        // POP AX
+        );
+        _cpu.Step(); // PUSH
+        _cpu.Step(); // XOR AX, AX
+        Assert.Equal((ushort)0, _cpu.Regs.AX);
+        _cpu.Step(); // POP AX
+        Assert.Equal((ushort)0xBEEF, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void XorRegReg_ZerosRegister()
+    {
+        _cpu.Regs.AX = 0x1234;
+        LoadCode(0x31, 0xC0); // XOR AX, AX
+        _cpu.Step();
+        Assert.Equal((ushort)0, _cpu.Regs.AX);
+        Assert.True((_cpu.Regs.Flags & CpuFlags.Zero) != 0);
+    }
+
+    [Fact]
+    public void IncDec_ModifiesValue()
+    {
+        _cpu.Regs.AX = 0x0005;
+        LoadCode(0x40, 0x48); // INC AX, DEC AX
+        _cpu.Step();
+        Assert.Equal((ushort)0x0006, _cpu.Regs.AX);
+        _cpu.Step();
+        Assert.Equal((ushort)0x0005, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void CallRet_ReturnsToCorrectAddress()
+    {
+        // CALL +3, which skips to NOP, NOP, NOP, then RET
+        LoadCode(
+            0xE8, 0x03, 0x00, // CALL +3 (jumps to offset 0x0106)
+            0x90,              // NOP (return point = 0x0103)
+            0x90,              // NOP
+            0x90,              // NOP
+            0xC3               // RET (at 0x0106)
+        );
+        ushort returnAddr = (ushort)(_cpu.Regs.IP + 3); // After CALL instruction
+        _cpu.Step(); // CALL
+        Assert.Equal((ushort)0x0106, _cpu.Regs.IP);
+        _cpu.Step(); // RET
+        Assert.Equal(returnAddr, _cpu.Regs.IP);
+    }
+
+    [Fact]
+    public void Loop_DecrementsAndJumps()
+    {
+        _cpu.Regs.CX = 3;
+        _cpu.Regs.AX = 0;
+        LoadCode(
+            0x40,       // INC AX (at 0x0100)
+            0xE2, 0xFD  // LOOP -3 (back to 0x0100)
+        );
+        for (int i = 0; i < 6; i++) _cpu.Step(); // 3 iterations of INC + LOOP
+        Assert.Equal((ushort)3, _cpu.Regs.AX);
+        Assert.Equal((ushort)0, _cpu.Regs.CX);
+    }
+
+    [Fact]
+    public void Hlt_StopsCpu()
+    {
+        LoadCode(0xF4); // HLT
+        _cpu.Step();
+        Assert.True(_cpu.IsHalted);
+    }
+
+    [Fact]
+    public void MovMemory_WritesAndReads()
+    {
+        // MOV [0x0200], AX  then  MOV BX, [0x0200]
+        _cpu.Regs.AX = 0xCAFE;
+        LoadCode(
+            0xA3, 0x00, 0x02, // MOV [0x0200], AX
+            0x8B, 0x1E, 0x00, 0x02 // MOV BX, [0x0200]
+        );
+        _cpu.Step(); // MOV [0x0200], AX
+        _cpu.Step(); // MOV BX, [0x0200]
+        Assert.Equal((ushort)0xCAFE, _cpu.Regs.BX);
+    }
+
+    [Fact]
+    public void Lea_LoadsEffectiveAddress()
+    {
+        _cpu.Regs.BX = 0x0010;
+        _cpu.Regs.SI = 0x0005;
+        LoadCode(0x8D, 0x00); // LEA AX, [BX+SI]
+        _cpu.Step();
+        Assert.Equal((ushort)0x0015, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void ShlShr_ShiftsCorrectly()
+    {
+        _cpu.Regs.AX = 0x0001;
+        LoadCode(
+            0xD1, 0xE0, // SHL AX, 1
+            0xD1, 0xE0, // SHL AX, 1
+            0xD1, 0xE8  // SHR AX, 1
+        );
+        _cpu.Step(); // AX = 2
+        Assert.Equal((ushort)2, _cpu.Regs.AX);
+        _cpu.Step(); // AX = 4
+        Assert.Equal((ushort)4, _cpu.Regs.AX);
+        _cpu.Step(); // AX = 2
+        Assert.Equal((ushort)2, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void Int_TriggersInterruptHandler()
+    {
+        byte triggeredVector = 0;
+        _cpu.InterruptTriggered += v => triggeredVector = v;
+        LoadCode(0xCD, 0x21); // INT 21h
+        _cpu.Step();
+        Assert.Equal(0x21, triggeredVector);
+    }
+}

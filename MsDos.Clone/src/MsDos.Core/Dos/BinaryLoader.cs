@@ -30,11 +30,11 @@ public sealed class BinaryLoader
     /// <returns>True if loaded successfully.</returns>
     public bool Load(ReadOnlySpan<byte> data, ushort loadSegment = DefaultLoadSegment)
     {
-        if (data.Length < 2)
+        if (data.Length < 1)
             return false;
 
-        // Check for MZ (EXE) header
-        if (data[0] == 0x4D && data[1] == 0x5A)
+        // Check for MZ (EXE) header - need at least 2 bytes
+        if (data.Length >= 2 && data[0] == 0x4D && data[1] == 0x5A)
             return LoadExe(data, loadSegment);
 
         return LoadCom(data, loadSegment);

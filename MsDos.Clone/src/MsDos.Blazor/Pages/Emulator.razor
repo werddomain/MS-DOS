@@ -1,0 +1,144 @@
+@page "/"
+@using MsDos.Core
+@using MsDos.Blazor.Platform
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div class="dos-emulator">
+    <div class="toolbar">
+        <h3>MS-DOS Emulator (.NET WebAssembly)</h3>
+        <div class="controls">
+            <InputFile OnChange="OnFileSelected" accept=".com,.exe,.COM,.EXE" />
+            <button class="btn btn-primary" @onclick="OnReset" disabled="@(!_loaded)">Reset</button>
+            <button class="btn btn-danger" @onclick="OnStop" disabled="@(!_running)">Stop</button>
+        </div>
+    </div>
+
+    <div class="screen-container" @onkeydown="OnKeyDown" @onkeyup="OnKeyUp"
+         @onkeydown:preventDefault @onkeyup:preventDefault tabindex="0" @ref="_containerRef">
+        <canvas id="dosCanvas" width="640" height="400"></canvas>
+    </div>
+
+    <div class="status-bar">
+        <span>@_statusText</span>
+    </div>
+</div>
+
+@code {
+    private ElementReference _containerRef;
+    private DosMachine? _machine;
+    private BlazorCanvasRenderer? _renderer;
+    private BlazorEventRegistry? _events;
+    private BlazorStreamProvider? _streams;
+    private CancellationTokenSource? _cts;
+    private bool _loaded;
+    private bool _running;
+    private string _statusText = "Ready - Upload a COM or EXE file to start";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await JS.InvokeVoidAsync("dosRenderer.init", "dosCanvas");
+            InitializeMachine();
+            await _containerRef.FocusAsync();
+        }
+    }
+
+    private void InitializeMachine()
+    {
+        _renderer = new BlazorCanvasRenderer(JS);
+        _events = new BlazorEventRegistry();
+        _streams = new BlazorStreamProvider();
+
+        _machine = new DosMachine(_renderer, _events, _streams);
+        _machine.OnProcessExit += code =>
+        {
+            _running = false;
+            _statusText = $"Process exited with code {code}";
+            InvokeAsync(StateHasChanged);
+        };
+        _machine.Reset();
+    }
+
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        try
+        {
+            _cts?.Cancel();
+
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            string fileName = file.Name.ToUpperInvariant();
+
+            await _streams!.ImportBinaryAsync(fileName, data);
+
+            bool loaded = _machine!.LoadBinary(data);
+            if (!loaded)
+            {
+                _statusText = "Failed to load binary. Unsupported format.";
+                return;
+            }
+
+            _loaded = true;
+            _running = true;
+            _statusText = $"Running: {fileName}";
+            StateHasChanged();
+
+            _cts = new CancellationTokenSource();
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _machine.RunAsync(_cts.Token);
+                }
+                catch (OperationCanceledException) { }
+                finally
+                {
+                    _running = false;
+                    await InvokeAsync(StateHasChanged);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error: {ex.Message}";
+        }
+    }
+
+    private void OnReset()
+    {
+        _cts?.Cancel();
+        _machine?.Reset();
+        _running = false;
+        _statusText = "Machine reset - Upload a file to start";
+    }
+
+    private void OnStop()
+    {
+        _cts?.Cancel();
+        _machine?.Stop();
+        _running = false;
+        _statusText = "Stopped";
+    }
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        _events?.OnKeyDown(e.Key, e.Code, e.ShiftKey, e.CtrlKey, e.AltKey);
+    }
+
+    private void OnKeyUp(KeyboardEventArgs e)
+    {
+        _events?.OnKeyUp(e.Key, e.Code, e.ShiftKey, e.CtrlKey, e.AltKey);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts?.Cancel();
+        _machine?.Stop();
+    }
+}
