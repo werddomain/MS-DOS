@@ -3,7 +3,7 @@ using MsDos.WinForms.Platform;
 
 namespace MsDos.WinForms;
 
-public partial class Form1 : Form
+public partial class MainForm : Form
 {
     private DosMachine? _machine;
     private WinFormsRenderer? _renderer;
@@ -16,7 +16,7 @@ public partial class Form1 : Form
     private StatusStrip _statusBar = null!;
     private ToolStripStatusLabel _statusLabel = null!;
 
-    public Form1()
+    public MainForm()
     {
         InitializeComponent();
         SetupUI();
