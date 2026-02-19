@@ -218,7 +218,8 @@ public sealed class CommandShell
 
     private void CmdEcho(string args)
     {
-        if (string.IsNullOrEmpty(args) || args.Equals("ON", StringComparison.OrdinalIgnoreCase) || 
+        if (string.IsNullOrEmpty(args) ||
+            args.Equals("ON", StringComparison.OrdinalIgnoreCase) ||
             args.Equals("OFF", StringComparison.OrdinalIgnoreCase))
         {
             PrintLine("ECHO is on");
@@ -261,7 +262,7 @@ public sealed class CommandShell
     private void CmdTime()
     {
         var now = DateTime.Now;
-        PrintLine($"Current time is {now:hh:mm:ss.ff}");
+        PrintLine($"Current time is {now:HH:mm:ss.ff}");
     }
 
     private void CmdMem()

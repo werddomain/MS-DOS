@@ -739,12 +739,12 @@ public sealed class DosKernel
         var now = DateTime.Now;
         ushort time = (ushort)((now.Hour << 11) | (now.Minute << 5) | (now.Second / 2));
         ushort date = (ushort)(((now.Year - 1980) << 9) | (now.Month << 5) | now.Day);
-        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x16)), time);
-        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x18)), date);
+        WriteDtaWord(seg, off, 0x16, time);
+        WriteDtaWord(seg, off, 0x18, date);
 
-        // File size (0 for simplicity, or try to get real size)
-        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x1A)), 0);
-        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x1C)), 0);
+        // File size (0 for simplicity)
+        WriteDtaWord(seg, off, 0x1A, 0);
+        WriteDtaWord(seg, off, 0x1C, 0);
 
         // Filename (up to 12 chars + null, DOS 8.3 format)
         string name = Path.GetFileName(filename).ToUpperInvariant();
@@ -752,6 +752,12 @@ public sealed class DosKernel
         for (int i = 0; i < name.Length; i++)
             _mem.WriteByte(seg, (ushort)(off + 0x1E + i), (byte)name[i]);
         _mem.WriteByte(seg, (ushort)(off + 0x1E + name.Length), 0);
+    }
+
+    private void WriteDtaWord(ushort seg, ushort dtaOff, int fieldOffset, ushort value)
+    {
+        uint addr = Cpu.Registers.PhysicalAddress(seg, (ushort)(dtaOff + fieldOffset));
+        _mem.WriteWord(addr, value);
     }
 
     /// <summary>Simple wildcard pattern matching (supports * and ?).</summary>

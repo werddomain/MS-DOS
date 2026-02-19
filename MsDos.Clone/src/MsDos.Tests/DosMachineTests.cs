@@ -50,8 +50,9 @@ public class DosMachineTests
         public async Task<DosKeyEventArgs> ReadKeyAsync(CancellationToken cancellationToken = default)
         {
             await _sem.WaitAsync(cancellationToken);
-            _keys.TryDequeue(out var key);
-            return key!;
+            if (_keys.TryDequeue(out var key))
+                return key;
+            return new DosKeyEventArgs();
         }
 
         public void EnqueueKey(byte ascii, byte scanCode = 0)
