@@ -21,6 +21,7 @@ public sealed class DosMachine
     public BiosMiscService BiosMisc { get; }
     public DosKernel Dos { get; }
     public BinaryLoader Loader { get; }
+    public CommandShell Shell { get; }
 
     public IGraphicsRenderer Renderer { get; }
     public IEventRegistry Events { get; }
@@ -60,6 +61,7 @@ public sealed class DosMachine
         BiosMisc = new BiosMiscService(Cpu);
         Dos = new DosKernel(Cpu, Memory, streams, events, renderer, Video);
         Loader = new BinaryLoader(Memory, Cpu);
+        Shell = new CommandShell(Dos, Memory, Cpu, streams, events, Video, renderer);
 
         // Register interrupt handlers
         Interrupts.RegisterHandler(0x10, Video.Handle);
@@ -184,7 +186,32 @@ public sealed class DosMachine
     public void Stop()
     {
         _running = false;
+        Shell.Stop();
         _cts?.Cancel();
+    }
+
+    /// <summary>
+    /// Start the built-in command shell (COMMAND.COM emulation).
+    /// Provides a DOS prompt with DIR, TYPE, VER, CLS, and other commands.
+    /// </summary>
+    public async Task RunShellAsync(CancellationToken cancellationToken = default)
+    {
+        Reset();
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _running = true;
+
+        try
+        {
+            await Shell.RunAsync(_cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal cancellation
+        }
+        finally
+        {
+            _running = false;
+        }
     }
 
     /// <summary>Whether the machine is currently running.</summary>

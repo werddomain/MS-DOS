@@ -9,7 +9,8 @@
         <h3>MS-DOS Emulator (.NET WebAssembly)</h3>
         <div class="controls">
             <InputFile OnChange="OnFileSelected" accept=".com,.exe,.COM,.EXE" />
-            <button class="btn btn-primary" @onclick="OnReset" disabled="@(!_loaded)">Reset</button>
+            <button class="btn btn-primary" @onclick="OnStartShell" disabled="@(_running)">Shell</button>
+            <button class="btn btn-primary" @onclick="OnReset" disabled="@(!_loaded && !_running)">Reset</button>
             <button class="btn btn-danger" @onclick="OnStop" disabled="@(!_running)">Stop</button>
         </div>
     </div>
@@ -115,7 +116,42 @@
         _cts?.Cancel();
         _machine?.Reset();
         _running = false;
-        _statusText = "Machine reset - Upload a file to start";
+        _statusText = "Machine reset - Upload a file or start Shell";
+    }
+
+    private async Task OnStartShell()
+    {
+        try
+        {
+            _cts?.Cancel();
+            InitializeMachine();
+
+            _running = true;
+            _loaded = true;
+            _statusText = "Shell running (COMMAND.COM)";
+            StateHasChanged();
+
+            _cts = new CancellationTokenSource();
+            await _containerRef.FocusAsync();
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _machine!.RunShellAsync(_cts.Token);
+                }
+                catch (OperationCanceledException) { }
+                finally
+                {
+                    _running = false;
+                    await InvokeAsync(StateHasChanged);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error: {ex.Message}";
+        }
     }
 
     private void OnStop()

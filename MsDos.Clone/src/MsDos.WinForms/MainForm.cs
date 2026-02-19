@@ -35,11 +35,13 @@ public partial class MainForm : Form
         var fileMenu = new ToolStripMenuItem("&File");
         var loadComItem = new ToolStripMenuItem("&Load Binary (COM/EXE)...", null, OnLoadBinary);
         loadComItem.ShortcutKeys = Keys.Control | Keys.O;
+        var shellItem = new ToolStripMenuItem("Start &Shell (COMMAND.COM)", null, OnStartShell);
+        shellItem.ShortcutKeys = Keys.Control | Keys.S;
         var resetItem = new ToolStripMenuItem("&Reset Machine", null, OnReset);
         resetItem.ShortcutKeys = Keys.Control | Keys.R;
         var exitItem = new ToolStripMenuItem("E&xit", null, (_, _) => Close());
         exitItem.ShortcutKeys = Keys.Alt | Keys.F4;
-        fileMenu.DropDownItems.AddRange(new ToolStripItem[] { loadComItem, resetItem, new ToolStripSeparator(), exitItem });
+        fileMenu.DropDownItems.AddRange(new ToolStripItem[] { loadComItem, shellItem, new ToolStripSeparator(), resetItem, new ToolStripSeparator(), exitItem });
         _menu.Items.Add(fileMenu);
         MainMenuStrip = _menu;
         Controls.Add(_menu);
@@ -125,6 +127,22 @@ public partial class MainForm : Form
         _cts?.Cancel();
         _machine?.Reset();
         _statusLabel.Text = "Machine reset - Load a COM or EXE file to start";
+    }
+
+    private async void OnStartShell(object? sender, EventArgs e)
+    {
+        try
+        {
+            _cts?.Cancel();
+            _cts = new CancellationTokenSource();
+            _statusLabel.Text = "Shell running (COMMAND.COM)";
+            _ = _machine!.RunShellAsync(_cts.Token);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error starting shell: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)

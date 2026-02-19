@@ -35,6 +35,14 @@ public sealed class DosKernel
     public ushort DtaSegment { get; set; }
     public ushort DtaOffset { get; set; } = 0x0080;
 
+    // Current default drive (0=A, 1=B, 2=C)
+    private byte _currentDrive = 2; // C:
+
+    // FindFirst/FindNext state
+    private IReadOnlyList<string>? _findResults;
+    private int _findIndex;
+    private string _findPattern = "*.*";
+
     /// <summary>Trigger process termination from external callers (e.g., INT 20h).</summary>
     public void Terminate(byte code) => ProcessTerminated?.Invoke(code);
 
@@ -104,8 +112,13 @@ public sealed class DosKernel
                 Handle();
                 break;
 
+            case 0x0E: // Select disk
+                _currentDrive = _cpu.Regs.DL;
+                _cpu.Regs.AL = 26; // Number of logical drives
+                break;
+
             case 0x19: // Get current default drive
-                _cpu.Regs.AL = 2; // C:
+                _cpu.Regs.AL = _currentDrive;
                 break;
 
             case 0x1A: // Set DTA
@@ -224,12 +237,38 @@ public sealed class DosKernel
                 _cpu.Regs.BX = CurrentPSP;
                 break;
 
+            case 0x54: // Get verify flag
+                _cpu.Regs.AL = 0; // Verify off
+                break;
+
             case 0x56: // Rename file
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;
                 break;
 
             case 0x57: // Get/set file date/time
                 HandleFileDateTime();
+                break;
+
+            case 0x58: // Get/set memory allocation strategy
+                if (_cpu.Regs.AL == 0)
+                    _cpu.Regs.AX = 0; // First fit
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x59: // Get extended error information
+                _cpu.Regs.AX = 0; // No error
+                _cpu.Regs.BH = 0;
+                _cpu.Regs.BL = 0;
+                _cpu.Regs.CH = 0;
+                break;
+
+            case 0x36: // Get disk free space
+                HandleGetDiskFreeSpace();
+                break;
+
+            case 0x2F: // Get DTA address
+                _cpu.Regs.ES = DtaSegment;
+                _cpu.Regs.BX = DtaOffset;
                 break;
 
             default:
@@ -606,17 +645,153 @@ public sealed class DosKernel
         _cpu.Regs.Flags &= ~CpuFlags.Carry;
     }
 
+    private void HandleGetDiskFreeSpace()
+    {
+        // Return simulated 32 MB free space
+        // DL = drive number (0=default, 1=A, 2=B, 3=C, ...)
+        _cpu.Regs.AX = 64;     // Sectors per cluster
+        _cpu.Regs.BX = 1024;   // Number of available clusters
+        _cpu.Regs.CX = 512;    // Bytes per sector
+        _cpu.Regs.DX = 2048;   // Total clusters on drive
+    }
+
     private void HandleFindFirst()
     {
-        // Simplified: set carry to indicate no files found
-        _cpu.Regs.AX = 0x12; // No more files
-        _cpu.Regs.Flags |= CpuFlags.Carry;
+        string pattern = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
+        _findPattern = pattern;
+        _findIndex = 0;
+
+        try
+        {
+            // Extract directory part and filename pattern
+            string dir = "";
+            string filePattern = pattern;
+            int lastSep = pattern.LastIndexOfAny(new[] { '\\', '/' });
+            if (lastSep >= 0)
+            {
+                dir = pattern[..lastSep];
+                filePattern = pattern[(lastSep + 1)..];
+            }
+
+            var entries = _streams.ListEntriesAsync(dir).GetAwaiter().GetResult();
+
+            // Filter by pattern (simple wildcard matching)
+            _findResults = entries
+                .Where(e => MatchWildcard(filePattern, Path.GetFileName(e)))
+                .ToList();
+
+            if (_findResults.Count > 0)
+            {
+                WriteFindResult(_findResults[0]);
+                _findIndex = 1;
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            }
+            else
+            {
+                _cpu.Regs.AX = 0x12; // No more files
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+            }
+        }
+        catch
+        {
+            _cpu.Regs.AX = 0x12;
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
     }
 
     private void HandleFindNext()
     {
-        _cpu.Regs.AX = 0x12;
-        _cpu.Regs.Flags |= CpuFlags.Carry;
+        if (_findResults != null && _findIndex < _findResults.Count)
+        {
+            WriteFindResult(_findResults[_findIndex]);
+            _findIndex++;
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        else
+        {
+            _cpu.Regs.AX = 0x12;
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
+    }
+
+    /// <summary>Write a FindFirst/FindNext result to the DTA.</summary>
+    private void WriteFindResult(string filename)
+    {
+        // DTA structure (43 bytes):
+        // 00-14h: Reserved for FindNext
+        // 15h: File attribute
+        // 16h-17h: File time
+        // 18h-19h: File date
+        // 1Ah-1Dh: File size (DWORD)
+        // 1Eh-2Ah: Filename (ASCIIZ, 13 bytes)
+
+        ushort seg = DtaSegment;
+        ushort off = DtaOffset;
+
+        // Clear DTA
+        for (int i = 0; i < 43; i++)
+            _mem.WriteByte(seg, (ushort)(off + i), 0);
+
+        // File attribute (0x20 = archive)
+        _mem.WriteByte(seg, (ushort)(off + 0x15), 0x20);
+
+        // File time/date (current time)
+        var now = DateTime.Now;
+        ushort time = (ushort)((now.Hour << 11) | (now.Minute << 5) | (now.Second / 2));
+        ushort date = (ushort)(((now.Year - 1980) << 9) | (now.Month << 5) | now.Day);
+        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x16)), time);
+        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x18)), date);
+
+        // File size (0 for simplicity, or try to get real size)
+        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x1A)), 0);
+        _mem.WriteWord(Cpu.Registers.PhysicalAddress(seg, (ushort)(off + 0x1C)), 0);
+
+        // Filename (up to 12 chars + null, DOS 8.3 format)
+        string name = Path.GetFileName(filename).ToUpperInvariant();
+        if (name.Length > 12) name = name[..12];
+        for (int i = 0; i < name.Length; i++)
+            _mem.WriteByte(seg, (ushort)(off + 0x1E + i), (byte)name[i]);
+        _mem.WriteByte(seg, (ushort)(off + 0x1E + name.Length), 0);
+    }
+
+    /// <summary>Simple wildcard pattern matching (supports * and ?).</summary>
+    internal static bool MatchWildcard(string pattern, string text)
+    {
+        if (pattern == "*.*" || pattern == "*") return true;
+
+        pattern = pattern.ToUpperInvariant();
+        text = text.ToUpperInvariant();
+
+        int pi = 0, ti = 0;
+        int starPi = -1, starTi = -1;
+
+        while (ti < text.Length)
+        {
+            if (pi < pattern.Length && (pattern[pi] == '?' || pattern[pi] == text[ti]))
+            {
+                pi++;
+                ti++;
+            }
+            else if (pi < pattern.Length && pattern[pi] == '*')
+            {
+                starPi = pi;
+                starTi = ti;
+                pi++;
+            }
+            else if (starPi >= 0)
+            {
+                pi = starPi + 1;
+                starTi++;
+                ti = starTi;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        while (pi < pattern.Length && pattern[pi] == '*') pi++;
+        return pi == pattern.Length;
     }
 
     private void HandleFileDateTime()
