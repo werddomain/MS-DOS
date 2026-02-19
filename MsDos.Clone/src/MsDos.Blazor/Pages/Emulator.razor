@@ -91,19 +91,18 @@
             StateHasChanged();
 
             _cts = new CancellationTokenSource();
-            _ = Task.Run(async () =>
+            await _containerRef.FocusAsync();
+
+            try
             {
-                try
-                {
-                    await _machine.RunAsync(_cts.Token);
-                }
-                catch (OperationCanceledException) { }
-                finally
-                {
-                    _running = false;
-                    await InvokeAsync(StateHasChanged);
-                }
-            });
+                await _machine.RunAsync(_cts.Token);
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                _running = false;
+                StateHasChanged();
+            }
         }
         catch (Exception ex)
         {
@@ -125,6 +124,7 @@
         {
             _cts?.Cancel();
             InitializeMachine();
+            await JS.InvokeVoidAsync("dosRenderer.init", "dosCanvas");
 
             _running = true;
             _loaded = true;
@@ -134,19 +134,16 @@
             _cts = new CancellationTokenSource();
             await _containerRef.FocusAsync();
 
-            _ = Task.Run(async () =>
+            try
             {
-                try
-                {
-                    await _machine!.RunShellAsync(_cts.Token);
-                }
-                catch (OperationCanceledException) { }
-                finally
-                {
-                    _running = false;
-                    await InvokeAsync(StateHasChanged);
-                }
-            });
+                await _machine!.RunShellAsync(_cts.Token);
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                _running = false;
+                StateHasChanged();
+            }
         }
         catch (Exception ex)
         {
