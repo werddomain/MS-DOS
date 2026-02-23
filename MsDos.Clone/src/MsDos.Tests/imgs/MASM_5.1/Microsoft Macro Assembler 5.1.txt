@@ -1,0 +1,5 @@
+Microsoft Macro Assembler 5.1
+Released in 1988 by Microsoft
+For DOS
+
+Disks need redump from origional media.
