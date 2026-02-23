@@ -234,7 +234,7 @@ public sealed class CommandShell
                 break;
             case "REN":
             case "RENAME":
-                PrintLine("REN command not yet implemented");
+                PrintLine("REN command not yet implemented. Syntax: REN <oldname> <newname>");
                 break;
             case "DEL":
             case "ERASE":

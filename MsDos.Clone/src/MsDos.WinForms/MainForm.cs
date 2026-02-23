@@ -37,7 +37,7 @@ public partial class MainForm : Form
         loadComItem.ShortcutKeys = Keys.Control | Keys.O;
         var loadDiskItem = new ToolStripMenuItem("Load &Disk Image (IMG/RAW)...", null, OnLoadDiskImage);
         loadDiskItem.ShortcutKeys = Keys.Control | Keys.D;
-        var exportDriveItem = new ToolStripMenuItem("&Export C: Drive as IMG...", null, OnExportDrive);
+        var exportDriveItem = new ToolStripMenuItem("&Export C: Drive as IMG...", null, OnExportCDrive);
         exportDriveItem.ShortcutKeys = Keys.Control | Keys.E;
         var importDriveItem = new ToolStripMenuItem("&Import C: Drive from IMG...", null, OnImportCDrive);
         var shellItem = new ToolStripMenuItem("Start &Shell (COMMAND.COM)", null, OnStartShell);
@@ -216,7 +216,7 @@ public partial class MainForm : Form
         base.OnFormClosing(e);
     }
 
-    private async void OnExportDrive(object? sender, EventArgs e)
+    private async void OnExportCDrive(object? sender, EventArgs e)
     {
         using var dlg = new SaveFileDialog
         {

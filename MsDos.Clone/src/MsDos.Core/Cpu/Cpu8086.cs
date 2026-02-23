@@ -650,7 +650,7 @@ public sealed class Cpu8086
             case 0xEB: { sbyte off = (sbyte)FetchByte(); Regs.IP = (ushort)(Regs.IP + off); } return 15;
 
             // --- LOCK prefix (treat as NOP) ---
-            case 0xF0: return DecodeAndExecute(); // LOCK prefix - NOP in emulation
+            case 0xF0: return DecodeAndExecute(); // LOCK prefix - execute next instruction without lock semantics
 
             // --- IN/OUT (simplified - do nothing meaningful) ---
             case 0xE4: FetchByte(); return 10; // IN AL, imm8
