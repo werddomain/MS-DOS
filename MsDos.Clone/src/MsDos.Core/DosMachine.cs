@@ -60,6 +60,7 @@ public sealed class DosMachine
 
         Memory = new MemoryBus();
         Cpu = new Cpu8086(Memory);
+        Cpu.SetLog(Log);
         Interrupts = new InterruptController(Cpu, Memory);
         Video = new BiosVideoService(Cpu, Memory, renderer);
         Keyboard = new BiosKeyboardService(Cpu, events);
@@ -154,13 +155,21 @@ public sealed class DosMachine
 
     /// <summary>
     /// Load a binary file (COM or EXE) from byte data and prepare for execution.
+    /// Preserves drive mounts across the reset.
     /// </summary>
     /// <param name="data">The binary file content.</param>
     /// <param name="commandLine">Optional command line arguments.</param>
     /// <returns>True if loaded successfully.</returns>
     public bool LoadBinary(byte[] data, string commandLine = "")
     {
+        // Save drive mounts
+        var savedDrives = new Dictionary<char, IStreamProvider>(_drives, CharComparer.OrdinalIgnoreCase);
+
         Reset();
+
+        // Restore drive mounts
+        foreach (var kv in savedDrives)
+            _drives[kv.Key] = kv.Value;
 
         bool loaded = Loader.Load(data);
         if (!loaded)

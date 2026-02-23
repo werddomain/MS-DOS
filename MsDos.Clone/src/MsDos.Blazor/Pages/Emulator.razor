@@ -17,6 +17,11 @@
                 Load Disk Image
                 <InputFile OnChange="OnDiskImageSelected" accept=".img,.raw,.ima,.dsk,.IMG,.RAW,.IMA,.DSK" style="display:none" />
             </label>
+            <label class="btn btn-secondary">
+                Import C: Drive
+                <InputFile OnChange="OnImportCDrive" accept=".img,.raw,.ima,.dsk,.IMG,.RAW,.IMA,.DSK" style="display:none" />
+            </label>
+            <button class="btn btn-secondary" @onclick="OnExportCDrive">Export C:</button>
             <button class="btn btn-primary" @onclick="OnStartShell" disabled="@(_running)">Shell</button>
             <button class="btn btn-primary" @onclick="OnReset" disabled="@(!_loaded && !_running)">Reset</button>
             <button class="btn btn-danger" @onclick="OnStop" disabled="@(!_running)">Stop</button>
@@ -252,6 +257,46 @@
         _machine?.Stop();
         _running = false;
         _statusText = "Stopped";
+    }
+
+    private async Task OnImportCDrive(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            bool mounted = _machine!.MountDiskImage('C', data);
+            _statusText = mounted
+                ? $"C: drive loaded from {file.Name}"
+                : "Failed to load disk image as C: drive";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error: {ex.Message}";
+        }
+    }
+
+    private async Task OnExportCDrive()
+    {
+        try
+        {
+            _statusText = "Exporting C: drive...";
+            StateHasChanged();
+            byte[] image = await MsDos.Core.Dos.DiskImageWriter.ExportDriveAsImageAsync(_streams!, _machine!.Log);
+            // Trigger download via JS
+            var base64 = Convert.ToBase64String(image);
+            await JS.InvokeVoidAsync("dosRenderer.downloadFile", "drive_c.img", base64);
+            _statusText = "C: drive exported as drive_c.img";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error exporting: {ex.Message}";
+        }
     }
 
     private void ClearLog()

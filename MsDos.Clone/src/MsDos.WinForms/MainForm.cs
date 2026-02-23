@@ -37,13 +37,16 @@ public partial class MainForm : Form
         loadComItem.ShortcutKeys = Keys.Control | Keys.O;
         var loadDiskItem = new ToolStripMenuItem("Load &Disk Image (IMG/RAW)...", null, OnLoadDiskImage);
         loadDiskItem.ShortcutKeys = Keys.Control | Keys.D;
+        var exportDriveItem = new ToolStripMenuItem("&Export C: Drive as IMG...", null, OnExportDrive);
+        exportDriveItem.ShortcutKeys = Keys.Control | Keys.E;
+        var importDriveItem = new ToolStripMenuItem("&Import C: Drive from IMG...", null, OnImportCDrive);
         var shellItem = new ToolStripMenuItem("Start &Shell (COMMAND.COM)", null, OnStartShell);
         shellItem.ShortcutKeys = Keys.Control | Keys.S;
         var resetItem = new ToolStripMenuItem("&Reset Machine", null, OnReset);
         resetItem.ShortcutKeys = Keys.Control | Keys.R;
         var exitItem = new ToolStripMenuItem("E&xit", null, (_, _) => Close());
         exitItem.ShortcutKeys = Keys.Alt | Keys.F4;
-        fileMenu.DropDownItems.AddRange(new ToolStripItem[] { loadComItem, loadDiskItem, shellItem, new ToolStripSeparator(), resetItem, new ToolStripSeparator(), exitItem });
+        fileMenu.DropDownItems.AddRange(new ToolStripItem[] { loadComItem, loadDiskItem, exportDriveItem, importDriveItem, shellItem, new ToolStripSeparator(), resetItem, new ToolStripSeparator(), exitItem });
         _menu.Items.Add(fileMenu);
         MainMenuStrip = _menu;
         Controls.Add(_menu);
@@ -211,6 +214,62 @@ public partial class MainForm : Form
         _machine?.Stop();
         _renderer?.Dispose();
         base.OnFormClosing(e);
+    }
+
+    private async void OnExportDrive(object? sender, EventArgs e)
+    {
+        using var dlg = new SaveFileDialog
+        {
+            Title = "Export C: Drive as Disk Image",
+            Filter = "Disk Images|*.img|All Files|*.*",
+            DefaultExt = "img",
+            FileName = "drive_c.img"
+        };
+
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            _statusLabel.Text = "Exporting C: drive...";
+            byte[] image = await MsDos.Core.Dos.DiskImageWriter.ExportDriveAsImageAsync(_streams!, _machine!.Log);
+            await File.WriteAllBytesAsync(dlg.FileName, image);
+            _statusLabel.Text = $"C: drive exported to {Path.GetFileName(dlg.FileName)}";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error exporting drive: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private async void OnImportCDrive(object? sender, EventArgs e)
+    {
+        using var dlg = new OpenFileDialog
+        {
+            Title = "Import C: Drive from Disk Image",
+            Filter = "Disk Images|*.img;*.raw;*.ima;*.dsk|All Files|*.*",
+            DefaultExt = "img"
+        };
+
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            byte[] data = await File.ReadAllBytesAsync(dlg.FileName);
+            bool mounted = _machine!.MountDiskImage('C', data);
+            if (!mounted)
+            {
+                MessageBox.Show("Failed to load disk image as C: drive.",
+                    "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            _statusLabel.Text = $"C: drive loaded from {Path.GetFileName(dlg.FileName)}";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error importing drive: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 }
 

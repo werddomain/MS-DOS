@@ -1,4 +1,5 @@
 using MsDos.Core.Memory;
+using MsDos.Core.Platform;
 
 namespace MsDos.Core.Cpu;
 
@@ -10,6 +11,7 @@ public sealed class Cpu8086
 {
     public Registers Regs { get; } = new();
     private readonly MemoryBus _mem;
+    private EmulatorLog? _log;
     private bool _halted;
     private int? _segmentOverride; // null = default, 0-3 = ES/CS/SS/DS
 
@@ -22,6 +24,8 @@ public sealed class Cpu8086
     {
         _mem = memory;
     }
+
+    public void SetLog(EmulatorLog log) => _log = log;
 
     public void Reset()
     {
@@ -314,6 +318,29 @@ public sealed class Cpu8086
             case 0x24: Regs.AL = And8(Regs.AL, FetchByte()); return 4;
             case 0x25: Regs.AX = And16(Regs.AX, FetchWord()); return 4;
 
+            // --- DAA ---
+            case 0x27:
+            {
+                byte oldAL = Regs.AL;
+                bool oldCF = GetFlag(CpuFlags.Carry);
+                SetFlag(CpuFlags.Carry, false);
+                if ((Regs.AL & 0x0F) > 9 || GetFlag(CpuFlags.AuxCarry))
+                {
+                    Regs.AL += 6;
+                    SetFlag(CpuFlags.Carry, oldCF || (Regs.AL < oldAL));
+                    SetFlag(CpuFlags.AuxCarry, true);
+                }
+                else
+                    SetFlag(CpuFlags.AuxCarry, false);
+                if (oldAL > 0x99 || oldCF)
+                {
+                    Regs.AL += 0x60;
+                    SetFlag(CpuFlags.Carry, true);
+                }
+                UpdateFlags8(Regs.AL);
+                return 4;
+            }
+
             // --- Segment overrides ---
             case 0x26: _segmentOverride = 0; return DecodeAndExecute(); // ES:
             case 0x2E: _segmentOverride = 1; return DecodeAndExecute(); // CS:
@@ -328,6 +355,29 @@ public sealed class Cpu8086
             case 0x2C: Regs.AL = Sub8(Regs.AL, FetchByte()); return 4;
             case 0x2D: Regs.AX = Sub16(Regs.AX, FetchWord()); return 4;
 
+            // --- DAS ---
+            case 0x2F:
+            {
+                byte oldAL = Regs.AL;
+                bool oldCF = GetFlag(CpuFlags.Carry);
+                SetFlag(CpuFlags.Carry, false);
+                if ((Regs.AL & 0x0F) > 9 || GetFlag(CpuFlags.AuxCarry))
+                {
+                    Regs.AL -= 6;
+                    SetFlag(CpuFlags.Carry, oldCF || (oldAL < 6));
+                    SetFlag(CpuFlags.AuxCarry, true);
+                }
+                else
+                    SetFlag(CpuFlags.AuxCarry, false);
+                if (oldAL > 0x99 || oldCF)
+                {
+                    Regs.AL -= 0x60;
+                    SetFlag(CpuFlags.Carry, true);
+                }
+                UpdateFlags8(Regs.AL);
+                return 4;
+            }
+
             // --- XOR ---
             case 0x30: modrm = FetchByte(); WriteModRM8(modrm, Xor8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7))); return 3;
             case 0x31: modrm = FetchByte(); WriteModRM16(modrm, Xor16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); return 3;
@@ -336,6 +386,24 @@ public sealed class Cpu8086
             case 0x34: Regs.AL = Xor8(Regs.AL, FetchByte()); return 4;
             case 0x35: Regs.AX = Xor16(Regs.AX, FetchWord()); return 4;
 
+            // --- AAA ---
+            case 0x37:
+            {
+                if ((Regs.AL & 0x0F) > 9 || GetFlag(CpuFlags.AuxCarry))
+                {
+                    Regs.AX += 0x106;
+                    SetFlag(CpuFlags.AuxCarry, true);
+                    SetFlag(CpuFlags.Carry, true);
+                }
+                else
+                {
+                    SetFlag(CpuFlags.AuxCarry, false);
+                    SetFlag(CpuFlags.Carry, false);
+                }
+                Regs.AL &= 0x0F;
+                return 4;
+            }
+
             // --- CMP ---
             case 0x38: modrm = FetchByte(); Sub8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7)); return 3;
             case 0x39: modrm = FetchByte(); Sub16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7)); return 3;
@@ -343,6 +411,25 @@ public sealed class Cpu8086
             case 0x3B: modrm = FetchByte(); reg = (modrm >> 3) & 7; Sub16(Regs.GetReg16(reg), ReadModRM16(modrm)); return 3;
             case 0x3C: Sub8(Regs.AL, FetchByte()); return 4;
             case 0x3D: Sub16(Regs.AX, FetchWord()); return 4;
+
+            // --- AAS ---
+            case 0x3F:
+            {
+                if ((Regs.AL & 0x0F) > 9 || GetFlag(CpuFlags.AuxCarry))
+                {
+                    Regs.AX -= 6;
+                    Regs.AH -= 1;
+                    SetFlag(CpuFlags.AuxCarry, true);
+                    SetFlag(CpuFlags.Carry, true);
+                }
+                else
+                {
+                    SetFlag(CpuFlags.AuxCarry, false);
+                    SetFlag(CpuFlags.Carry, false);
+                }
+                Regs.AL &= 0x0F;
+                return 4;
+            }
 
             // --- INC reg16 (0x40-0x47) ---
             case >= 0x40 and <= 0x47:
@@ -419,6 +506,21 @@ public sealed class Cpu8086
             // --- CBW / CWD ---
             case 0x98: Regs.AX = (ushort)(sbyte)Regs.AL; return 2; // CBW
             case 0x99: Regs.DX = (ushort)((Regs.AX & 0x8000) != 0 ? 0xFFFF : 0); return 5; // CWD
+
+            // --- WAIT/FWAIT ---
+            case 0x9B: return 4; // WAIT (no FPU - NOP)
+
+            // --- SAHF/LAHF ---
+            case 0x9E: // SAHF - Store AH into flags (low byte)
+            {
+                ushort flags = (ushort)Regs.Flags;
+                flags = (ushort)((flags & 0xFF00) | (Regs.AH & 0xD5) | 0x02);
+                Regs.Flags = (CpuFlags)flags;
+                return 4;
+            }
+            case 0x9F: // LAHF - Load flags into AH
+                Regs.AH = (byte)((ushort)Regs.Flags & 0xFF);
+                return 4;
 
             // --- CALL far ---
             case 0x9A:
@@ -507,6 +609,30 @@ public sealed class Cpu8086
             case 0xD2: return ExecuteShiftGroup_8(FetchByte(), Regs.CL);
             case 0xD3: return ExecuteShiftGroup_16(FetchByte(), Regs.CL);
 
+            // --- AAM ---
+            case 0xD4:
+            {
+                byte imm = FetchByte(); // Usually 0x0A
+                if (imm == 0) { TriggerInterrupt(0); return 4; }
+                Regs.AH = (byte)(Regs.AL / imm);
+                Regs.AL = (byte)(Regs.AL % imm);
+                UpdateFlags8(Regs.AL);
+                return 83;
+            }
+            // --- AAD ---
+            case 0xD5:
+            {
+                byte imm = FetchByte(); // Usually 0x0A
+                Regs.AL = (byte)(Regs.AH * imm + Regs.AL);
+                Regs.AH = 0;
+                UpdateFlags8(Regs.AL);
+                return 60;
+            }
+            // --- XLAT ---
+            case 0xD7:
+                Regs.AL = _mem.ReadByte(GetDataSegment(), (ushort)(Regs.BX + Regs.AL));
+                return 11;
+
             // --- LOOP / LOOPcc ---
             case 0xE0: { sbyte off = (sbyte)FetchByte(); Regs.CX--; if (Regs.CX != 0 && !GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); } return 5; // LOOPNZ
             case 0xE1: { sbyte off = (sbyte)FetchByte(); Regs.CX--; if (Regs.CX != 0 && GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); } return 5; // LOOPZ
@@ -522,6 +648,9 @@ public sealed class Cpu8086
             case 0xEA: { ushort newIp = FetchWord(); ushort newCs = FetchWord(); Regs.CS = newCs; Regs.IP = newIp; } return 15;
             // --- JMP short (rel8) ---
             case 0xEB: { sbyte off = (sbyte)FetchByte(); Regs.IP = (ushort)(Regs.IP + off); } return 15;
+
+            // --- LOCK prefix (treat as NOP) ---
+            case 0xF0: return DecodeAndExecute(); // LOCK prefix - NOP in emulation
 
             // --- IN/OUT (simplified - do nothing meaningful) ---
             case 0xE4: FetchByte(); return 10; // IN AL, imm8
@@ -561,7 +690,7 @@ public sealed class Cpu8086
 
             default:
                 // Unimplemented opcode - treat as NOP with warning
-                System.Diagnostics.Debug.WriteLine($"Unimplemented opcode: 0x{opcode:X2} at {Regs.CS:X4}:{(Regs.IP - 1):X4}");
+                _log?.Warn("CPU", $"Unimplemented opcode: 0x{opcode:X2} at {Regs.CS:X4}:{(ushort)(Regs.IP - 1):X4}");
                 return 1;
         }
     }

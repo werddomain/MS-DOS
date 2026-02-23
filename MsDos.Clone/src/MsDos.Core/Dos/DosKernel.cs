@@ -274,6 +274,63 @@ public sealed class DosKernel
                 _cpu.Regs.BX = DtaOffset;
                 break;
 
+            case 0x2E: // Set verify flag
+                // Just accept and ignore
+                break;
+
+            case 0x38: // Get/set country info
+                if (_cpu.Regs.AL == 0) // Get
+                {
+                    // Write minimal country info to DS:DX
+                    ushort seg = _cpu.Regs.DS;
+                    ushort off = _cpu.Regs.DX;
+                    _mem.WriteWord(seg, off, 0); // Date format (0=US)
+                    _mem.WriteByte(seg, (ushort)(off + 2), (byte)'$'); // Currency symbol
+                    _mem.WriteByte(seg, (ushort)(off + 3), 0);
+                    _mem.WriteByte(seg, (ushort)(off + 7), (byte)','); // Thousands separator
+                    _mem.WriteByte(seg, (ushort)(off + 8), 0);
+                    _mem.WriteByte(seg, (ushort)(off + 9), (byte)'.'); // Decimal separator
+                    _mem.WriteByte(seg, (ushort)(off + 10), 0);
+                    _cpu.Regs.BX = 1; // Country code
+                }
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x39: // Create directory (MKDIR)
+                _log.Info("DOS", $"MKDIR: {ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX)}");
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x3A: // Remove directory (RMDIR)
+                _log.Info("DOS", $"RMDIR: {ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX)}");
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x3B: // Change directory (CHDIR)
+                _log.Info("DOS", $"CHDIR: {ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX)}");
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x55: // Create child PSP
+                _log.Debug("DOS", $"Create child PSP at {_cpu.Regs.DX:X4}");
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x63: // Get lead byte table (DBCS)
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x65: // Get extended country info
+                _cpu.Regs.AX = 1; // Function not supported
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                break;
+
+            case 0x66: // Get/set global code page
+                _cpu.Regs.BX = 437; // US code page
+                _cpu.Regs.DX = 437;
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
             default:
                 _log.Warn("DOS", $"Unhandled INT 21h AH={func:X2}h");
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;

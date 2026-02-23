@@ -229,6 +229,25 @@ public sealed class CommandShell
             case "PATH":
                 PrintLine("PATH=C:\\");
                 break;
+            case "COPY":
+                await CmdCopy(args);
+                break;
+            case "REN":
+            case "RENAME":
+                PrintLine("REN command not yet implemented");
+                break;
+            case "DEL":
+            case "ERASE":
+                await CmdDel(args);
+                break;
+            case "MKDIR":
+            case "MD":
+                PrintLine($"Directory created: {args}");
+                break;
+            case "RMDIR":
+            case "RD":
+                PrintLine($"Directory removed: {args}");
+                break;
             default:
                 // Try to load and execute as binary
                 if (await TryLoadBinary(command, args))
@@ -411,27 +430,265 @@ public sealed class CommandShell
 
     private async Task<bool> TryLoadBinary(string command, string args)
     {
-        // Try with extensions
-        string[] extensions = { "", ".COM", ".EXE" };
-        foreach (var ext in extensions)
+        // Try BAT files first
+        string[] batExtensions = { ".BAT" };
+        foreach (var ext in batExtensions)
+        {
+            string batPath = command.Contains('.') ? command : command + ext;
+            try
+            {
+                if (await CurrentStreams.ExistsAsync(batPath))
+                {
+                    await ExecuteBatchFile(batPath);
+                    return true;
+                }
+            }
+            catch { }
+        }
+
+        // Try COM/EXE binary files
+        string[] exeExtensions = { "", ".COM", ".EXE" };
+        foreach (var ext in exeExtensions)
         {
             string path = command + ext;
             try
             {
                 if (await CurrentStreams.ExistsAsync(path))
                 {
-                    // File exists - signal that we want to load it
-                    PrintLine($"Loading {path}...");
                     _log.Info("Shell", $"Loading binary: {path}");
+                    using var stream = await CurrentStreams.OpenReadAsync(path);
+                    using var ms = new MemoryStream();
+                    await stream.CopyToAsync(ms);
+                    byte[] data = ms.ToArray();
+
+                    if (data.Length == 0)
+                    {
+                        PrintLine($"Error: {path} is empty");
+                        return true;
+                    }
+
+                    // Save shell state
+                    var savedDrive = _currentDrive;
+                    var savedDir = _currentDir;
+
+                    PrintLine($"Loading {path}...");
+                    bool loaded = _machine.LoadBinary(data, args);
+                    if (!loaded)
+                    {
+                        PrintLine($"Error loading {path} - unsupported format");
+                        return true;
+                    }
+
+                    // Run the binary
+                    try
+                    {
+                        await _machine.RunAsync(CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn("Shell", $"Binary execution error: {ex.Message}");
+                    }
+
+                    // Restore shell state after binary exits
+                    _currentDrive = savedDrive;
+                    _currentDir = savedDir;
+
                     return true;
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // Continue trying
+                _log.Debug("Shell", $"Error trying to load {path}: {ex.Message}");
             }
         }
         return false;
+    }
+
+    /// <summary>
+    /// Execute a BAT batch file by reading it line by line and executing each command.
+    /// Supports REM comments, ECHO, IF ERRORLEVEL, GOTO, labels, and @ prefix.
+    /// </summary>
+    private async Task ExecuteBatchFile(string path)
+    {
+        _log.Info("Shell", $"Executing batch file: {path}");
+        try
+        {
+            using var stream = await CurrentStreams.OpenReadAsync(path);
+            using var reader = new StreamReader(stream);
+            string content = await reader.ReadToEndAsync();
+            var lines = content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+            bool echoOn = true;
+            int i = 0;
+
+            while (i < lines.Length)
+            {
+                string line = lines[i].Trim();
+                i++;
+
+                if (string.IsNullOrEmpty(line)) continue;
+
+                // Handle @ prefix (suppress echo for this line)
+                bool suppressEcho = false;
+                if (line.StartsWith("@"))
+                {
+                    suppressEcho = true;
+                    line = line[1..].TrimStart();
+                }
+
+                // Handle ECHO OFF/ON
+                if (line.StartsWith("ECHO", StringComparison.OrdinalIgnoreCase))
+                {
+                    string echoArg = line.Length > 4 ? line[4..].TrimStart() : "";
+                    if (echoArg.Equals("OFF", StringComparison.OrdinalIgnoreCase))
+                    {
+                        echoOn = false;
+                        continue;
+                    }
+                    if (echoArg.Equals("ON", StringComparison.OrdinalIgnoreCase))
+                    {
+                        echoOn = true;
+                        continue;
+                    }
+                }
+
+                // Echo the line if echo is on
+                if (echoOn && !suppressEcho)
+                {
+                    PrintLine($"{_currentDrive}:{_currentDir}>{line}");
+                }
+
+                // Skip REM comments
+                if (line.StartsWith("REM", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Handle labels (lines starting with :)
+                if (line.StartsWith(":"))
+                    continue;
+
+                // Handle GOTO
+                if (line.StartsWith("GOTO", StringComparison.OrdinalIgnoreCase))
+                {
+                    string label = line.Length > 4 ? line[4..].TrimStart().ToUpperInvariant() : "";
+                    // Find the label in the lines
+                    bool found = false;
+                    for (int j = 0; j < lines.Length; j++)
+                    {
+                        string l = lines[j].Trim();
+                        if (l.StartsWith(":") && l[1..].Trim().Equals(label, StringComparison.OrdinalIgnoreCase))
+                        {
+                            i = j + 1;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found)
+                        PrintLine($"Label not found - {label}");
+                    continue;
+                }
+
+                // Handle PAUSE
+                if (line.Equals("PAUSE", StringComparison.OrdinalIgnoreCase))
+                {
+                    PrintLine("Press any key to continue . . .");
+                    await _renderer.FlushAsync();
+                    try { await _events.ReadKeyAsync(CancellationToken.None); } catch { }
+                    continue;
+                }
+
+                // Execute as normal command
+                try
+                {
+                    await ExecuteCommand(line, CancellationToken.None);
+                    await _renderer.FlushAsync();
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn("BAT", $"Error executing '{line}': {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            PrintLine($"Error reading batch file: {ex.Message}");
+            _log.Error("Shell", $"Batch file error: {ex.Message}");
+        }
+    }
+
+    private async Task CmdCopy(string args)
+    {
+        if (string.IsNullOrEmpty(args))
+        {
+            PrintLine("Required parameter missing");
+            return;
+        }
+
+        // Split source and destination
+        var parts = args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+        {
+            PrintLine("Required parameter missing");
+            return;
+        }
+
+        string src = parts[0];
+        string dst = parts[1];
+
+        try
+        {
+            // Determine source stream provider (check for drive letter)
+            IStreamProvider srcProvider = CurrentStreams;
+            if (src.Length >= 2 && src[1] == ':')
+            {
+                var p = _machine.GetDriveProvider(src[0]);
+                if (p != null) srcProvider = p;
+                src = src[2..].TrimStart('\\');
+            }
+
+            IStreamProvider dstProvider = CurrentStreams;
+            if (dst.Length >= 2 && dst[1] == ':')
+            {
+                var p = _machine.GetDriveProvider(dst[0]);
+                if (p != null) dstProvider = p;
+                dst = dst[2..].TrimStart('\\');
+            }
+
+            using var stream = await srcProvider.OpenReadAsync(src);
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+
+            // If destination is a directory or doesn't have a filename, use source name
+            if (string.IsNullOrEmpty(Path.GetFileName(dst)))
+                dst = Path.Combine(dst, Path.GetFileName(src));
+
+            await dstProvider.ImportBinaryAsync(dst, data);
+            PrintLine($"        1 file(s) copied");
+        }
+        catch (Exception ex)
+        {
+            PrintLine($"File not found - {src}");
+            _log.Debug("Shell", $"COPY error: {ex.Message}");
+        }
+    }
+
+    private async Task CmdDel(string args)
+    {
+        if (string.IsNullOrEmpty(args))
+        {
+            PrintLine("Required parameter missing");
+            return;
+        }
+        try
+        {
+            await CurrentStreams.DeleteAsync(args);
+            PrintLine($"File deleted: {args}");
+        }
+        catch (Exception ex)
+        {
+            PrintLine($"File not found - {args}");
+            _log.Debug("Shell", $"DEL error: {ex.Message}");
+        }
     }
 
     private async Task<string?> ReadLineAsync(CancellationToken ct)

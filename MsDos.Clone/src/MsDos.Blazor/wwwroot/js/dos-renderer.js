@@ -59,5 +59,14 @@ window.dosRenderer = {
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(cursorCol * cw, cursorRow * ch + ch - 2, cw, 2);
         }
+    },
+
+    downloadFile: function(filename, base64data) {
+        const link = document.createElement('a');
+        link.href = 'data:application/octet-stream;base64,' + base64data;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
     }
 };
