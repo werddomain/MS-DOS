@@ -104,7 +104,7 @@ public sealed class DosMachine
         var diskLoader = new DiskImageLoader(Log);
         if (!diskLoader.Load(imageData))
         {
-            Log.Error("Machine", $"Failed to mount disk image on {driveLetter}:");
+            Log.Error("Machine", $"Failed to mount disk image on drive {driveLetter}");
             return false;
         }
 

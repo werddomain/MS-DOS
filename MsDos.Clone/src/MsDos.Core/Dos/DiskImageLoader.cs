@@ -12,6 +12,11 @@ public sealed class DiskImageLoader
     private byte[]? _imageData;
     private readonly EmulatorLog _log;
 
+    private const int Fat12EndOfChain = 0xFF8;
+    private const int Fat12BadCluster = 0xFFF;
+    private const int Fat16EndOfChain = 0xFFF8;
+    private const int Fat16BadCluster = 0xFFFF;
+
     // BPB (BIOS Parameter Block) values parsed from the boot sector
     public int BytesPerSector { get; private set; }
     public int SectorsPerCluster { get; private set; }
@@ -222,12 +227,12 @@ public sealed class DiskImageLoader
 
     private int GetNextCluster(int cluster, int fatOffset)
     {
-        if (_imageData == null) return 0xFFF;
+        if (_imageData == null) return Fat12BadCluster;
 
         if (DetectedFatType == FatType.Fat12)
         {
             int offset = fatOffset + (cluster * 3 / 2);
-            if (offset + 1 >= _imageData.Length) return 0xFFF;
+            if (offset + 1 >= _imageData.Length) return Fat12BadCluster;
 
             ushort val = (ushort)(_imageData[offset] | (_imageData[offset + 1] << 8));
             return (cluster & 1) != 0 ? (val >> 4) : (val & 0xFFF);
@@ -235,14 +240,14 @@ public sealed class DiskImageLoader
         else // FAT16
         {
             int offset = fatOffset + (cluster * 2);
-            if (offset + 1 >= _imageData.Length) return 0xFFFF;
+            if (offset + 1 >= _imageData.Length) return Fat16BadCluster;
 
             return ReadUInt16(_imageData, offset);
         }
     }
 
     private bool IsEndOfChain(int cluster) =>
-        DetectedFatType == FatType.Fat12 ? cluster >= 0xFF8 : cluster >= 0xFFF8;
+        DetectedFatType == FatType.Fat12 ? cluster >= Fat12EndOfChain : cluster >= Fat16EndOfChain;
 
     private bool TryGuessGeometry(int imageSize)
     {

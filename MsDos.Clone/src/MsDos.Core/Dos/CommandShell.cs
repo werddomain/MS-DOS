@@ -164,7 +164,7 @@ public sealed class CommandShell
         }
 
         // Check for drive letter change (e.g., "A:", "C:")
-        if (command.Length == 2 && command[1] == ':' && char.IsLetter(command[0]))
+        if (IsDriveLetterCommand(command))
         {
             char drive = char.ToUpperInvariant(command[0]);
             var provider = _machine.GetDriveProvider(drive);
@@ -489,6 +489,10 @@ public sealed class CommandShell
         _video.TtyOutput('\r');
         _video.TtyOutput('\n');
     }
+
+    /// <summary>Check if the command is a drive letter change (e.g. "A:", "C:").</summary>
+    private static bool IsDriveLetterCommand(string command) =>
+        command.Length == 2 && command[1] == ':' && char.IsLetter(command[0]);
 
     /// <summary>Format a filename in DOS 8.3 format for DIR listing.</summary>
     private static string FormatDos83Name(string name)

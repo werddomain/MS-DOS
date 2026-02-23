@@ -82,7 +82,7 @@ public sealed class EmulatorLog
     public IReadOnlyList<LogEntry> GetEntries()
     {
         lock (_entries)
-            return _entries.ToList();
+            return _entries.ToArray();
     }
 
     /// <summary>Clear all stored entries.</summary>
