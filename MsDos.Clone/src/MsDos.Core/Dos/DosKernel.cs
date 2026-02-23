@@ -16,6 +16,7 @@ public sealed class DosKernel
     private readonly IEventRegistry _events;
     private readonly IGraphicsRenderer _renderer;
     private readonly Interrupts.BiosVideoService _video;
+    private readonly EmulatorLog _log;
 
     // DOS version to report
     private const byte MajorVersion = 4;
@@ -58,7 +59,8 @@ public sealed class DosKernel
         IStreamProvider streams,
         IEventRegistry events,
         IGraphicsRenderer renderer,
-        Interrupts.BiosVideoService video)
+        Interrupts.BiosVideoService video,
+        EmulatorLog log)
     {
         _cpu = cpu;
         _mem = mem;
@@ -66,6 +68,7 @@ public sealed class DosKernel
         _events = events;
         _renderer = renderer;
         _video = video;
+        _log = log;
     }
 
     public void Handle()
@@ -272,7 +275,7 @@ public sealed class DosKernel
                 break;
 
             default:
-                System.Diagnostics.Debug.WriteLine($"Unhandled DOS INT 21h AH={func:X2}");
+                _log.Warn("DOS", $"Unhandled INT 21h AH={func:X2}h");
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;
                 break;
         }
@@ -640,7 +643,7 @@ public sealed class DosKernel
     private void HandleExec()
     {
         string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
-        System.Diagnostics.Debug.WriteLine($"DOS EXEC: {path}");
+        _log.Info("DOS", $"EXEC: {path}");
         // TODO: Implement child process loading
         _cpu.Regs.Flags &= ~CpuFlags.Carry;
     }

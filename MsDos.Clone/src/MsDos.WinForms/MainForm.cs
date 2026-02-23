@@ -35,13 +35,15 @@ public partial class MainForm : Form
         var fileMenu = new ToolStripMenuItem("&File");
         var loadComItem = new ToolStripMenuItem("&Load Binary (COM/EXE)...", null, OnLoadBinary);
         loadComItem.ShortcutKeys = Keys.Control | Keys.O;
+        var loadDiskItem = new ToolStripMenuItem("Load &Disk Image (IMG/RAW)...", null, OnLoadDiskImage);
+        loadDiskItem.ShortcutKeys = Keys.Control | Keys.D;
         var shellItem = new ToolStripMenuItem("Start &Shell (COMMAND.COM)", null, OnStartShell);
         shellItem.ShortcutKeys = Keys.Control | Keys.S;
         var resetItem = new ToolStripMenuItem("&Reset Machine", null, OnReset);
         resetItem.ShortcutKeys = Keys.Control | Keys.R;
         var exitItem = new ToolStripMenuItem("E&xit", null, (_, _) => Close());
         exitItem.ShortcutKeys = Keys.Alt | Keys.F4;
-        fileMenu.DropDownItems.AddRange(new ToolStripItem[] { loadComItem, shellItem, new ToolStripSeparator(), resetItem, new ToolStripSeparator(), exitItem });
+        fileMenu.DropDownItems.AddRange(new ToolStripItem[] { loadComItem, loadDiskItem, shellItem, new ToolStripSeparator(), resetItem, new ToolStripSeparator(), exitItem });
         _menu.Items.Add(fileMenu);
         MainMenuStrip = _menu;
         Controls.Add(_menu);
@@ -78,6 +80,17 @@ public partial class MainForm : Form
             {
                 _statusLabel.Text = $"Process exited with code {code}";
             });
+        };
+        _machine.Log.EntryAdded += entry =>
+        {
+            if (entry.Level >= MsDos.Core.Platform.LogLevel.Warning)
+            {
+                try
+                {
+                    BeginInvoke(() => _statusLabel.Text = entry.ToString());
+                }
+                catch { /* form may be closing */ }
+            }
         };
         _machine.Reset();
     }
@@ -118,6 +131,53 @@ public partial class MainForm : Form
         catch (Exception ex)
         {
             MessageBox.Show($"Error loading file: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private async void OnLoadDiskImage(object? sender, EventArgs e)
+    {
+        using var dlg = new OpenFileDialog
+        {
+            Title = "Load Disk Image",
+            Filter = "Disk Images|*.img;*.raw;*.ima;*.dsk|All Files|*.*",
+            DefaultExt = "img"
+        };
+
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            byte[] data = await File.ReadAllBytesAsync(dlg.FileName);
+            string fileName = Path.GetFileName(dlg.FileName);
+
+            // Ask for drive letter
+            char drive = 'A';
+            if (_machine!.GetDriveProvider('A') != null)
+                drive = 'B';
+
+            bool mounted = _machine.LoadDiskImage(data, drive);
+            if (!mounted)
+            {
+                MessageBox.Show("Failed to load disk image. Invalid or unsupported format.",
+                    "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            _statusLabel.Text = $"Disk image mounted as {drive}: ({fileName})";
+
+            // If shell is not running, start it so user can explore the disk
+            if (!_machine.IsRunning)
+            {
+                _cts?.Cancel();
+                _cts = new CancellationTokenSource();
+                _ = _machine.RunShellAsync(_cts.Token);
+                _statusLabel.Text = $"Shell running - Disk {drive}: loaded ({fileName})";
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error loading disk image: {ex.Message}", "Error",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }

@@ -16,13 +16,16 @@ public sealed class CommandShell
     private readonly DosKernel _dos;
     private readonly MemoryBus _mem;
     private readonly Cpu8086 _cpu;
-    private readonly IStreamProvider _streams;
+    private readonly IStreamProvider _defaultStreams;
     private readonly IEventRegistry _events;
     private readonly BiosVideoService _video;
     private readonly IGraphicsRenderer _renderer;
+    private readonly EmulatorLog _log;
+    private readonly DosMachine _machine;
 
     private bool _running;
     private string _currentDir = "\\";
+    private char _currentDrive = 'C';
 
     public CommandShell(
         DosKernel dos,
@@ -31,16 +34,24 @@ public sealed class CommandShell
         IStreamProvider streams,
         IEventRegistry events,
         BiosVideoService video,
-        IGraphicsRenderer renderer)
+        IGraphicsRenderer renderer,
+        EmulatorLog log,
+        DosMachine machine)
     {
         _dos = dos;
         _mem = mem;
         _cpu = cpu;
-        _streams = streams;
+        _defaultStreams = streams;
         _events = events;
         _video = video;
         _renderer = renderer;
+        _log = log;
+        _machine = machine;
     }
+
+    /// <summary>Current stream provider (resolves to the active drive).</summary>
+    private IStreamProvider CurrentStreams =>
+        _machine.GetDriveProvider(_currentDrive) ?? _defaultStreams;
 
     /// <summary>
     /// Run the command shell loop. Displays prompt, reads commands, executes them.
@@ -58,8 +69,8 @@ public sealed class CommandShell
 
         while (_running && !cancellationToken.IsCancellationRequested)
         {
-            // Display prompt
-            Print($"C:{_currentDir}>");
+            // Display prompt with current drive letter
+            Print($"{_currentDrive}:{_currentDir}>");
 
             // Flush display
             await _renderer.FlushAsync();
@@ -82,6 +93,7 @@ public sealed class CommandShell
             catch (Exception ex)
             {
                 PrintLine($"Error: {ex.Message}");
+                _log.Error("Shell", ex.Message);
             }
 
             await _renderer.FlushAsync();
@@ -89,6 +101,50 @@ public sealed class CommandShell
     }
 
     public void Stop() => _running = false;
+
+    /// <summary>
+    /// Process AUTOEXEC.BAT if it exists. Runs each line as a command.
+    /// </summary>
+    public async Task ProcessAutoexecAsync(CancellationToken ct)
+    {
+        try
+        {
+            if (!await _defaultStreams.ExistsAsync("AUTOEXEC.BAT")) return;
+
+            _log.Info("Shell", "Processing AUTOEXEC.BAT...");
+            using var stream = await _defaultStreams.OpenReadAsync("AUTOEXEC.BAT");
+            using var reader = new StreamReader(stream);
+            string content = await reader.ReadToEndAsync();
+
+            foreach (string rawLine in content.Split('\n', '\r'))
+            {
+                if (ct.IsCancellationRequested) break;
+                string line = rawLine.Trim();
+                if (string.IsNullOrEmpty(line)) continue;
+                if (line.StartsWith("@")) line = line[1..]; // Strip @ prefix
+                if (line.StartsWith("REM", StringComparison.OrdinalIgnoreCase)) continue;
+
+                _log.Debug("AUTOEXEC", line);
+                try
+                {
+                    await ExecuteCommand(line, ct);
+                    await _renderer.FlushAsync();
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn("AUTOEXEC", $"Error executing '{line}': {ex.Message}");
+                }
+            }
+        }
+        catch (FileNotFoundException)
+        {
+            // No AUTOEXEC.BAT - fine
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Shell", $"Error processing AUTOEXEC.BAT: {ex.Message}");
+        }
+    }
 
     private async Task ExecuteCommand(string commandLine, CancellationToken ct)
     {
@@ -105,6 +161,25 @@ public sealed class CommandShell
         {
             command = commandLine.ToUpperInvariant();
             args = "";
+        }
+
+        // Check for drive letter change (e.g., "A:", "C:")
+        if (command.Length == 2 && command[1] == ':' && char.IsLetter(command[0]))
+        {
+            char drive = char.ToUpperInvariant(command[0]);
+            var provider = _machine.GetDriveProvider(drive);
+            if (provider != null)
+            {
+                _currentDrive = drive;
+                _currentDir = "\\";
+                _log.Info("Shell", $"Changed to drive {drive}:");
+            }
+            else
+            {
+                PrintLine($"Invalid drive specification");
+                _log.Warn("Shell", $"Drive {drive}: not mounted");
+            }
+            return;
         }
 
         switch (command)
@@ -166,13 +241,13 @@ public sealed class CommandShell
     private async Task CmdDir(string args)
     {
         string pattern = string.IsNullOrEmpty(args) ? "*.*" : args;
-        PrintLine($" Volume in drive C has no label");
-        PrintLine($" Directory of C:{_currentDir}");
+        PrintLine($" Volume in drive {_currentDrive} has no label");
+        PrintLine($" Directory of {_currentDrive}:{_currentDir}");
         PrintLine("");
 
         try
         {
-            var entries = await _streams.ListEntriesAsync(_currentDir);
+            var entries = await CurrentStreams.ListEntriesAsync(_currentDir);
             int fileCount = 0;
 
             foreach (var entry in entries)
@@ -196,9 +271,10 @@ public sealed class CommandShell
             PrintLine($"        {fileCount} file(s)");
             PrintLine($"    33,554,432 bytes free");
         }
-        catch
+        catch (Exception ex)
         {
             PrintLine("File not found");
+            _log.Debug("Shell", $"DIR error: {ex.Message}");
         }
     }
 
@@ -240,16 +316,17 @@ public sealed class CommandShell
 
         try
         {
-            using var stream = await _streams.OpenReadAsync(args);
+            using var stream = await CurrentStreams.OpenReadAsync(args);
             using var reader = new StreamReader(stream);
             string content = await reader.ReadToEndAsync();
             Print(content);
             if (!content.EndsWith('\n'))
                 PrintLine("");
         }
-        catch
+        catch (Exception ex)
         {
             PrintLine($"File not found - {args}");
+            _log.Debug("Shell", $"TYPE error for '{args}': {ex.Message}");
         }
     }
 
@@ -302,7 +379,7 @@ public sealed class CommandShell
     {
         if (string.IsNullOrEmpty(args))
         {
-            PrintLine($"C:{_currentDir}");
+            PrintLine($"{_currentDrive}:{_currentDir}");
         }
         else if (args == "..")
         {
@@ -341,11 +418,11 @@ public sealed class CommandShell
             string path = command + ext;
             try
             {
-                if (await _streams.ExistsAsync(path))
+                if (await CurrentStreams.ExistsAsync(path))
                 {
                     // File exists - signal that we want to load it
-                    // Return true to indicate a binary was found
                     PrintLine($"Loading {path}...");
+                    _log.Info("Shell", $"Loading binary: {path}");
                     return true;
                 }
             }

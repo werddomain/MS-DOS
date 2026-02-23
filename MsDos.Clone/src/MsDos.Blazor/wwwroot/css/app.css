@@ -80,6 +80,56 @@ html, body {
     font-family: 'Courier New', monospace;
 }
 
+.btn-secondary {
+    background: #6c757d;
+    color: white;
+    border-color: #6c757d;
+}
+
+.btn-sm {
+    padding: 0.15rem 0.5rem;
+    font-size: 0.75rem;
+    background: #444;
+    color: #ccc;
+    border: 1px solid #666;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.log-panel {
+    margin-top: 0.5rem;
+    width: 100%;
+    max-width: 660px;
+    border: 1px solid #333;
+    border-radius: 4px;
+    background: #111;
+    max-height: 200px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 0.75rem;
+}
+
+.log-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.25rem 0.5rem;
+    background: #222;
+    border-bottom: 1px solid #333;
+    position: sticky;
+    top: 0;
+}
+
+.log-content {
+    padding: 0.25rem 0.5rem;
+}
+
+.log-trace { color: #666; }
+.log-debug { color: #888; }
+.log-info { color: #55ff55; }
+.log-warning { color: #ffaa00; }
+.log-error { color: #ff5555; }
+
 .valid.modified:not([type=checkbox]) {
     outline: 1px solid #26b050;
 }

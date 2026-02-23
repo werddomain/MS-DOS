@@ -1,5 +1,6 @@
 @page "/"
 @using MsDos.Core
+@using MsDos.Core.Platform
 @using MsDos.Blazor.Platform
 @inject IJSRuntime JS
 @implements IAsyncDisposable
@@ -8,7 +9,14 @@
     <div class="toolbar">
         <h3>MS-DOS Emulator (.NET WebAssembly)</h3>
         <div class="controls">
-            <InputFile OnChange="OnFileSelected" accept=".com,.exe,.COM,.EXE" />
+            <label class="btn btn-secondary">
+                Load Binary
+                <InputFile OnChange="OnFileSelected" accept=".com,.exe,.COM,.EXE" style="display:none" />
+            </label>
+            <label class="btn btn-secondary">
+                Load Disk Image
+                <InputFile OnChange="OnDiskImageSelected" accept=".img,.raw,.ima,.dsk,.IMG,.RAW,.IMA,.DSK" style="display:none" />
+            </label>
             <button class="btn btn-primary" @onclick="OnStartShell" disabled="@(_running)">Shell</button>
             <button class="btn btn-primary" @onclick="OnReset" disabled="@(!_loaded && !_running)">Reset</button>
             <button class="btn btn-danger" @onclick="OnStop" disabled="@(!_running)">Stop</button>
@@ -23,6 +31,22 @@
     <div class="status-bar">
         <span>@_statusText</span>
     </div>
+
+    @if (_logEntries.Count > 0)
+    {
+        <div class="log-panel">
+            <div class="log-header">
+                <strong>System Log</strong>
+                <button class="btn btn-sm" @onclick="ClearLog">Clear</button>
+            </div>
+            <div class="log-content">
+                @foreach (var entry in _logEntries.TakeLast(20))
+                {
+                    <div class="log-@entry.Level.ToString().ToLower()">@entry</div>
+                }
+            </div>
+        </div>
+    }
 </div>
 
 @code {
@@ -34,7 +58,8 @@
     private CancellationTokenSource? _cts;
     private bool _loaded;
     private bool _running;
-    private string _statusText = "Ready - Upload a COM or EXE file to start";
+    private string _statusText = "Ready - Upload a COM/EXE file or disk image to start";
+    private readonly List<LogEntry> _logEntries = new();
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -58,6 +83,17 @@
             _running = false;
             _statusText = $"Process exited with code {code}";
             InvokeAsync(StateHasChanged);
+        };
+        _machine.Log.EntryAdded += entry =>
+        {
+            _logEntries.Add(entry);
+            if (_logEntries.Count > 100)
+                _logEntries.RemoveAt(0);
+            if (entry.Level >= LogLevel.Warning)
+            {
+                _statusText = entry.ToString();
+                InvokeAsync(StateHasChanged);
+            }
         };
         _machine.Reset();
     }
@@ -102,6 +138,65 @@
             {
                 _running = false;
                 StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error: {ex.Message}";
+        }
+    }
+
+    private async Task OnDiskImageSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        try
+        {
+            using var ms = new MemoryStream();
+            // Allow up to 10MB for disk images
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            string fileName = file.Name;
+
+            // Pick drive letter (A: first, then B:)
+            char drive = 'A';
+            if (_machine!.GetDriveProvider('A') != null)
+                drive = 'B';
+
+            bool mounted = _machine.LoadDiskImage(data, drive);
+            if (!mounted)
+            {
+                _statusText = "Failed to load disk image. Invalid or unsupported format.";
+                StateHasChanged();
+                return;
+            }
+
+            _statusText = $"Disk image mounted as {drive}: ({fileName})";
+            _loaded = true;
+            StateHasChanged();
+
+            // Start shell if not running so user can explore the disk
+            if (!_running)
+            {
+                _cts?.Cancel();
+                _running = true;
+                _statusText = $"Shell running - Disk {drive}: loaded ({fileName})";
+                StateHasChanged();
+
+                _cts = new CancellationTokenSource();
+                await _containerRef.FocusAsync();
+
+                try
+                {
+                    await _machine.RunShellAsync(_cts.Token);
+                }
+                catch (OperationCanceledException) { }
+                finally
+                {
+                    _running = false;
+                    StateHasChanged();
+                }
             }
         }
         catch (Exception ex)
@@ -157,6 +252,12 @@
         _machine?.Stop();
         _running = false;
         _statusText = "Stopped";
+    }
+
+    private void ClearLog()
+    {
+        _logEntries.Clear();
+        _machine?.Log.Clear();
     }
 
     private void OnKeyDown(KeyboardEventArgs e)

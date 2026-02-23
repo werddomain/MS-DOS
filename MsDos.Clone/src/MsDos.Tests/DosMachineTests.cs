@@ -215,4 +215,50 @@ public class DosMachineTests
         machine.StepInstruction(); // HLT
         Assert.True(machine.Cpu.IsHalted);
     }
+
+    [Fact]
+    public void MountDiskImage_ValidFat12_MountsSuccessfully()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Create a minimal 360K floppy (size-based geometry guess)
+        var image = new byte[368640];
+
+        bool mounted = machine.MountDiskImage('A', image);
+
+        Assert.True(mounted);
+        Assert.NotNull(machine.GetDriveProvider('A'));
+        Assert.Contains('A', machine.GetMountedDrives());
+        Assert.Contains('C', machine.GetMountedDrives());
+    }
+
+    [Fact]
+    public void MountDiskImage_TooSmall_ReturnsFalse()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        bool mounted = machine.MountDiskImage('A', new byte[100]);
+
+        Assert.False(mounted);
+        Assert.Null(machine.GetDriveProvider('A'));
+    }
+
+    [Fact]
+    public void Log_CapturesMessages()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // The constructor should log initialization
+        var entries = machine.Log.GetEntries();
+        Assert.Contains(entries, e => e.Source == "Machine" && e.Message.Contains("initialized"));
+    }
 }
