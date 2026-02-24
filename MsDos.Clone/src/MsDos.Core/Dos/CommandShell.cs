@@ -53,6 +53,18 @@ public sealed class CommandShell
     private IStreamProvider CurrentStreams =>
         _machine.GetDriveProvider(_currentDrive) ?? _defaultStreams;
 
+    /// <summary>The current drive letter.</summary>
+    public char CurrentDrive => _currentDrive;
+
+    /// <summary>
+    /// Set the current drive and stream provider (used by boot sequence).
+    /// </summary>
+    public void SetCurrentDrive(char driveLetter, IStreamProvider provider)
+    {
+        _currentDrive = char.ToUpperInvariant(driveLetter);
+        _currentDir = "\\";
+    }
+
     /// <summary>
     /// Run the command shell loop. Displays prompt, reads commands, executes them.
     /// This runs asynchronously so the UI can remain responsive.

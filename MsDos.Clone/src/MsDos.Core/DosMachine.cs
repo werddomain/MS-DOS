@@ -30,6 +30,9 @@ public sealed class DosMachine
     public IEventRegistry Events { get; }
     public IStreamProvider Streams { get; }
 
+    /// <summary>Floppy drive controller with A: and B: slots.</summary>
+    public FloppyDriveController Floppy { get; }
+
     /// <summary>Drive letter → stream provider mapping. Populated by mounting disk images or directories.</summary>
     private readonly Dictionary<char, IStreamProvider> _drives = new(CharComparer.OrdinalIgnoreCase);
 
@@ -44,11 +47,26 @@ public sealed class DosMachine
     /// <summary>Fired on each instruction step (for debugging).</summary>
     public event Action? OnStep;
 
+    /// <summary>Fired after a step in manual clock mode, providing the memory diff.</summary>
+    public event Action<MemoryDiff>? OnManualStep;
+
     /// <summary>Maximum instructions per frame (throttle).</summary>
     public int InstructionsPerFrame { get; set; } = 50000;
 
     /// <summary>Target frame interval in milliseconds.</summary>
     public int FrameIntervalMs { get; set; } = 16; // ~60 FPS
+
+    /// <summary>When true, the automatic CPU clock is disabled; instructions only execute on StepInstruction().</summary>
+    public bool ManualClockMode { get; set; }
+
+    /// <summary>Physical start address for memory snapshots in manual mode.</summary>
+    public uint SnapshotStartAddress { get; set; }
+
+    /// <summary>Length in bytes for memory snapshots in manual mode.</summary>
+    public int SnapshotLength { get; set; } = 256;
+
+    /// <summary>The last memory snapshot captured (before last step).</summary>
+    public MemorySnapshot? LastSnapshot { get; private set; }
 
     public DosMachine(
         IGraphicsRenderer renderer,
@@ -72,6 +90,7 @@ public sealed class DosMachine
         Dos = new DosKernel(Cpu, Memory, streams, events, renderer, Video, Log);
         Loader = new BinaryLoader(Memory, Cpu);
         Shell = new CommandShell(Dos, Memory, Cpu, streams, events, Video, renderer, Log, this);
+        Floppy = new FloppyDriveController(Log);
 
         // Mount C: as the default stream provider
         _drives['C'] = streams;
@@ -103,12 +122,14 @@ public sealed class DosMachine
 
     /// <summary>
     /// Mount a disk image (IMG/RAW) as a drive letter.
+    /// For A:/B: drives, also registers with the floppy drive controller.
     /// Also registers it with INT 13h disk services for sector-level access.
     /// </summary>
     /// <param name="driveLetter">Drive letter (A-Z).</param>
     /// <param name="imageData">Raw disk image bytes.</param>
+    /// <param name="label">Optional label for the disk.</param>
     /// <returns>True if the image was loaded and mounted.</returns>
-    public bool MountDiskImage(char driveLetter, byte[] imageData)
+    public bool MountDiskImage(char driveLetter, byte[] imageData, string? label = null)
     {
         driveLetter = char.ToUpperInvariant(driveLetter);
         var diskLoader = new DiskImageLoader(Log);
@@ -120,6 +141,13 @@ public sealed class DosMachine
 
         var provider = new DiskImageStreamProvider(diskLoader, Log);
         _drives[driveLetter] = provider;
+
+        // Track in floppy controller for A:/B:
+        var floppySlot = Floppy.GetSlot(driveLetter);
+        if (floppySlot != null)
+        {
+            floppySlot.InsertDisk(imageData, label);
+        }
 
         // Register with INT 13h for sector-level access
         byte biosDrive = driveLetter switch
@@ -145,6 +173,73 @@ public sealed class DosMachine
 
     /// <summary>Get all mounted drive letters.</summary>
     public IReadOnlyList<char> GetMountedDrives() => _drives.Keys.OrderBy(c => c).ToList();
+
+    /// <summary>
+    /// Eject a floppy disk from drive A: or B: while the system is running.
+    /// Returns the current disk image data (for saving), or null if no disk.
+    /// </summary>
+    public byte[]? EjectFloppyDisk(char driveLetter)
+    {
+        driveLetter = char.ToUpperInvariant(driveLetter);
+        if (driveLetter != 'A' && driveLetter != 'B') return null;
+
+        var data = Floppy.EjectDisk(driveLetter);
+        _drives.Remove(driveLetter);
+        Log.Info("Machine", $"Floppy {driveLetter}: ejected");
+        return data;
+    }
+
+    /// <summary>
+    /// Insert a floppy disk into drive A: or B: while the system is running (hot-swap).
+    /// </summary>
+    public bool InsertFloppyDisk(char driveLetter, byte[] imageData, string? label = null)
+    {
+        driveLetter = char.ToUpperInvariant(driveLetter);
+        if (driveLetter != 'A' && driveLetter != 'B') return false;
+
+        return MountDiskImage(driveLetter, imageData, label);
+    }
+
+    /// <summary>
+    /// Save the current state of a floppy drive to an IMG byte array.
+    /// </summary>
+    public byte[]? SaveFloppyState(char driveLetter)
+    {
+        return Floppy.SaveDriveState(driveLetter);
+    }
+
+    /// <summary>
+    /// Perform the boot sequence: check A: → B: → C: for bootable media.
+    /// Returns the drive letter that was selected for boot, or null if no bootable drive found.
+    /// </summary>
+    public char? CheckBootSequence()
+    {
+        Log.Info("Boot", "Checking boot sequence: A: → B: → C:");
+
+        // Check A:
+        if (Floppy.SlotA.HasDisk)
+        {
+            Log.Info("Boot", "Boot disk found in A:");
+            return 'A';
+        }
+
+        // Check B:
+        if (Floppy.SlotB.HasDisk)
+        {
+            Log.Info("Boot", "Boot disk found in B:");
+            return 'B';
+        }
+
+        // Check C:
+        if (_drives.ContainsKey('C'))
+        {
+            Log.Info("Boot", "Booting from C: (hard drive)");
+            return 'C';
+        }
+
+        Log.Warn("Boot", "No bootable media found");
+        return null;
+    }
 
     /// <summary>Case-insensitive char comparer for drive letters.</summary>
     private sealed class CharComparer : IEqualityComparer<char>
@@ -248,6 +343,14 @@ public sealed class DosMachine
         {
             while (_running && !_terminated && !_cts.Token.IsCancellationRequested)
             {
+                // In manual clock mode, just yield and wait for manual steps
+                if (ManualClockMode)
+                {
+                    await Renderer.FlushAsync();
+                    await Task.Delay(FrameIntervalMs, _cts.Token).ConfigureAwait(false);
+                    continue;
+                }
+
                 // Execute a batch of instructions
                 for (int i = 0; i < InstructionsPerFrame && _running && !_terminated; i++)
                 {
@@ -284,10 +387,39 @@ public sealed class DosMachine
 
     /// <summary>
     /// Execute a single CPU instruction (for debugging/stepping).
+    /// In manual clock mode, captures memory snapshots and fires OnManualStep with a diff.
     /// </summary>
     public int StepInstruction()
     {
         if (Cpu.IsHalted || _terminated) return 0;
+
+        if (ManualClockMode)
+        {
+            // Capture snapshot before execution
+            uint snapAddr = SnapshotStartAddress;
+            if (snapAddr == 0)
+                snapAddr = Cpu.Regs.CS * 16u + Cpu.Regs.IP;
+
+            var before = Memory.CaptureSnapshot(snapAddr, SnapshotLength, Cpu.Regs);
+
+            // Log the instruction about to execute
+            ushort cs = Cpu.Regs.CS, ip = Cpu.Regs.IP;
+            byte opcode = Memory.ReadByte(cs, ip);
+            Log.Trace("CPU", $"STEP {cs:X4}:{ip:X4}  opcode={opcode:X2}  AX={Cpu.Regs.AX:X4} BX={Cpu.Regs.BX:X4} CX={Cpu.Regs.CX:X4} DX={Cpu.Regs.DX:X4}");
+
+            int cycles = Cpu.Step();
+            OnStep?.Invoke();
+
+            // Capture snapshot after execution
+            var after = Memory.CaptureSnapshot(snapAddr, SnapshotLength, Cpu.Regs);
+            LastSnapshot = after;
+
+            var diff = before.CompareTo(after);
+            OnManualStep?.Invoke(diff);
+
+            return cycles;
+        }
+
         return Cpu.Step();
     }
 
@@ -303,7 +435,7 @@ public sealed class DosMachine
 
     /// <summary>
     /// Start the built-in command shell (COMMAND.COM emulation).
-    /// Provides a DOS prompt with DIR, TYPE, VER, CLS, and other commands.
+    /// Performs boot sequence check (A: → B: → C:), then provides a DOS prompt.
     /// Processes CONFIG.SYS and AUTOEXEC.BAT if they exist.
     /// </summary>
     public async Task RunShellAsync(CancellationToken cancellationToken = default)
@@ -314,6 +446,19 @@ public sealed class DosMachine
 
         try
         {
+            // Check boot sequence: A: → B: → C:
+            var bootDrive = CheckBootSequence();
+            if (bootDrive.HasValue && bootDrive.Value != 'C')
+            {
+                // Set the shell's current drive to the boot floppy
+                var provider = GetDriveProvider(bootDrive.Value);
+                if (provider != null)
+                {
+                    Shell.SetCurrentDrive(bootDrive.Value, provider);
+                    Log.Info("Boot", $"Shell starting on {bootDrive.Value}:");
+                }
+            }
+
             // Process CONFIG.SYS if present
             await ProcessConfigSysAsync();
 

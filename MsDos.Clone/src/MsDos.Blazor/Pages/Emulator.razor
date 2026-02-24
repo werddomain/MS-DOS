@@ -1,5 +1,7 @@
 @page "/"
 @using MsDos.Core
+@using MsDos.Core.Dos
+@using MsDos.Core.Memory
 @using MsDos.Core.Platform
 @using MsDos.Blazor.Platform
 @inject IJSRuntime JS
@@ -14,11 +16,7 @@
                 <InputFile OnChange="OnFileSelected" accept=".com,.exe,.COM,.EXE" style="display:none" />
             </label>
             <label class="btn btn-secondary">
-                Load Disk Image
-                <InputFile OnChange="OnDiskImageSelected" accept=".img,.raw,.ima,.dsk,.IMG,.RAW,.IMA,.DSK" style="display:none" />
-            </label>
-            <label class="btn btn-secondary">
-                Import C: Drive
+                Import C:
                 <InputFile OnChange="OnImportCDrive" accept=".img,.raw,.ima,.dsk,.IMG,.RAW,.IMA,.DSK" style="display:none" />
             </label>
             <button class="btn btn-secondary" @onclick="OnExportCDrive">Export C:</button>
@@ -26,6 +24,36 @@
             <button class="btn btn-primary" @onclick="OnReset" disabled="@(!_loaded && !_running)">Reset</button>
             <button class="btn btn-danger" @onclick="OnStop" disabled="@(!_running)">Stop</button>
         </div>
+    </div>
+
+    @* ── Floppy Drive Panel ── *@
+    <div class="floppy-panel">
+        @foreach (var slot in new[] { ('A', _slotALabel, _slotAReading, _slotAWriting, _slotAHasDisk),
+                                       ('B', _slotBLabel, _slotBReading, _slotBWriting, _slotBHasDisk) })
+        {
+            var drive = slot.Item1;
+            var label = slot.Item2;
+            var reading = slot.Item3;
+            var writing = slot.Item4;
+            var hasDisk = slot.Item5;
+
+            <div class="floppy-slot">
+                <div class="floppy-led @(writing ? "led-write" : reading ? "led-read" : hasDisk ? "led-idle" : "led-off")"></div>
+                <span class="floppy-label">@drive: [@label]</span>
+                <select class="floppy-type" @onchange="(e) => OnDriveTypeChanged(drive, e)">
+                    <option selected>1.44 MB</option>
+                    <option>720 KB</option>
+                    <option>1.2 MB</option>
+                    <option>360 KB</option>
+                </select>
+                <label class="btn btn-sm btn-green">
+                    Insert
+                    <InputFile OnChange="(e) => OnInsertFloppy(drive, e)" accept=".img,.raw,.ima,.dsk" style="display:none" />
+                </label>
+                <button class="btn btn-sm btn-orange" disabled="@(!hasDisk)" @onclick="() => OnEjectFloppy(drive)">Eject</button>
+                <button class="btn btn-sm btn-blue" disabled="@(!hasDisk)" @onclick="() => OnSaveFloppy(drive)">Save</button>
+            </div>
+        }
     </div>
 
     <div class="screen-container" @onkeydown="OnKeyDown" @onkeyup="OnKeyUp"
@@ -37,17 +65,55 @@
         <span>@_statusText</span>
     </div>
 
-    @if (_logEntries.Count > 0)
+    @* ── Debug Toolbar ── *@
+    <div class="debug-toolbar">
+        <label class="debug-toggle">
+            <input type="checkbox" @bind="_manualClock" @bind:event="onchange" @bind:after="OnManualClockToggle" />
+            Manual Clock
+        </label>
+        <button class="btn btn-sm" disabled="@(!_manualClock)" @onclick="OnStepClick">Step (F10)</button>
+        <label class="debug-toggle">
+            <input type="checkbox" @bind="_traceEnabled" @bind:event="onchange" @bind:after="OnTraceToggle" />
+            Trace
+        </label>
+        <select class="log-level-select" @onchange="OnLogLevelChanged">
+            <option>Trace</option>
+            <option>Debug</option>
+            <option selected>Info</option>
+            <option>Warning</option>
+            <option>Error</option>
+        </select>
+        <button class="btn btn-sm" @onclick="ClearLog">Clear Log</button>
+        <div class="debug-tab-buttons">
+            <button class="btn btn-sm @(_activeDebugTab == 0 ? "active-tab" : "")" @onclick="() => _activeDebugTab = 0">Log</button>
+            <button class="btn btn-sm @(_activeDebugTab == 1 ? "active-tab" : "")" @onclick="() => _activeDebugTab = 1">Memory</button>
+        </div>
+    </div>
+
+    @* ── Log / Memory Panel ── *@
+    @if (_activeDebugTab == 0)
     {
         <div class="log-panel">
-            <div class="log-header">
-                <strong>System Log</strong>
-                <button class="btn btn-sm" @onclick="ClearLog">Clear</button>
-            </div>
-            <div class="log-content">
-                @foreach (var entry in _logEntries.TakeLast(20))
+            <div class="log-content" id="logContent">
+                @foreach (var entry in _logEntries.TakeLast(100))
                 {
                     <div class="log-@entry.Level.ToString().ToLower()">@entry</div>
+                }
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="memory-panel">
+            <div class="register-bar">@_registerText</div>
+            <div class="memory-content">
+                @if (_memoryDiffHtml != null)
+                {
+                    @((MarkupString)_memoryDiffHtml)
+                }
+                else
+                {
+                    <span class="mem-muted">Enable Manual Clock and press Step to see memory diffs</span>
                 }
             </div>
         </div>
@@ -63,8 +129,21 @@
     private CancellationTokenSource? _cts;
     private bool _loaded;
     private bool _running;
-    private string _statusText = "Ready - Upload a COM/EXE file or disk image to start";
+    private string _statusText = "Ready - Upload a COM/EXE file or start Shell";
     private readonly List<LogEntry> _logEntries = new();
+
+    // Floppy drive state
+    private string _slotALabel = "Empty";
+    private string _slotBLabel = "Empty";
+    private bool _slotAReading, _slotAWriting, _slotAHasDisk;
+    private bool _slotBReading, _slotBWriting, _slotBHasDisk;
+
+    // Debug state
+    private bool _manualClock;
+    private bool _traceEnabled;
+    private int _activeDebugTab;
+    private string _registerText = "Registers: (load a program to see register state)";
+    private string? _memoryDiffHtml;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -92,7 +171,7 @@
         _machine.Log.EntryAdded += entry =>
         {
             _logEntries.Add(entry);
-            if (_logEntries.Count > 100)
+            if (_logEntries.Count > 500)
                 _logEntries.RemoveAt(0);
             if (entry.Level >= LogLevel.Warning)
             {
@@ -100,9 +179,162 @@
                 InvokeAsync(StateHasChanged);
             }
         };
+        _machine.OnManualStep += diff =>
+        {
+            InvokeAsync(() =>
+            {
+                UpdateMemoryDiffView(diff);
+                StateHasChanged();
+            });
+        };
+
+        // Wire floppy activity
+        _machine.Floppy.SlotA.ActivityChanged += slot =>
+            InvokeAsync(() => { _slotAReading = slot.IsReading; _slotAWriting = slot.IsWriting; StateHasChanged(); });
+        _machine.Floppy.SlotB.ActivityChanged += slot =>
+            InvokeAsync(() => { _slotBReading = slot.IsReading; _slotBWriting = slot.IsWriting; StateHasChanged(); });
+        _machine.Floppy.SlotA.DiskChanged += slot =>
+            InvokeAsync(() => { _slotAHasDisk = slot.HasDisk; _slotALabel = slot.DiskLabel ?? "Empty"; StateHasChanged(); });
+        _machine.Floppy.SlotB.DiskChanged += slot =>
+            InvokeAsync(() => { _slotBHasDisk = slot.HasDisk; _slotBLabel = slot.DiskLabel ?? "Empty"; StateHasChanged(); });
+
         _machine.Reset();
     }
 
+    // ── Memory diff rendering (git-diff style) ──
+    private void UpdateMemoryDiffView(MemoryDiff diff)
+    {
+        var rb = diff.RegistersBefore;
+        var ra = diff.RegistersAfter;
+        string RD(string n, ushort b, ushort a) => b != a ? $"<span class='reg-changed'>{n}:{b:X4}→{a:X4}</span>" : $"{n}:{a:X4}";
+        _registerText = ""; // use HTML instead
+        var regHtml = $"{RD("AX",rb.AX,ra.AX)} {RD("BX",rb.BX,ra.BX)} {RD("CX",rb.CX,ra.CX)} {RD("DX",rb.DX,ra.DX)} " +
+                      $"{RD("SI",rb.SI,ra.SI)} {RD("DI",rb.DI,ra.DI)} {RD("SP",rb.SP,ra.SP)} {RD("BP",rb.BP,ra.BP)} " +
+                      $"{RD("CS",rb.CS,ra.CS)} {RD("DS",rb.DS,ra.DS)} {RD("ES",rb.ES,ra.ES)} {RD("SS",rb.SS,ra.SS)} " +
+                      $"{RD("IP",rb.IP,ra.IP)} {RD("FL",rb.Flags,ra.Flags)}";
+
+        var changedAddrs = new HashSet<uint>(diff.Changes.Select(c => c.Address));
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"<div class='register-line'>{regHtml}</div>");
+
+        int bytesPerLine = 16;
+        for (int offset = 0; offset < diff.After.Length; offset += bytesPerLine)
+        {
+            uint addr = diff.After.StartAddress + (uint)offset;
+            sb.Append($"<span class='mem-addr'>{addr:X5}</span>  ");
+            for (int i = 0; i < bytesPerLine && offset + i < diff.After.Length; i++)
+            {
+                uint ba = addr + (uint)i;
+                byte val = diff.After.Data[offset + i];
+                if (changedAddrs.Contains(ba))
+                {
+                    byte ov = diff.Before.Data[offset + i];
+                    sb.Append($"<span class='mem-old'>{ov:X2}</span><span class='mem-new'>→{val:X2}</span> ");
+                }
+                else
+                    sb.Append($"<span class='mem-byte'>{val:X2}</span> ");
+            }
+            sb.Append(" ");
+            for (int i = 0; i < bytesPerLine && offset + i < diff.After.Length; i++)
+            {
+                byte val = diff.After.Data[offset + i];
+                char c = (val >= 0x20 && val < 0x7F) ? (char)val : '.';
+                uint ba = addr + (uint)i;
+                if (changedAddrs.Contains(ba))
+                    sb.Append($"<span class='mem-ascii-changed'>{System.Net.WebUtility.HtmlEncode(c.ToString())}</span>");
+                else
+                    sb.Append($"<span class='mem-ascii'>{System.Net.WebUtility.HtmlEncode(c.ToString())}</span>");
+            }
+            sb.Append("<br/>");
+        }
+        _memoryDiffHtml = sb.ToString();
+        _activeDebugTab = 1; // switch to memory tab
+    }
+
+    // ── Floppy drive operations ──
+    private async Task OnInsertFloppy(char drive, InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            bool ok = _machine!.InsertFloppyDisk(drive, data, file.Name);
+            _statusText = ok ? $"Disk inserted into {drive}: ({file.Name})" : $"Failed to insert disk into {drive}:";
+            StateHasChanged();
+        }
+        catch (Exception ex) { _statusText = $"Error: {ex.Message}"; }
+    }
+
+    private async Task OnEjectFloppy(char drive)
+    {
+        var data = _machine?.EjectFloppyDisk(drive);
+        _statusText = $"Disk ejected from {drive}:";
+        StateHasChanged();
+    }
+
+    private async Task OnSaveFloppy(char drive)
+    {
+        var data = _machine?.SaveFloppyState(drive);
+        if (data != null)
+        {
+            var base64 = Convert.ToBase64String(data);
+            await JS.InvokeVoidAsync("dosRenderer.downloadFile", $"drive_{char.ToLower(drive)}.img", base64);
+            _statusText = $"Drive {drive}: saved";
+        }
+    }
+
+    private void OnDriveTypeChanged(char drive, ChangeEventArgs e)
+    {
+        if (_machine == null) return;
+        var diskType = (e.Value?.ToString()) switch
+        {
+            "720 KB" => FloppyDiskType.Floppy720K,
+            "1.2 MB" => FloppyDiskType.Floppy1200K,
+            "360 KB" => FloppyDiskType.Floppy360K,
+            _ => FloppyDiskType.Floppy1440K,
+        };
+        _machine.Floppy.SetDiskType(drive, diskType);
+    }
+
+    // ── Debug controls ──
+    private void OnManualClockToggle()
+    {
+        if (_machine == null) return;
+        _machine.ManualClockMode = _manualClock;
+        _statusText = _manualClock ? "Manual clock — press Step to execute" : "Automatic clock";
+    }
+
+    private void OnStepClick()
+    {
+        if (_machine == null || !_manualClock) return;
+        _machine.StepInstruction();
+    }
+
+    private void OnTraceToggle()
+    {
+        if (_machine == null) return;
+        _machine.Log.TraceInstructions = _traceEnabled;
+        if (_traceEnabled)
+            _machine.Log.MinLevel = LogLevel.Trace;
+    }
+
+    private void OnLogLevelChanged(ChangeEventArgs e)
+    {
+        if (_machine == null) return;
+        _machine.Log.MinLevel = (e.Value?.ToString()) switch
+        {
+            "Trace" => LogLevel.Trace,
+            "Debug" => LogLevel.Debug,
+            "Warning" => LogLevel.Warning,
+            "Error" => LogLevel.Error,
+            _ => LogLevel.Info,
+        };
+    }
+
+    // ── File operations ──
     private async Task OnFileSelected(InputFileChangeEventArgs e)
     {
         var file = e.File;
@@ -143,65 +375,6 @@
             {
                 _running = false;
                 StateHasChanged();
-            }
-        }
-        catch (Exception ex)
-        {
-            _statusText = $"Error: {ex.Message}";
-        }
-    }
-
-    private async Task OnDiskImageSelected(InputFileChangeEventArgs e)
-    {
-        var file = e.File;
-        if (file == null) return;
-
-        try
-        {
-            using var ms = new MemoryStream();
-            // Allow up to 10MB for disk images
-            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
-            byte[] data = ms.ToArray();
-            string fileName = file.Name;
-
-            // Pick drive letter (A: first, then B:)
-            char drive = 'A';
-            if (_machine!.GetDriveProvider('A') != null)
-                drive = 'B';
-
-            bool mounted = _machine.LoadDiskImage(data, drive);
-            if (!mounted)
-            {
-                _statusText = "Failed to load disk image. Invalid or unsupported format.";
-                StateHasChanged();
-                return;
-            }
-
-            _statusText = $"Disk image mounted as {drive}: ({fileName})";
-            _loaded = true;
-            StateHasChanged();
-
-            // Start shell if not running so user can explore the disk
-            if (!_running)
-            {
-                _cts?.Cancel();
-                _running = true;
-                _statusText = $"Shell running - Disk {drive}: loaded ({fileName})";
-                StateHasChanged();
-
-                _cts = new CancellationTokenSource();
-                await _containerRef.FocusAsync();
-
-                try
-                {
-                    await _machine.RunShellAsync(_cts.Token);
-                }
-                catch (OperationCanceledException) { }
-                finally
-                {
-                    _running = false;
-                    StateHasChanged();
-                }
             }
         }
         catch (Exception ex)
@@ -287,7 +460,6 @@
             _statusText = "Exporting C: drive...";
             StateHasChanged();
             byte[] image = await MsDos.Core.Dos.DiskImageWriter.ExportDriveAsImageAsync(_streams!, _machine!.Log);
-            // Trigger download via JS
             var base64 = Convert.ToBase64String(image);
             await JS.InvokeVoidAsync("dosRenderer.downloadFile", "drive_c.img", base64);
             _statusText = "C: drive exported as drive_c.img";
@@ -307,6 +479,12 @@
 
     private void OnKeyDown(KeyboardEventArgs e)
     {
+        // F10 = step in manual mode
+        if (e.Key == "F10" && _manualClock)
+        {
+            _machine?.StepInstruction();
+            return;
+        }
         _events?.OnKeyDown(e.Key, e.Code, e.ShiftKey, e.CtrlKey, e.AltKey);
     }
 
