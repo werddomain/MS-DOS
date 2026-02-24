@@ -28,12 +28,12 @@ Legend: ✅ Implemented | 🔧 Partial | ❌ Not implemented
 | 9F | LAHF | ✅ | |
 | E4-E7 | IN AL/AX, imm8 / OUT imm8, AL/AX | ✅ | Stub (no port I/O) |
 | EC-EF | IN AL/AX, DX / OUT DX, AL/AX | ✅ | Stub (no port I/O) |
-| 0x60 | PUSHA | ❌ | 80186+ |
-| 0x61 | POPA | ❌ | 80186+ |
-| 0x68 | PUSH imm16 | ❌ | 80186+ |
-| 0x6A | PUSH imm8 (sign-ext) | ❌ | 80186+ |
-| 0x6C-0x6D | INSB/INSW | ❌ | 80186+ |
-| 0x6E-0x6F | OUTSB/OUTSW | ❌ | 80186+ |
+| 0x60 | PUSHA | ✅ | 80186+ |
+| 0x61 | POPA | ✅ | 80186+ |
+| 0x68 | PUSH imm16 | ✅ | 80186+ |
+| 0x6A | PUSH imm8 (sign-ext) | ✅ | 80186+ |
+| 0x6C-0x6D | INSB/INSW | ✅ | Stub (no port I/O) |
+| 0x6E-0x6F | OUTSB/OUTSW | ✅ | Stub (no port I/O) |
 
 ### 1.2 Arithmetic
 
@@ -61,9 +61,9 @@ Legend: ✅ Implemented | 🔧 Partial | ❌ Not implemented
 | 99 | CWD | ✅ | |
 | F6 /3 | NEG r/m8 | ✅ | |
 | F7 /3 | NEG r/m16 | ✅ | |
-| 0x69 | IMUL r16, r/m16, imm16 | ❌ | 80186+ |
-| 0x6B | IMUL r16, r/m16, imm8 | ❌ | 80186+ |
-| 0x62 | BOUND r16, mem | ❌ | 80186+ |
+| 0x69 | IMUL r16, r/m16, imm16 | ✅ | 80186+ |
+| 0x6B | IMUL r16, r/m16, imm8 | ✅ | 80186+ |
+| 0x62 | BOUND r16, mem | ✅ | 80186+ |
 
 ### 1.3 Logic & Shift
 
@@ -119,8 +119,8 @@ Legend: ✅ Implemented | 🔧 Partial | ❌ Not implemented
 | CD | INT n | ✅ | |
 | CE | INTO | ✅ | |
 | CF | IRET | ✅ | |
-| 0xC8 | ENTER imm16, imm8 | ❌ | 80186+ |
-| 0xC9 | LEAVE | ❌ | 80186+ |
+| 0xC8 | ENTER imm16, imm8 | ✅ | 80186+ |
+| 0xC9 | LEAVE | ✅ | 80186+ |
 
 ### 1.6 Stack
 
@@ -159,14 +159,17 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | Opcode(s) | Mnemonic | Status | Notes |
 |-----------|----------|--------|-------|
-| 0F 80-8F | Jcc near rel16 (16-bit offsets) | ❌ | Required by most compilers |
-| 0F B6 | MOVZX r16, r/m8 | ❌ | 80386+ but common |
-| 0F B7 | MOVZX r16, r/m16 | ❌ | 80386+ |
-| 0F BE | MOVSX r16, r/m8 | ❌ | 80386+ but common |
-| 0F BF | MOVSX r16, r/m16 | ❌ | 80386+ |
-| 0F A4/A5 | SHLD | ❌ | 80386+ |
-| 0F AC/AD | SHRD | ❌ | 80386+ |
-| 0F AF | IMUL r16, r/m16 | ❌ | 80386+ |
+| 0F 80-8F | Jcc near rel16 (16-bit offsets) | ✅ | Required by most compilers |
+| 0F B6 | MOVZX r16, r/m8 | ✅ | 80386+ but common |
+| 0F B7 | MOVZX r16, r/m16 | ✅ | 80386+ |
+| 0F BE | MOVSX r16, r/m8 | ✅ | 80386+ but common |
+| 0F BF | MOVSX r16, r/m16 | ✅ | 80386+ |
+| 0F A4/A5 | SHLD | ✅ | 80386+ |
+| 0F AC/AD | SHRD | ✅ | 80386+ |
+| 0F AF | IMUL r16, r/m16 | ✅ | 80386+ |
+| 0F 90-9F | SETcc | ✅ | 80386+ |
+| 0F A3/AB/B3/BA/BB | BT/BTS/BTR/BTC | ✅ | 80386+ |
+| 0F BC/BD | BSF/BSR | ✅ | 80386+ |
 | 0F B0/B1 | CMPXCHG | ❌ | 80486+ |
 | 0F C0/C1 | XADD | ❌ | 80486+ |
 | 0F 01 | LGDT/SGDT/LIDT/SIDT | ❌ | Protected mode, low priority |
@@ -197,7 +200,7 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | AH | Function | Status | Notes |
 |----|----------|--------|-------|
-| 0Dh | Disk reset | ❌ | Flush all disk buffers |
+| 0Dh | Disk reset | ✅ | Flush all disk buffers |
 | 0Eh | Select disk | ✅ | |
 | 0Fh | Open file using FCB | ❌ | Legacy FCB, low priority |
 | 10h | Close file using FCB | ❌ | Legacy FCB, low priority |
@@ -217,27 +220,28 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 23h | Get file size (FCB) | ❌ | Legacy FCB, low priority |
 | 24h | Set random record number (FCB) | ❌ | Legacy FCB, low priority |
 | 25h | Set interrupt vector | ✅ | |
-| 26h | Create new PSP | ❌ | |
+| 26h | Create new PSP | ✅ | |
 | 27h | Random block read (FCB) | ❌ | Legacy FCB, low priority |
 | 28h | Random block write (FCB) | ❌ | Legacy FCB, low priority |
-| 29h | Parse filename into FCB | ❌ | Needed by some programs |
+| 29h | Parse filename into FCB | ✅ | Needed by some programs |
 
 ### 2.3 Date/Time & System Info (AH=2Ah–36h)
 
 | AH | Function | Status | Notes |
 |----|----------|--------|-------|
 | 2Ah | Get date | ✅ | |
-| 2Bh | Set date | ❌ | |
+| 2Bh | Set date | ✅ | Stub — accepted but ignored |
 | 2Ch | Get time | ✅ | |
-| 2Dh | Set time | ❌ | |
+| 2Dh | Set time | ✅ | Stub — accepted but ignored |
 | 2Eh | Set verify flag | ✅ | |
 | 2Fh | Get DTA address | ✅ | |
 | 30h | Get DOS version | ✅ | Returns 4.0 |
 | 31h | Terminate and stay resident (TSR) | ❌ | Complex |
 | 33h | Get/set Ctrl-Break flag | ✅ | |
-| 34h | Get InDOS flag address | ❌ | |
+| 34h | Get InDOS flag address | ✅ | |
 | 35h | Get interrupt vector | ✅ | |
 | 36h | Get disk free space | ✅ | |
+| 37h | Get/set switch char | ✅ | |
 
 ### 2.4 File Handle Functions (AH=38h–62h)
 
@@ -256,8 +260,8 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 42h | Move file pointer (LSEEK) | ✅ | |
 | 43h | Get/set file attributes | 🔧 | Always returns archive |
 | 44h | IOCTL | 🔧 | Only subfunc 00h |
-| 45h | Duplicate handle (DUP) | ❌ | |
-| 46h | Force duplicate handle (DUP2) | ❌ | |
+| 45h | Duplicate handle (DUP) | ✅ | |
+| 46h | Force duplicate handle (DUP2) | ✅ | |
 | 47h | Get current directory | ✅ | Always returns root |
 | 48h | Allocate memory | ✅ | Simplified |
 | 49h | Free memory | ✅ | Stub |
@@ -275,20 +279,20 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 57h | Get/set file date/time | ✅ | |
 | 58h | Get/set memory allocation strategy | ✅ | |
 | 59h | Get extended error information | ✅ | Always returns "no error" |
-| 5Ah | Create temporary file | ❌ | |
-| 5Bh | Create new file (fail if exists) | ❌ | |
+| 5Ah | Create temporary file | ✅ | |
+| 5Bh | Create new file (fail if exists) | ✅ | |
 | 5Ch | Lock/unlock file region | ❌ | |
 | 5Dh | Set extended error info | ❌ | Undocumented |
 | 5Eh | Network services | ❌ | Low priority |
 | 5Fh | Network redirection | ❌ | Low priority |
-| 60h | Canonicalize filename | ❌ | |
+| 60h | Canonicalize filename | ✅ | |
 | 62h | Get PSP address | ✅ | |
 | 63h | Get lead byte table (DBCS) | ✅ | |
 | 65h | Get extended country info | 🔧 | Returns unsupported |
 | 66h | Get/set global code page | ✅ | |
-| 67h | Set handle count | ❌ | |
-| 68h | Commit file (flush) | ❌ | |
-| 6Ch | Extended open/create | ❌ | DOS 4.0+ |
+| 67h | Set handle count | ✅ | |
+| 68h | Commit file (flush) | ✅ | |
+| 6Ch | Extended open/create | ✅ | DOS 4.0+ |
 
 ---
 
@@ -305,17 +309,17 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 04h | Get light pen position | ❌ | Rarely used |
 | 05h | Set active display page | ✅ | |
 | 06h | Scroll up | ✅ | |
-| 07h | Scroll down | 🔧 | Delegates to scroll up |
+| 07h | Scroll down | ✅ | Proper implementation |
 | 08h | Read char/attr at cursor | ✅ | |
 | 09h | Write char/attr at cursor | ✅ | |
 | 0Ah | Write char at cursor (keep attr) | ✅ | |
-| 0Bh | Set color palette | ❌ | |
-| 0Ch | Write pixel | ❌ | Graphics modes |
-| 0Dh | Read pixel | ❌ | Graphics modes |
+| 0Bh | Set color palette | ✅ | Stub |
+| 0Ch | Write pixel | ✅ | |
+| 0Dh | Read pixel | ✅ | |
 | 0Eh | TTY output | ✅ | |
 | 0Fh | Get video mode | ✅ | |
 | 10h | Set palette registers | 🔧 | Stub |
-| 11h | Character generator | 🔧 | Stub |
+| 11h | Character generator | ✅ | Font info query supported |
 | 12h | Video subsystem configuration | ✅ | |
 | 13h | Write string | ✅ | |
 
@@ -335,15 +339,15 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | AH | Function | Status | Notes |
 |----|----------|--------|-------|
-| 00h | Reset disk system | ❌ | |
-| 01h | Get disk status | ❌ | |
-| 02h | Read sectors | ❌ | Required for disk image boot |
-| 03h | Write sectors | ❌ | |
-| 04h | Verify sectors | ❌ | |
+| 00h | Reset disk system | ✅ | |
+| 01h | Get disk status | ✅ | |
+| 02h | Read sectors | ✅ | |
+| 03h | Write sectors | ✅ | |
+| 04h | Verify sectors | ✅ | |
 | 05h | Format track | ❌ | |
-| 08h | Get drive parameters | ❌ | |
-| 15h | Get disk type | ❌ | |
-| 16h | Detect disk change | ❌ | |
+| 08h | Get drive parameters | ✅ | |
+| 15h | Get disk type | ✅ | |
+| 16h | Detect disk change | ✅ | |
 
 ### 3.5 INT 14h — Serial Port Services
 
@@ -358,10 +362,10 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | AH | Function | Status | Notes |
 |----|----------|--------|-------|
-| 86h | Wait | ❌ | |
+| 86h | Wait | ✅ | |
 | 87h | Extended memory copy | ❌ | |
-| 88h | Get extended memory size | ❌ | |
-| C0h | Get system config | ❌ | |
+| 88h | Get extended memory size | ✅ | |
+| C0h | Get system config | ✅ | Returns unsupported |
 
 ### 3.7 INT 16h — Keyboard Services
 
@@ -388,7 +392,7 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | Function | Status | Notes |
 |----------|--------|-------|
-| Reboot | ❌ | Could restart emulation |
+| Reboot | ✅ | Restarts emulation |
 
 ### 3.10 INT 1Ah — Time of Day
 
@@ -405,14 +409,14 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | AX | Function | Status | Notes |
 |----|----------|--------|-------|
-| 0000h | Reset/detect mouse | ❌ | |
-| 0001h | Show cursor | ❌ | |
-| 0002h | Hide cursor | ❌ | |
-| 0003h | Get position/button status | ❌ | |
-| 0004h | Set position | ❌ | |
-| 0007h | Set horizontal limits | ❌ | |
-| 0008h | Set vertical limits | ❌ | |
-| 000Ch | Set interrupt subroutine | ❌ | |
+| 0000h | Reset/detect mouse | ✅ | |
+| 0001h | Show cursor | ✅ | |
+| 0002h | Hide cursor | ✅ | |
+| 0003h | Get position/button status | ✅ | |
+| 0004h | Set position | ✅ | |
+| 0007h | Set horizontal limits | ✅ | |
+| 0008h | Set vertical limits | ✅ | |
+| 000Ch | Set interrupt subroutine | ✅ | Stub — accepted but ignored |
 
 ---
 
@@ -540,28 +544,28 @@ These are needed by many real-world DOS programs compiled for 80186+.
 ## 5. Implementation Priority
 
 ### Phase 1 — Core CPU Completeness (Highest Priority)
-1. ❌ **0x0F two-byte opcodes**: Jcc near (0F 80-8F) — used by virtually all compiled programs
-2. ❌ **ENTER/LEAVE** (C8/C9) — used by compiled C programs for stack frames
-3. ❌ **PUSHA/POPA** (60/61) — used widely by 80186+ programs
-4. ❌ **PUSH imm** (68/6A) — used by compilers for pushing constants
-5. ❌ **IMUL imm** (69/6B) — three-operand multiply used by compilers
-6. ❌ **MOVZX/MOVSX** (0F B6/BE) — used by 386+ compiled code
+1. ✅ **0x0F two-byte opcodes**: Jcc near (0F 80-8F) — used by virtually all compiled programs
+2. ✅ **ENTER/LEAVE** (C8/C9) — used by compiled C programs for stack frames
+3. ✅ **PUSHA/POPA** (60/61) — used widely by 80186+ programs
+4. ✅ **PUSH imm** (68/6A) — used by compilers for pushing constants
+5. ✅ **IMUL imm** (69/6B) — three-operand multiply used by compilers
+6. ✅ **MOVZX/MOVSX** (0F B6/BE) — used by 386+ compiled code
 
 ### Phase 2 — Critical DOS Services
 1. ❌ **INT 21h/4Bh EXEC** — properly load and execute child programs
-2. ❌ **INT 21h/29h Parse filename** — needed by many programs
+2. ✅ **INT 21h/29h Parse filename** — needed by many programs
 3. ❌ **INT 21h/43h File attributes** — proper implementation
 4. ❌ **INT 21h/44h IOCTL** — additional subfunctions
-5. ❌ **INT 21h/45h-46h DUP/DUP2** — handle duplication
-6. ❌ **INT 21h/5Ah-5Bh** — temp file / create new
+5. ✅ **INT 21h/45h-46h DUP/DUP2** — handle duplication
+6. ✅ **INT 21h/5Ah-5Bh** — temp file / create new
 7. ❌ **MCB chain** — proper memory management
 
 ### Phase 3 — BIOS Services
-1. ❌ **INT 13h Disk services** — sector-level disk I/O for boot/install
-2. ❌ **INT 10h/0Ch-0Dh** — pixel read/write for graphics modes
-3. ❌ **INT 10h/07h** — proper scroll down
-4. ❌ **INT 33h Mouse** — mouse driver services
-5. ❌ **INT 15h/86h Wait** — timed delays
+1. ✅ **INT 13h Disk services** — sector-level disk I/O for boot/install
+2. ✅ **INT 10h/0Ch-0Dh** — pixel read/write for graphics modes
+3. ✅ **INT 10h/07h** — proper scroll down
+4. ✅ **INT 33h Mouse** — mouse driver services
+5. ✅ **INT 15h/86h Wait** — timed delays
 
 ### Phase 4 — Shell & Utilities
 1. ❌ I/O redirection (>, >>, <)
