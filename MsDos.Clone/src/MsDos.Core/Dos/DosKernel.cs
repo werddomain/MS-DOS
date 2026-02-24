@@ -40,7 +40,7 @@ public sealed class DosKernel
     private byte _currentDrive = 2; // C:
 
     // Drive provider map for resolving paths on different drives
-    private readonly Dictionary<char, IStreamProvider> _driveProviders = new(StringComparer.OrdinalIgnoreCase.GetHashCode() == 0 ? null! : new CharOrdinalIgnoreCaseComparer());
+    private readonly Dictionary<char, IStreamProvider> _driveProviders = new(new CharOrdinalIgnoreCaseComparer());
 
     /// <summary>
     /// Register a drive letter with its stream provider so the kernel can resolve file paths.
@@ -672,10 +672,28 @@ public sealed class DosKernel
             _cpu.Regs.Flags &= ~CpuFlags.Carry;
             _log.Debug("DOS", $"Open file '{path}' → handle {handle}");
         }
+        catch (FileNotFoundException ex)
+        {
+            _log.Debug("DOS", $"Open file '{path}' not found: {ex.Message}");
+            _cpu.Regs.AX = 0x02; // File not found
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            _log.Debug("DOS", $"Open file '{path}' access denied: {ex.Message}");
+            _cpu.Regs.AX = 0x05; // Access denied
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
+        catch (DirectoryNotFoundException ex)
+        {
+            _log.Debug("DOS", $"Open file '{path}' path not found: {ex.Message}");
+            _cpu.Regs.AX = 0x03; // Path not found
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
         catch (Exception ex)
         {
             _log.Debug("DOS", $"Open file '{path}' failed: {ex.Message}");
-            _cpu.Regs.AX = 0x02; // File not found
+            _cpu.Regs.AX = 0x02; // File not found (default)
             _cpu.Regs.Flags |= CpuFlags.Carry;
         }
     }

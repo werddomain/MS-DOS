@@ -712,7 +712,7 @@ public partial class MainForm : Form
         if (ok)
             _statusLabel.Text = $"Blank {diskType} disk inserted into {drive}:";
         else
-            MessageBox.Show($"Failed to create blank disk for {drive}:", "Error",
+            MessageBox.Show($"Failed to create blank disk for {drive}", "Error",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
