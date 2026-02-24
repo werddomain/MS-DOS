@@ -117,7 +117,7 @@ public class DiskImageWriterTests
         
         // Verify SETUP.BAT exists and is readable
         var setupBat = entries.FirstOrDefault(e => e.Name == "SETUP.BAT");
-        Assert.NotEmpty(setupBat.Name);
+        Assert.False(string.IsNullOrEmpty(setupBat.Name), "SETUP.BAT not found in root directory");
         byte[]? content = loader.ReadFile(setupBat);
         Assert.NotNull(content);
         string text = System.Text.Encoding.ASCII.GetString(content);

@@ -40,6 +40,7 @@ public partial class MainForm : Form
         var exportDriveItem = new ToolStripMenuItem("&Export C: Drive as IMG...", null, OnExportCDrive);
         exportDriveItem.ShortcutKeys = Keys.Control | Keys.E;
         var importDriveItem = new ToolStripMenuItem("&Import C: Drive from IMG...", null, OnImportCDrive);
+        importDriveItem.ShortcutKeys = Keys.Control | Keys.I;
         var shellItem = new ToolStripMenuItem("Start &Shell (COMMAND.COM)", null, OnStartShell);
         shellItem.ShortcutKeys = Keys.Control | Keys.S;
         var resetItem = new ToolStripMenuItem("&Reset Machine", null, OnReset);

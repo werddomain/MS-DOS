@@ -211,7 +211,7 @@ public sealed class DiskImageWriter
                 using var stream = await streams.OpenReadAsync(entry);
                 using var ms = new MemoryStream();
                 await stream.CopyToAsync(ms);
-                string name = Path.GetFileName(entry).ToUpperInvariant();
+                string name = (Path.GetFileName(entry) ?? entry).ToUpperInvariant();
                 files.Add((name, ms.ToArray()));
             }
             catch (Exception ex)

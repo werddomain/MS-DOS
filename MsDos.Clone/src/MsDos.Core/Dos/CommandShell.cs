@@ -575,7 +575,7 @@ public sealed class CommandShell
                     for (int j = 0; j < lines.Length; j++)
                     {
                         string l = lines[j].Trim();
-                        if (l.StartsWith(":") && l[1..].Trim().Equals(label, StringComparison.OrdinalIgnoreCase))
+                        if (l.StartsWith(":") && l.Length > 1 && l[1..].Trim().Equals(label, StringComparison.OrdinalIgnoreCase))
                         {
                             i = j + 1;
                             found = true;
@@ -660,7 +660,7 @@ public sealed class CommandShell
 
             // If destination is a directory or doesn't have a filename, use source name
             if (string.IsNullOrEmpty(Path.GetFileName(dst)))
-                dst = Path.Combine(dst, Path.GetFileName(src));
+                dst = Path.Combine(dst, Path.GetFileName(src) ?? src);
 
             await dstProvider.ImportBinaryAsync(dst, data);
             PrintLine($"        1 file(s) copied");
