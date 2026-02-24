@@ -62,8 +62,32 @@ public sealed class DosMachine
 
     private bool _running;
     private bool _terminated;
+    private bool _poweredOn;
     private byte _exitCode;
     private CancellationTokenSource? _cts;
+
+    // Activity tracking
+    private bool _cpuActive;
+    private bool _diskActive;
+    private DateTime _diskActivityUntilUtc;
+
+    /// <summary>Fired when HDD/disk activity state changes (true = active, false = idle).</summary>
+    public event Action<bool>? OnDiskActivity;
+
+    /// <summary>Fired when CPU activity state changes (true = executing, false = idle/halted).</summary>
+    public event Action<bool>? OnCpuActivity;
+
+    /// <summary>Fired when power state changes (true = on, false = off).</summary>
+    public event Action<bool>? OnPowerStateChanged;
+
+    /// <summary>Whether the machine is currently powered on.</summary>
+    public bool IsPoweredOn => _poweredOn;
+
+    /// <summary>Whether the CPU is actively executing instructions.</summary>
+    public bool IsCpuActive => _cpuActive;
+
+    /// <summary>Whether a disk operation is in progress.</summary>
+    public bool IsDiskActive => _diskActive;
 
     // INT 15h AH=86h wait state (non-blocking)
     private readonly object _int15WaitSync = new();
@@ -164,6 +188,7 @@ public sealed class DosMachine
         KeyboardIrq = new BiosKeyboardIrqHandler(Memory, Pic);
         Dos = new DosKernel(Cpu, Memory, streams, events, renderer, Video, Log);
         Dos.SetMemoryManager(MemoryManager);
+        Dos.OnFileIo = () => NotifyDiskActivity();
         Loader = new BinaryLoader(Memory, Cpu);
         Shell = new CommandShell(Dos, Memory, Cpu, streams, events, Video, renderer, Log, this);
         Floppy = new FloppyDriveController(Log);
@@ -516,6 +541,9 @@ public sealed class DosMachine
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _running = true;
         _terminated = false;
+        _poweredOn = true;
+
+        SetCpuActive(true);
 
         Log.Info("Machine", $"Emulation started at {Cpu.Regs.CS:X4}:{Cpu.Regs.IP:X4}");
 
@@ -579,6 +607,7 @@ public sealed class DosMachine
         finally
         {
             _running = false;
+            SetCpuActive(false);
             Log.Info("Machine", "Emulation stopped");
         }
     }
@@ -871,6 +900,214 @@ public sealed class DosMachine
 
     /// <summary>The exit code from the last terminated process.</summary>
     public byte ExitCode => _exitCode;
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  POWER ON / OFF
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Power on the machine. Performs reset, checks boot sequence (A: → B: → C:),
+    /// and starts the shell on the appropriate drive.
+    /// </summary>
+    public async Task PowerOnAsync(CancellationToken cancellationToken = default)
+    {
+        if (_poweredOn) return;
+        _poweredOn = true;
+        OnPowerStateChanged?.Invoke(true);
+        Log.Info("Machine", "Power ON");
+
+        SetCpuActive(true);
+        await RunShellAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Power off the machine. Stops emulation and clears CPU state.
+    /// Drive mounts are preserved for next power-on.
+    /// </summary>
+    public void PowerOff()
+    {
+        if (!_poweredOn) return;
+
+        Stop();
+        _poweredOn = false;
+        SetCpuActive(false);
+        SetDiskActive(false);
+
+        // Clear video
+        Renderer.SetMode(VideoMode.Text80x25);
+        Renderer.Clear(0);
+
+        OnPowerStateChanged?.Invoke(false);
+        Log.Info("Machine", "Power OFF");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  FILE UPLOAD / DOWNLOAD HELPERS
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Upload a file to a drive's file system, converting the filename to DOS 8.3 format.
+    /// Returns the actual DOS filename used on the target drive.
+    /// </summary>
+    /// <param name="driveLetter">Target drive letter (A-Z).</param>
+    /// <param name="filename">Original filename (will be converted to 8.3).</param>
+    /// <param name="data">File content bytes.</param>
+    /// <returns>The DOS 8.3 filename that was used, or null if upload failed.</returns>
+    public async Task<string?> UploadFileToDriveAsync(char driveLetter, string filename, byte[] data)
+    {
+        driveLetter = char.ToUpperInvariant(driveLetter);
+        string dosName = DosFileName.ToShortName(filename);
+
+        NotifyDiskActivity();
+        Log.Info("FileIO", $"Uploading '{filename}' → '{dosName}' to {driveLetter}: ({data.Length} bytes)");
+
+        try
+        {
+            var provider = GetDriveProvider(driveLetter);
+            if (provider == null)
+            {
+                Log.Error("FileIO", $"Drive {driveLetter}: not mounted");
+                return null;
+            }
+
+            // For floppy drives, we need to update the raw disk image
+            var floppySlot = Floppy.GetSlot(driveLetter);
+            if (floppySlot != null && floppySlot.HasDisk && floppySlot.ImageData != null)
+            {
+                // Write directly into the FAT image
+                var files = new List<(string Name, byte[] Data)> { (dosName, data) };
+                byte[] updatedImage = DiskImageWriter.WriteFilesToExistingImage(floppySlot.ImageData, files);
+                if (updatedImage != null)
+                {
+                    // Re-mount with updated image
+                    MountDiskImage(driveLetter, updatedImage, floppySlot.DiskLabel);
+                    Log.Info("FileIO", $"File '{dosName}' written to {driveLetter}: floppy image");
+                    return dosName;
+                }
+                else
+                {
+                    Log.Error("FileIO", $"Failed to write '{dosName}' to floppy image");
+                    return null;
+                }
+            }
+
+            // For non-floppy drives (C: etc.), use the stream provider
+            await provider.ImportBinaryAsync(dosName, data);
+            Log.Info("FileIO", $"File '{dosName}' uploaded to {driveLetter}:");
+            return dosName;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("FileIO", $"Upload failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Download a file from a drive's file system.
+    /// </summary>
+    /// <param name="driveLetter">Source drive letter (A-Z).</param>
+    /// <param name="filename">DOS filename to download.</param>
+    /// <returns>The file content bytes, or null if not found.</returns>
+    public async Task<byte[]?> DownloadFileFromDriveAsync(char driveLetter, string filename)
+    {
+        driveLetter = char.ToUpperInvariant(driveLetter);
+        string dosName = DosFileName.ToShortName(filename);
+
+        NotifyDiskActivity();
+        Log.Info("FileIO", $"Downloading '{dosName}' from {driveLetter}:");
+
+        try
+        {
+            var provider = GetDriveProvider(driveLetter);
+            if (provider == null)
+            {
+                Log.Error("FileIO", $"Drive {driveLetter}: not mounted");
+                return null;
+            }
+
+            if (!await provider.ExistsAsync(dosName))
+            {
+                Log.Warn("FileIO", $"File '{dosName}' not found on {driveLetter}:");
+                return null;
+            }
+
+            using var stream = await provider.OpenReadAsync(dosName);
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            Log.Info("FileIO", $"Downloaded '{dosName}' from {driveLetter}: ({data.Length} bytes)");
+            return data;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("FileIO", $"Download failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// List files on a drive.
+    /// </summary>
+    public async Task<IReadOnlyList<string>?> ListDriveFilesAsync(char driveLetter)
+    {
+        driveLetter = char.ToUpperInvariant(driveLetter);
+        var provider = GetDriveProvider(driveLetter);
+        if (provider == null) return null;
+
+        try
+        {
+            return await provider.ListEntriesAsync("");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("FileIO", $"Failed to list {driveLetter}: {ex.Message}");
+            return null;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  ACTIVITY TRACKING
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Signal that a disk operation occurred. Automatically turns off after a short delay.
+    /// Called internally from DosKernel file operations and INT 13h.
+    /// </summary>
+    public void NotifyDiskActivity()
+    {
+        _diskActivityUntilUtc = DateTime.UtcNow.AddMilliseconds(150);
+        SetDiskActive(true);
+    }
+
+    /// <summary>
+    /// Pump activity LEDs — call from UI timer to auto-deactivate disk LED.
+    /// </summary>
+    public void PumpActivityLeds()
+    {
+        if (_diskActive && DateTime.UtcNow >= _diskActivityUntilUtc)
+        {
+            SetDiskActive(false);
+        }
+    }
+
+    private void SetCpuActive(bool active)
+    {
+        if (_cpuActive != active)
+        {
+            _cpuActive = active;
+            OnCpuActivity?.Invoke(active);
+        }
+    }
+
+    private void SetDiskActive(bool active)
+    {
+        if (_diskActive != active)
+        {
+            _diskActive = active;
+            OnDiskActivity?.Invoke(active);
+        }
+    }
 
     /// <summary>INT 15h — System services (simplified).</summary>
     private void HandleInt15()

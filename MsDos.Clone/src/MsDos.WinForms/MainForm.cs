@@ -56,6 +56,11 @@ public partial class MainForm : Form
     private ComboBox _logLevelFilter = null!;
     private bool _adjustingMainSplit;
 
+    // Activity LEDs on status bar
+    private ToolStripStatusLabel _hddLed = null!;
+    private ToolStripStatusLabel _cpuLed = null!;
+    private ToolStripStatusLabel _powerButton = null!;
+
     public MainForm()
     {
         InitializeComponent();
@@ -78,6 +83,9 @@ public partial class MainForm : Form
         {
             MakeMenuItem("&Load Binary (COM/EXE)...", Keys.Control | Keys.O, OnLoadBinary),
             MakeMenuItem("Load &Disk Image (IMG/RAW)...", Keys.Control | Keys.D, OnLoadDiskImage),
+            new ToolStripSeparator(),
+            MakeMenuItem("&Upload File to Drive...", Keys.Control | Keys.U, OnUploadFile),
+            MakeMenuItem("Download File from Drive...", Keys.None, OnDownloadFile),
             new ToolStripSeparator(),
             MakeMenuItem("&Export C: Drive as IMG...", Keys.Control | Keys.E, OnExportCDrive),
             MakeMenuItem("&Import C: Drive from IMG...", Keys.Control | Keys.I, OnImportCDrive),
@@ -128,16 +136,48 @@ public partial class MainForm : Form
         // ── Right side: debug tabs ──
         BuildDebugPanel();
 
-        // ── Status bar ──
+        // ── Status bar with activity LEDs and power button ──
         _statusBar = new StatusStrip();
         _statusLabel = new ToolStripStatusLabel("Ready - Load a COM/EXE file or start Shell");
+
+        // Power button
+        _powerButton = new ToolStripStatusLabel("⏻ Power On")
+        {
+            IsLink = true,
+            ForeColor = System.Drawing.Color.LimeGreen,
+            Font = new System.Drawing.Font("Segoe UI", 9, FontStyle.Bold),
+            BorderSides = ToolStripStatusLabelBorderSides.All,
+            BorderStyle = Border3DStyle.RaisedOuter,
+            Padding = new Padding(4, 0, 4, 0),
+        };
+        _powerButton.Click += (_, _) => OnTogglePower();
+
+        // HDD activity LED
+        _hddLed = new ToolStripStatusLabel("● HDD")
+        {
+            ForeColor = System.Drawing.Color.DarkGray,
+            Font = new System.Drawing.Font("Segoe UI", 8, FontStyle.Bold),
+        };
+
+        // CPU activity LED
+        _cpuLed = new ToolStripStatusLabel("● CPU")
+        {
+            ForeColor = System.Drawing.Color.DarkGray,
+            Font = new System.Drawing.Font("Segoe UI", 8, FontStyle.Bold),
+        };
+
         _biosWaitLabel = new ToolStripStatusLabel("")
         {
             ForeColor = System.Drawing.Color.Gold,
             Font = new System.Drawing.Font("Segoe UI", 9, FontStyle.Bold)
         };
+        _statusBar.Items.Add(_powerButton);
+        _statusBar.Items.Add(new ToolStripSeparator());
         _statusBar.Items.Add(_statusLabel);
         _statusBar.Items.Add(new ToolStripStatusLabel { Spring = true });
+        _statusBar.Items.Add(_hddLed);
+        _statusBar.Items.Add(_cpuLed);
+        _statusBar.Items.Add(new ToolStripSeparator());
         _statusBar.Items.Add(_biosWaitLabel);
         Controls.Add(_statusBar);
 
@@ -462,10 +502,29 @@ public partial class MainForm : Form
         _uiWaitPumpTimer.Tick += (_, _) =>
         {
             _machine?.PumpBiosWaitFromHostClock();
+            _machine?.PumpActivityLeds();
             bool pending = _machine?.IsBiosWaitPending == true;
             _biosWaitLabel.Text = pending ? "BIOS WAIT…" : string.Empty;
         };
         _uiWaitPumpTimer.Start();
+
+        // Wire activity LEDs
+        _machine.OnDiskActivity += active =>
+        {
+            try { BeginInvoke(() => _hddLed.ForeColor = active ? System.Drawing.Color.Orange : System.Drawing.Color.DarkGray); } catch { }
+        };
+        _machine.OnCpuActivity += active =>
+        {
+            try { BeginInvoke(() => _cpuLed.ForeColor = active ? System.Drawing.Color.LimeGreen : System.Drawing.Color.DarkGray); } catch { }
+        };
+        _machine.OnPowerStateChanged += powered =>
+        {
+            try { BeginInvoke(() =>
+            {
+                _powerButton.Text = powered ? "⏻ Power Off" : "⏻ Power On";
+                _powerButton.ForeColor = powered ? System.Drawing.Color.Red : System.Drawing.Color.LimeGreen;
+            }); } catch { }
+        };
 
         // Wire process exit
         _machine.OnProcessExit += code =>
@@ -1006,5 +1065,183 @@ public partial class MainForm : Form
             MessageBox.Show($"Error importing drive: {ex.Message}", "Error",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  POWER ON / OFF
+    // ═══════════════════════════════════════════════════════════════════
+    private async void OnTogglePower()
+    {
+        if (_machine == null) return;
+
+        if (_machine.IsPoweredOn)
+        {
+            _cts?.Cancel();
+            _machine.PowerOff();
+            _statusLabel.Text = "Power OFF — insert a floppy and press Power On";
+        }
+        else
+        {
+            _cts?.Cancel();
+            _cts = new CancellationTokenSource();
+            _statusLabel.Text = "Power ON — booting...";
+            _ = _machine.PowerOnAsync(_cts.Token);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  FILE UPLOAD / DOWNLOAD
+    // ═══════════════════════════════════════════════════════════════════
+    private async void OnUploadFile(object? sender, EventArgs e)
+    {
+        if (_machine == null) return;
+
+        using var dlg = new OpenFileDialog
+        {
+            Title = "Upload File to Drive",
+            Filter = "All Files|*.*",
+        };
+
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        // Ask which drive
+        char drive = PickDrive("Upload to which drive?");
+        if (drive == '\0') return;
+
+        try
+        {
+            byte[] data = await File.ReadAllBytesAsync(dlg.FileName);
+            string filename = Path.GetFileName(dlg.FileName);
+            string? dosName = await _machine.UploadFileToDriveAsync(drive, filename, data);
+            if (dosName != null)
+                _statusLabel.Text = $"Uploaded '{filename}' → '{dosName}' to {drive}:";
+            else
+                MessageBox.Show($"Failed to upload file to {drive}:", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error uploading file: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private async void OnDownloadFile(object? sender, EventArgs e)
+    {
+        if (_machine == null) return;
+
+        // Ask which drive
+        char drive = PickDrive("Download from which drive?");
+        if (drive == '\0') return;
+
+        // List files on the drive
+        var files = await _machine.ListDriveFilesAsync(drive);
+        if (files == null || files.Count == 0)
+        {
+            MessageBox.Show($"No files found on {drive}:", "Info",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        // Let user pick a file
+        string? filename = PickFile(files, $"Select file from {drive}:");
+        if (filename == null) return;
+
+        try
+        {
+            byte[]? data = await _machine.DownloadFileFromDriveAsync(drive, filename);
+            if (data == null)
+            {
+                MessageBox.Show($"Could not read '{filename}' from {drive}:", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            using var dlg = new SaveFileDialog
+            {
+                Title = $"Save {filename}",
+                FileName = filename,
+                Filter = "All Files|*.*",
+            };
+
+            if (dlg.ShowDialog() == DialogResult.OK)
+            {
+                await File.WriteAllBytesAsync(dlg.FileName, data);
+                _statusLabel.Text = $"Downloaded '{filename}' from {drive}: ({data.Length} bytes)";
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error downloading file: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    /// <summary>Show a simple dialog to pick a drive letter from mounted drives.</summary>
+    private char PickDrive(string prompt)
+    {
+        var drives = _machine?.GetMountedDrives();
+        if (drives == null || drives.Count == 0)
+        {
+            MessageBox.Show("No drives mounted.", "Info", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return '\0';
+        }
+
+        using var form = new Form
+        {
+            Text = prompt,
+            ClientSize = new System.Drawing.Size(250, 100),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+        };
+
+        var combo = new ComboBox
+        {
+            Location = new System.Drawing.Point(20, 20),
+            Width = 200,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+        };
+        foreach (var d in drives) combo.Items.Add($"{d}:");
+        combo.SelectedIndex = 0;
+
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new System.Drawing.Point(80, 60) };
+        form.Controls.AddRange(new Control[] { combo, ok });
+        form.AcceptButton = ok;
+
+        return form.ShowDialog() == DialogResult.OK && combo.SelectedItem is string s && s.Length >= 1
+            ? s[0]
+            : '\0';
+    }
+
+    /// <summary>Show a simple dialog to pick a file from a list.</summary>
+    private static string? PickFile(IReadOnlyList<string> files, string title)
+    {
+        using var form = new Form
+        {
+            Text = title,
+            ClientSize = new System.Drawing.Size(300, 300),
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            StartPosition = FormStartPosition.CenterParent,
+            MaximizeBox = false,
+            MinimizeBox = false,
+        };
+
+        var listBox = new ListBox
+        {
+            Dock = DockStyle.Fill,
+            Font = new System.Drawing.Font("Consolas", 10),
+        };
+        foreach (var f in files) listBox.Items.Add(f);
+        listBox.SelectedIndex = 0;
+
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Dock = DockStyle.Bottom };
+        form.Controls.Add(listBox);
+        form.Controls.Add(ok);
+        form.AcceptButton = ok;
+        listBox.DoubleClick += (_, _) => { form.DialogResult = DialogResult.OK; form.Close(); };
+
+        return form.ShowDialog() == DialogResult.OK && listBox.SelectedItem is string s ? s : null;
     }
 }

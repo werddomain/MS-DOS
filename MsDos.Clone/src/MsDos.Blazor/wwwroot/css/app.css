@@ -88,6 +88,35 @@ html, body {
     font-weight: 700;
 }
 
+.activity-leds {
+    display: flex;
+    gap: 0.75rem;
+    font-size: 0.8rem;
+    font-family: 'Segoe UI', sans-serif;
+    font-weight: 700;
+}
+
+.activity-led {
+    color: #555;
+    transition: color 0.15s;
+}
+
+.led-hdd-active {
+    color: #ff8800;
+    text-shadow: 0 0 4px #ff8800;
+}
+
+.led-cpu-active {
+    color: #00ff00;
+    text-shadow: 0 0 4px #00ff00;
+}
+
+.btn-success {
+    background: #28a745;
+    color: white;
+    border-color: #28a745;
+}
+
 .btn-secondary {
     background: #6c757d;
     color: white;
