@@ -646,7 +646,7 @@ public partial class MainForm : Form
             bool ok = _machine!.InsertFloppyDisk(drive, data, label);
             if (!ok)
             {
-                MessageBox.Show($"Failed to load disk image into {drive}:", "Error",
+                MessageBox.Show($"Failed to load disk image into {drive}", "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }

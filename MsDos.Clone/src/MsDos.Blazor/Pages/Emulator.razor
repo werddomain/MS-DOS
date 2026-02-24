@@ -262,7 +262,7 @@
             await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
             byte[] data = ms.ToArray();
             bool ok = _machine!.InsertFloppyDisk(drive, data, file.Name);
-            _statusText = ok ? $"Disk inserted into {drive}: ({file.Name})" : $"Failed to insert disk into {drive}:";
+            _statusText = ok ? $"Disk inserted into {drive}: ({file.Name})" : $"Failed to load disk image into {drive}";
             StateHasChanged();
         }
         catch (Exception ex) { _statusText = $"Error: {ex.Message}"; }
@@ -271,7 +271,7 @@
     private async Task OnEjectFloppy(char drive)
     {
         var data = _machine?.EjectFloppyDisk(drive);
-        _statusText = $"Disk ejected from {drive}:";
+        _statusText = $"Disk ejected from {drive}";
         StateHasChanged();
     }
 

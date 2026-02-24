@@ -25,7 +25,7 @@ public sealed class MemorySnapshot
     {
         StartAddress = startAddress;
         Data = data;
-        Timestamp = DateTime.Now;
+        Timestamp = DateTime.UtcNow;
         Registers = registers;
     }
 
