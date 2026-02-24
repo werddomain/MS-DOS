@@ -1,0 +1,9 @@
+DOSBox version 0.74-3
+Copyright 2002-2019 DOSBox Team, published under GNU GPL.
+---
+CONFIG:Loading primary settings from config file c:\Users\clefw\source\repos\MS-DOS\v4.0\dosbox-build.conf
+Maximum memory size is 63 MB
+Memory sizes above 31 MB are NOT recommended.
+Stick with the default values unless you are absolutely certain.
+MIDI:Opened device:win32
+SHELL:Redirect output to dosbox_cfg_marker.txt

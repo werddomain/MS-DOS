@@ -11,9 +11,12 @@ public sealed class Cpu8086
 {
     public Registers Regs { get; } = new();
     private readonly MemoryBus _mem;
+    private IOPortBus? _ports;
     private EmulatorLog? _log;
     private bool _halted;
+    private bool _waitingForInput; // set by INT handlers when no key is available
     private int? _segmentOverride; // null = default, 0-3 = ES/CS/SS/DS
+    private bool _operandSize32;   // 0x66 prefix active: use 32-bit operands
 
     // ModR/M address cache: prevents double-decode when an instruction both reads and writes
     // the same ModR/M operand (e.g., ADD [BX+disp], reg). Without caching, the displacement
@@ -25,12 +28,37 @@ public sealed class Cpu8086
     /// <summary>Raised when an INT instruction is executed.</summary>
     public event Action<byte>? InterruptTriggered;
 
+    /// <summary>Raised after each instruction if the Trap Flag is set (INT 1 single-step).</summary>
+    public event Action? TrapFired;
+
+    /// <summary>
+    /// Raise a hardware interrupt (from PIC). Pushes flags/CS/IP and dispatches
+    /// just like TriggerInterrupt, but called externally instead of from an INT instruction.
+    /// </summary>
+    public void RaiseHardwareInterrupt(byte vector)
+    {
+        TriggerInterrupt(vector);
+    }
+
     public bool IsHalted => _halted;
+
+    /// <summary>
+    /// When true, an interrupt handler needs keyboard input but none is available.
+    /// The execution loop should yield and wait for a key event.
+    /// </summary>
+    public bool IsWaitingForInput
+    {
+        get => _waitingForInput;
+        set => _waitingForInput = value;
+    }
 
     public Cpu8086(MemoryBus memory)
     {
         _mem = memory;
     }
+
+    /// <summary>Attach the I/O port bus for IN/OUT instructions.</summary>
+    public void SetIOPortBus(IOPortBus ports) => _ports = ports;
 
     public void SetLog(EmulatorLog log) => _log = log;
 
@@ -44,13 +72,25 @@ public sealed class Cpu8086
         _segmentOverride = null;
     }
 
+    /// <summary>Unhalt the CPU (e.g. when an IRQ arrives).</summary>
+    public void Unhalt() => _halted = false;
+
     /// <summary>Execute a single instruction. Returns number of cycles (approximate).</summary>
     public int Step()
     {
         if (_halted) return 1;
         _segmentOverride = null;
         _modrmCached = false;
-        return DecodeAndExecute();
+        _operandSize32 = false;
+
+        bool wasTrap = GetFlag(CpuFlags.Trap);
+        int cycles = DecodeAndExecute();
+
+        // If the Trap Flag was set before this instruction, fire INT 1 (single-step)
+        if (wasTrap)
+            TrapFired?.Invoke();
+
+        return cycles;
     }
 
     // --- Helpers ---
@@ -68,6 +108,16 @@ public sealed class Cpu8086
         Regs.IP += 2;
         return val;
     }
+
+    private uint FetchDword()
+    {
+        uint val = _mem.ReadDword(Regs.CS, Regs.IP);
+        Regs.IP += 4;
+        return val;
+    }
+
+    /// <summary>Fetch a 16- or 32-bit immediate based on the operand-size prefix.</summary>
+    private uint FetchWordOrDword() => _operandSize32 ? FetchDword() : FetchWord();
 
     private ushort GetDefaultSegment(int rmField) =>
         rmField switch
@@ -98,6 +148,24 @@ public sealed class Cpu8086
     }
 
     // --- ModR/M decoding ---
+
+    /// <summary>
+    /// Fetch a ModR/M byte and skip any displacement it implies, without
+    /// reading or writing the operand. Used for ESC (x87) stubs so that
+    /// IP advances past the full instruction even though no FPU is present.
+    /// </summary>
+    private void SkipModRM()
+    {
+        byte modrm = FetchByte();
+        int mod = (modrm >> 6) & 3;
+        int rm = modrm & 7;
+
+        if (mod == 3) return; // register operand – nothing more to skip
+        if (mod == 0 && rm == 6) { FetchWord(); return; } // direct address (disp16)
+        if (mod == 1) { FetchByte(); return; } // disp8
+        if (mod == 2) { FetchWord(); } // disp16
+        // mod == 0 with rm != 6: no displacement bytes
+    }
 
     private (ushort segment, ushort offset) DecodeModRM_Address(byte modrm)
     {
@@ -290,11 +358,11 @@ public sealed class Cpu8086
         {
             // --- ADD ---
             case 0x00: modrm = FetchByte(); WriteModRM8(modrm, Add8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7))); return 3;
-            case 0x01: modrm = FetchByte(); WriteModRM16(modrm, Add16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); return 3;
+            case 0x01: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, Add32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7))); } else { WriteModRM16(modrm, Add16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); } return 3;
             case 0x02: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg8(reg, Add8(Regs.GetReg8(reg), ReadModRM8(modrm))); return 3;
-            case 0x03: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, Add16(Regs.GetReg16(reg), ReadModRM16(modrm))); return 3;
+            case 0x03: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Regs.SetReg32(reg, Add32(Regs.GetReg32(reg), ReadModRM32(modrm))); } else { Regs.SetReg16(reg, Add16(Regs.GetReg16(reg), ReadModRM16(modrm))); } return 3;
             case 0x04: Regs.AL = Add8(Regs.AL, FetchByte()); return 4;
-            case 0x05: Regs.AX = Add16(Regs.AX, FetchWord()); return 4;
+            case 0x05: if (_operandSize32) { Regs.EAX = Add32(Regs.EAX, FetchDword()); } else { Regs.AX = Add16(Regs.AX, FetchWord()); } return 4;
 
             // --- PUSH/POP segment ---
             case 0x06: Push(Regs.ES); return 10;
@@ -308,35 +376,35 @@ public sealed class Cpu8086
 
             // --- OR ---
             case 0x08: modrm = FetchByte(); WriteModRM8(modrm, Or8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7))); return 3;
-            case 0x09: modrm = FetchByte(); WriteModRM16(modrm, Or16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); return 3;
+            case 0x09: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, Or32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7))); } else { WriteModRM16(modrm, Or16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); } return 3;
             case 0x0A: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg8(reg, Or8(Regs.GetReg8(reg), ReadModRM8(modrm))); return 3;
-            case 0x0B: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, Or16(Regs.GetReg16(reg), ReadModRM16(modrm))); return 3;
+            case 0x0B: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Regs.SetReg32(reg, Or32(Regs.GetReg32(reg), ReadModRM32(modrm))); } else { Regs.SetReg16(reg, Or16(Regs.GetReg16(reg), ReadModRM16(modrm))); } return 3;
             case 0x0C: Regs.AL = Or8(Regs.AL, FetchByte()); return 4;
-            case 0x0D: Regs.AX = Or16(Regs.AX, FetchWord()); return 4;
+            case 0x0D: if (_operandSize32) { Regs.EAX = Or32(Regs.EAX, FetchDword()); } else { Regs.AX = Or16(Regs.AX, FetchWord()); } return 4;
 
             // --- ADC ---
             case 0x10: modrm = FetchByte(); WriteModRM8(modrm, Add8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7), true)); return 3;
-            case 0x11: modrm = FetchByte(); WriteModRM16(modrm, Add16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7), true)); return 3;
+            case 0x11: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, Add32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7), true)); } else { WriteModRM16(modrm, Add16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7), true)); } return 3;
             case 0x12: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg8(reg, Add8(Regs.GetReg8(reg), ReadModRM8(modrm), true)); return 3;
-            case 0x13: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, Add16(Regs.GetReg16(reg), ReadModRM16(modrm), true)); return 3;
+            case 0x13: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Regs.SetReg32(reg, Add32(Regs.GetReg32(reg), ReadModRM32(modrm), true)); } else { Regs.SetReg16(reg, Add16(Regs.GetReg16(reg), ReadModRM16(modrm), true)); } return 3;
             case 0x14: Regs.AL = Add8(Regs.AL, FetchByte(), true); return 4;
-            case 0x15: Regs.AX = Add16(Regs.AX, FetchWord(), true); return 4;
+            case 0x15: if (_operandSize32) { Regs.EAX = Add32(Regs.EAX, FetchDword(), true); } else { Regs.AX = Add16(Regs.AX, FetchWord(), true); } return 4;
 
             // --- SBB ---
             case 0x18: modrm = FetchByte(); WriteModRM8(modrm, Sub8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7), true)); return 3;
-            case 0x19: modrm = FetchByte(); WriteModRM16(modrm, Sub16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7), true)); return 3;
+            case 0x19: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, Sub32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7), true)); } else { WriteModRM16(modrm, Sub16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7), true)); } return 3;
             case 0x1A: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg8(reg, Sub8(Regs.GetReg8(reg), ReadModRM8(modrm), true)); return 3;
-            case 0x1B: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, Sub16(Regs.GetReg16(reg), ReadModRM16(modrm), true)); return 3;
+            case 0x1B: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Regs.SetReg32(reg, Sub32(Regs.GetReg32(reg), ReadModRM32(modrm), true)); } else { Regs.SetReg16(reg, Sub16(Regs.GetReg16(reg), ReadModRM16(modrm), true)); } return 3;
             case 0x1C: Regs.AL = Sub8(Regs.AL, FetchByte(), true); return 4;
-            case 0x1D: Regs.AX = Sub16(Regs.AX, FetchWord(), true); return 4;
+            case 0x1D: if (_operandSize32) { Regs.EAX = Sub32(Regs.EAX, FetchDword(), true); } else { Regs.AX = Sub16(Regs.AX, FetchWord(), true); } return 4;
 
             // --- AND ---
             case 0x20: modrm = FetchByte(); WriteModRM8(modrm, And8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7))); return 3;
-            case 0x21: modrm = FetchByte(); WriteModRM16(modrm, And16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); return 3;
+            case 0x21: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, And32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7))); } else { WriteModRM16(modrm, And16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); } return 3;
             case 0x22: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg8(reg, And8(Regs.GetReg8(reg), ReadModRM8(modrm))); return 3;
-            case 0x23: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, And16(Regs.GetReg16(reg), ReadModRM16(modrm))); return 3;
+            case 0x23: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Regs.SetReg32(reg, And32(Regs.GetReg32(reg), ReadModRM32(modrm))); } else { Regs.SetReg16(reg, And16(Regs.GetReg16(reg), ReadModRM16(modrm))); } return 3;
             case 0x24: Regs.AL = And8(Regs.AL, FetchByte()); return 4;
-            case 0x25: Regs.AX = And16(Regs.AX, FetchWord()); return 4;
+            case 0x25: if (_operandSize32) { Regs.EAX = And32(Regs.EAX, FetchDword()); } else { Regs.AX = And16(Regs.AX, FetchWord()); } return 4;
 
             // --- DAA ---
             case 0x27:
@@ -366,14 +434,16 @@ public sealed class Cpu8086
             case 0x2E: _segmentOverride = 1; return DecodeAndExecute(); // CS:
             case 0x36: _segmentOverride = 2; return DecodeAndExecute(); // SS:
             case 0x3E: _segmentOverride = 3; return DecodeAndExecute(); // DS:
+            case 0x64: _segmentOverride = 4; return DecodeAndExecute(); // FS: (386+)
+            case 0x65: _segmentOverride = 5; return DecodeAndExecute(); // GS: (386+)
 
             // --- SUB ---
             case 0x28: modrm = FetchByte(); WriteModRM8(modrm, Sub8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7))); return 3;
-            case 0x29: modrm = FetchByte(); WriteModRM16(modrm, Sub16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); return 3;
+            case 0x29: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, Sub32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7))); } else { WriteModRM16(modrm, Sub16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); } return 3;
             case 0x2A: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg8(reg, Sub8(Regs.GetReg8(reg), ReadModRM8(modrm))); return 3;
-            case 0x2B: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, Sub16(Regs.GetReg16(reg), ReadModRM16(modrm))); return 3;
+            case 0x2B: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Regs.SetReg32(reg, Sub32(Regs.GetReg32(reg), ReadModRM32(modrm))); } else { Regs.SetReg16(reg, Sub16(Regs.GetReg16(reg), ReadModRM16(modrm))); } return 3;
             case 0x2C: Regs.AL = Sub8(Regs.AL, FetchByte()); return 4;
-            case 0x2D: Regs.AX = Sub16(Regs.AX, FetchWord()); return 4;
+            case 0x2D: if (_operandSize32) { Regs.EAX = Sub32(Regs.EAX, FetchDword()); } else { Regs.AX = Sub16(Regs.AX, FetchWord()); } return 4;
 
             // --- DAS ---
             case 0x2F:
@@ -400,11 +470,11 @@ public sealed class Cpu8086
 
             // --- XOR ---
             case 0x30: modrm = FetchByte(); WriteModRM8(modrm, Xor8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7))); return 3;
-            case 0x31: modrm = FetchByte(); WriteModRM16(modrm, Xor16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); return 3;
+            case 0x31: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, Xor32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7))); } else { WriteModRM16(modrm, Xor16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7))); } return 3;
             case 0x32: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg8(reg, Xor8(Regs.GetReg8(reg), ReadModRM8(modrm))); return 3;
-            case 0x33: modrm = FetchByte(); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, Xor16(Regs.GetReg16(reg), ReadModRM16(modrm))); return 3;
+            case 0x33: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Regs.SetReg32(reg, Xor32(Regs.GetReg32(reg), ReadModRM32(modrm))); } else { Regs.SetReg16(reg, Xor16(Regs.GetReg16(reg), ReadModRM16(modrm))); } return 3;
             case 0x34: Regs.AL = Xor8(Regs.AL, FetchByte()); return 4;
-            case 0x35: Regs.AX = Xor16(Regs.AX, FetchWord()); return 4;
+            case 0x35: if (_operandSize32) { Regs.EAX = Xor32(Regs.EAX, FetchDword()); } else { Regs.AX = Xor16(Regs.AX, FetchWord()); } return 4;
 
             // --- AAA ---
             case 0x37:
@@ -426,18 +496,18 @@ public sealed class Cpu8086
 
             // --- CMP ---
             case 0x38: modrm = FetchByte(); Sub8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7)); return 3;
-            case 0x39: modrm = FetchByte(); Sub16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7)); return 3;
+            case 0x39: modrm = FetchByte(); if (_operandSize32) { Sub32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7)); } else { Sub16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7)); } return 3;
             case 0x3A: modrm = FetchByte(); reg = (modrm >> 3) & 7; Sub8(Regs.GetReg8(reg), ReadModRM8(modrm)); return 3;
-            case 0x3B: modrm = FetchByte(); reg = (modrm >> 3) & 7; Sub16(Regs.GetReg16(reg), ReadModRM16(modrm)); return 3;
+            case 0x3B: modrm = FetchByte(); reg = (modrm >> 3) & 7; if (_operandSize32) { Sub32(Regs.GetReg32(reg), ReadModRM32(modrm)); } else { Sub16(Regs.GetReg16(reg), ReadModRM16(modrm)); } return 3;
             case 0x3C: Sub8(Regs.AL, FetchByte()); return 4;
-            case 0x3D: Sub16(Regs.AX, FetchWord()); return 4;
+            case 0x3D: if (_operandSize32) { Sub32(Regs.EAX, FetchDword()); } else { Sub16(Regs.AX, FetchWord()); } return 4;
 
             // --- AAS ---
             case 0x3F:
             {
                 if ((Regs.AL & 0x0F) > 9 || GetFlag(CpuFlags.AuxCarry))
                 {
-                    Regs.AX -= 6;
+                    Regs.AL = (byte)(Regs.AL - 6);
                     Regs.AH -= 1;
                     SetFlag(CpuFlags.AuxCarry, true);
                     SetFlag(CpuFlags.Carry, true);
@@ -454,20 +524,28 @@ public sealed class Cpu8086
             // --- INC reg16 (0x40-0x47) ---
             case >= 0x40 and <= 0x47:
                 reg = opcode - 0x40;
-                { bool cf = GetFlag(CpuFlags.Carry); Regs.SetReg16(reg, Add16(Regs.GetReg16(reg), 1)); SetFlag(CpuFlags.Carry, cf); }
+                if (_operandSize32) { bool cf = GetFlag(CpuFlags.Carry); Regs.SetReg32(reg, Add32(Regs.GetReg32(reg), 1)); SetFlag(CpuFlags.Carry, cf); }
+                else { bool cf = GetFlag(CpuFlags.Carry); Regs.SetReg16(reg, Add16(Regs.GetReg16(reg), 1)); SetFlag(CpuFlags.Carry, cf); }
                 return 2;
 
             // --- DEC reg16 (0x48-0x4F) ---
             case >= 0x48 and <= 0x4F:
                 reg = opcode - 0x48;
-                { bool cf = GetFlag(CpuFlags.Carry); Regs.SetReg16(reg, Sub16(Regs.GetReg16(reg), 1)); SetFlag(CpuFlags.Carry, cf); }
+                if (_operandSize32) { bool cf = GetFlag(CpuFlags.Carry); Regs.SetReg32(reg, Sub32(Regs.GetReg32(reg), 1)); SetFlag(CpuFlags.Carry, cf); }
+                else { bool cf = GetFlag(CpuFlags.Carry); Regs.SetReg16(reg, Sub16(Regs.GetReg16(reg), 1)); SetFlag(CpuFlags.Carry, cf); }
                 return 2;
 
             // --- PUSH reg16 (0x50-0x57) ---
-            case >= 0x50 and <= 0x57: Push(Regs.GetReg16(opcode - 0x50)); return 11;
+            case >= 0x50 and <= 0x57:
+                if (_operandSize32) Push32(Regs.GetReg32(opcode - 0x50));
+                else Push(Regs.GetReg16(opcode - 0x50));
+                return 11;
 
             // --- POP reg16 (0x58-0x5F) ---
-            case >= 0x58 and <= 0x5F: Regs.SetReg16(opcode - 0x58, Pop()); return 8;
+            case >= 0x58 and <= 0x5F:
+                if (_operandSize32) Regs.SetReg32(opcode - 0x58, Pop32());
+                else Regs.SetReg16(opcode - 0x58, Pop());
+                return 8;
 
             // --- Jcc short (conditional jumps) ---
             case 0x70: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JO
@@ -489,43 +567,52 @@ public sealed class Cpu8086
 
             // --- Group 1: immediate to r/m (0x80-0x83) ---
             case 0x80: return ExecuteGroup1_8(false);
-            case 0x81: return ExecuteGroup1_16(false);
+            case 0x81: return _operandSize32 ? ExecuteGroup1_32(false) : ExecuteGroup1_16(false);
             case 0x82: return ExecuteGroup1_8(false); // Same as 0x80
-            case 0x83: return ExecuteGroup1_16(true); // sign-extended byte
+            case 0x83: return _operandSize32 ? ExecuteGroup1_32(true) : ExecuteGroup1_16(true); // sign-extended byte
 
             // --- TEST ---
             case 0x84: modrm = FetchByte(); And8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7)); return 3;
-            case 0x85: modrm = FetchByte(); And16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7)); return 3;
+            case 0x85: modrm = FetchByte(); if (_operandSize32) { And32(ReadModRM32(modrm), Regs.GetReg32((modrm >> 3) & 7)); } else { And16(ReadModRM16(modrm), Regs.GetReg16((modrm >> 3) & 7)); } return 3;
 
             // --- XCHG ---
             case 0x86: modrm = FetchByte(); { reg = (modrm >> 3) & 7; byte a = Regs.GetReg8(reg); byte b = ReadModRM8(modrm); Regs.SetReg8(reg, b); WriteModRM8(modrm, a); } return 4;
-            case 0x87: modrm = FetchByte(); { reg = (modrm >> 3) & 7; ushort a = Regs.GetReg16(reg); ushort b = ReadModRM16(modrm); Regs.SetReg16(reg, b); WriteModRM16(modrm, a); } return 4;
+            case 0x87: modrm = FetchByte(); if (_operandSize32) { reg = (modrm >> 3) & 7; uint a = Regs.GetReg32(reg); uint b = ReadModRM32(modrm); Regs.SetReg32(reg, b); WriteModRM32(modrm, a); } else { reg = (modrm >> 3) & 7; ushort a = Regs.GetReg16(reg); ushort b = ReadModRM16(modrm); Regs.SetReg16(reg, b); WriteModRM16(modrm, a); } return 4;
 
             // --- MOV r/m, reg ---
             case 0x88: modrm = FetchByte(); WriteModRM8(modrm, Regs.GetReg8((modrm >> 3) & 7)); return 2;
-            case 0x89: modrm = FetchByte(); WriteModRM16(modrm, Regs.GetReg16((modrm >> 3) & 7)); return 2;
+            case 0x89: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, Regs.GetReg32((modrm >> 3) & 7)); } else { WriteModRM16(modrm, Regs.GetReg16((modrm >> 3) & 7)); } return 2;
             // --- MOV reg, r/m ---
             case 0x8A: modrm = FetchByte(); Regs.SetReg8((modrm >> 3) & 7, ReadModRM8(modrm)); return 2;
-            case 0x8B: modrm = FetchByte(); Regs.SetReg16((modrm >> 3) & 7, ReadModRM16(modrm)); return 2;
+            case 0x8B: modrm = FetchByte(); if (_operandSize32) { Regs.SetReg32((modrm >> 3) & 7, ReadModRM32(modrm)); } else { Regs.SetReg16((modrm >> 3) & 7, ReadModRM16(modrm)); } return 2;
 
             // --- MOV r/m, sreg ---
             case 0x8C: modrm = FetchByte(); WriteModRM16(modrm, Regs.GetSegReg((modrm >> 3) & 3)); return 2;
             // --- LEA ---
-            case 0x8D: modrm = FetchByte(); { var (_, off) = DecodeModRM_Address(modrm); Regs.SetReg16((modrm >> 3) & 7, off); } return 2;
+            case 0x8D: modrm = FetchByte(); { var (_, off) = DecodeModRM_Address(modrm); if (_operandSize32) Regs.SetReg32((modrm >> 3) & 7, off); else Regs.SetReg16((modrm >> 3) & 7, off); } return 2;
             // --- MOV sreg, r/m ---
             case 0x8E: modrm = FetchByte(); Regs.SetSegReg((modrm >> 3) & 3, ReadModRM16(modrm)); return 2;
             // --- POP r/m ---
-            case 0x8F: modrm = FetchByte(); WriteModRM16(modrm, Pop()); return 8;
+            case 0x8F: modrm = FetchByte(); if (_operandSize32) WriteModRM32(modrm, Pop32()); else WriteModRM16(modrm, Pop()); return 8;
 
             // --- NOP / XCHG AX, reg ---
             case 0x90: return 3; // NOP
             case >= 0x91 and <= 0x97:
+                if (_operandSize32)
+                { reg = opcode - 0x90; uint tmp = Regs.EAX; Regs.EAX = Regs.GetReg32(reg); Regs.SetReg32(reg, tmp); }
+                else
                 { reg = opcode - 0x90; ushort tmp = Regs.AX; Regs.AX = Regs.GetReg16(reg); Regs.SetReg16(reg, tmp); }
                 return 3;
 
             // --- CBW / CWD ---
-            case 0x98: Regs.AX = (ushort)(sbyte)Regs.AL; return 2; // CBW
-            case 0x99: Regs.DX = (ushort)((Regs.AX & 0x8000) != 0 ? 0xFFFF : 0); return 5; // CWD
+            case 0x98:
+                if (_operandSize32) Regs.EAX = (uint)(int)(short)Regs.AX; // CWDE
+                else Regs.AX = (ushort)(sbyte)Regs.AL; // CBW
+                return 2;
+            case 0x99:
+                if (_operandSize32) Regs.EDX = (Regs.EAX & 0x80000000) != 0 ? 0xFFFFFFFF : 0; // CDQ
+                else Regs.DX = (ushort)((Regs.AX & 0x8000) != 0 ? 0xFFFF : 0); // CWD
+                return 5;
 
             // --- WAIT/FWAIT ---
             case 0x9B: return 4; // WAIT (no FPU - NOP)
@@ -555,15 +642,15 @@ public sealed class Cpu8086
             }
 
             // --- PUSHF / POPF ---
-            case 0x9C: Push((ushort)Regs.Flags); return 10;
-            case 0x9D: Regs.Flags = (CpuFlags)(Pop() | 0x0002); return 8; // bit 1 always set
+            case 0x9C: if (_operandSize32) Push32((uint)Regs.Flags & 0xFFFF); else Push((ushort)Regs.Flags); return 10;
+            case 0x9D: if (_operandSize32) { Regs.Flags = (CpuFlags)((ushort)Pop32() | 0x0002); } else { Regs.Flags = (CpuFlags)(Pop() | 0x0002); } return 8;
 
             // --- MOV AL/AX, [addr] ---
             case 0xA0: { ushort addr = FetchWord(); Regs.AL = _mem.ReadByte(GetDataSegment(), addr); } return 10;
-            case 0xA1: { ushort addr = FetchWord(); Regs.AX = _mem.ReadWord(GetDataSegment(), addr); } return 10;
+            case 0xA1: { ushort addr = FetchWord(); if (_operandSize32) Regs.EAX = _mem.ReadDword(GetDataSegment(), addr); else Regs.AX = _mem.ReadWord(GetDataSegment(), addr); } return 10;
             // --- MOV [addr], AL/AX ---
             case 0xA2: { ushort addr = FetchWord(); _mem.WriteByte(GetDataSegment(), addr, Regs.AL); } return 10;
-            case 0xA3: { ushort addr = FetchWord(); _mem.WriteWord(GetDataSegment(), addr, Regs.AX); } return 10;
+            case 0xA3: { ushort addr = FetchWord(); if (_operandSize32) _mem.WriteDword(GetDataSegment(), addr, Regs.EAX); else _mem.WriteWord(GetDataSegment(), addr, Regs.AX); } return 10;
 
             // --- MOVSB/MOVSW ---
             case 0xA4: ExecuteMovs(false); return 18;
@@ -575,7 +662,7 @@ public sealed class Cpu8086
 
             // --- TEST AL/AX, imm ---
             case 0xA8: And8(Regs.AL, FetchByte()); return 4;
-            case 0xA9: And16(Regs.AX, FetchWord()); return 4;
+            case 0xA9: if (_operandSize32) And32(Regs.EAX, FetchDword()); else And16(Regs.AX, FetchWord()); return 4;
 
             // --- STOSB/STOSW ---
             case 0xAA: ExecuteStos(false); return 11;
@@ -593,11 +680,14 @@ public sealed class Cpu8086
             case >= 0xB0 and <= 0xB7: Regs.SetReg8(opcode - 0xB0, FetchByte()); return 4;
 
             // --- MOV reg16, imm16 (0xB8-0xBF) ---
-            case >= 0xB8 and <= 0xBF: Regs.SetReg16(opcode - 0xB8, FetchWord()); return 4;
+            case >= 0xB8 and <= 0xBF:
+                if (_operandSize32) Regs.SetReg32(opcode - 0xB8, FetchDword());
+                else Regs.SetReg16(opcode - 0xB8, FetchWord());
+                return 4;
 
             // --- Shift/rotate group (0xC0, 0xC1) ---
             case 0xC0: return ExecuteShiftGroup_8(FetchByte(), FetchByte());
-            case 0xC1: return ExecuteShiftGroup_16(FetchByte(), FetchByte());
+            case 0xC1: { byte m = FetchByte(); byte c = FetchByte(); return _operandSize32 ? ExecuteShiftGroup_32(m, c) : ExecuteShiftGroup_16(m, c); }
 
             // --- RET near (with/without pop) ---
             case 0xC2: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.SP += pop; } return 20;
@@ -609,7 +699,7 @@ public sealed class Cpu8086
 
             // --- MOV r/m, imm ---
             case 0xC6: modrm = FetchByte(); WriteModRM8(modrm, FetchByte()); return 10;
-            case 0xC7: modrm = FetchByte(); WriteModRM16(modrm, FetchWord()); return 10;
+            case 0xC7: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, FetchDword()); } else { WriteModRM16(modrm, FetchWord()); } return 10;
 
             // --- RET far (with/without pop) ---
             case 0xCA: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.CS = Pop(); Regs.SP += pop; } return 25;
@@ -625,9 +715,9 @@ public sealed class Cpu8086
 
             // --- Shift/rotate group by 1 / CL ---
             case 0xD0: return ExecuteShiftGroup_8(FetchByte(), 1);
-            case 0xD1: return ExecuteShiftGroup_16(FetchByte(), 1);
+            case 0xD1: { byte m = FetchByte(); return _operandSize32 ? ExecuteShiftGroup_32(m, 1) : ExecuteShiftGroup_16(m, 1); }
             case 0xD2: return ExecuteShiftGroup_8(FetchByte(), Regs.CL);
-            case 0xD3: return ExecuteShiftGroup_16(FetchByte(), Regs.CL);
+            case 0xD3: { byte m = FetchByte(); return _operandSize32 ? ExecuteShiftGroup_32(m, Regs.CL) : ExecuteShiftGroup_16(m, Regs.CL); }
 
             // --- AAM ---
             case 0xD4:
@@ -648,10 +738,22 @@ public sealed class Cpu8086
                 UpdateFlags8(Regs.AL);
                 return 60;
             }
+            // --- SALC (undocumented: Set AL if Carry) ---
+            case 0xD6:
+                Regs.AL = GetFlag(CpuFlags.Carry) ? (byte)0xFF : (byte)0x00;
+                return 3;
             // --- XLAT ---
             case 0xD7:
                 Regs.AL = _mem.ReadByte(GetDataSegment(), (ushort)(Regs.BX + Regs.AL));
                 return 11;
+
+            // --- ESC (x87 FPU coprocessor escape) ---
+            // No FPU present: consume the ModR/M byte (and any displacement/operand it
+            // implies) so IP advances correctly, then treat as NOP.
+            case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+            case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+                SkipModRM();
+                return 2;
 
             // --- LOOP / LOOPcc ---
             case 0xE0: { sbyte off = (sbyte)FetchByte(); Regs.CX--; if (Regs.CX != 0 && !GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); } return 5; // LOOPNZ
@@ -672,15 +774,26 @@ public sealed class Cpu8086
             // --- LOCK prefix (treat as NOP) ---
             case 0xF0: return DecodeAndExecute(); // LOCK prefix - execute next instruction without lock semantics
 
-            // --- IN/OUT (simplified - do nothing meaningful) ---
-            case 0xE4: FetchByte(); return 10; // IN AL, imm8
-            case 0xE5: FetchByte(); return 10; // IN AX, imm8
-            case 0xE6: FetchByte(); return 10; // OUT imm8, AL
-            case 0xE7: FetchByte(); return 10; // OUT imm8, AX
-            case 0xEC: return 8; // IN AL, DX
-            case 0xED: return 8; // IN AX, DX
-            case 0xEE: return 8; // OUT DX, AL
-            case 0xEF: return 8; // OUT DX, AX
+            // --- Operand-size prefix (386+): switch to 32-bit operands ---
+            case 0x66:
+                _operandSize32 = true;
+                return DecodeAndExecute();
+
+            // --- Address-size prefix (386+): in 16-bit real mode this is mostly a no-op ---
+            case 0x67:
+                // In real mode with 16-bit default, 0x67 switches to 32-bit addressing.
+                // We treat it as transparent — most DOS programs don't use 32-bit addressing.
+                return DecodeAndExecute();
+
+            // --- IN/OUT with I/O port bus ---
+            case 0xE4: { byte port = FetchByte(); Regs.AL = _ports?.ReadByte(port) ?? 0xFF; } return 10; // IN AL, imm8
+            case 0xE5: { byte port = FetchByte(); Regs.AX = _ports?.ReadWord(port) ?? 0xFFFF; } return 10; // IN AX, imm8
+            case 0xE6: { byte port = FetchByte(); _ports?.WriteByte(port, Regs.AL); } return 10; // OUT imm8, AL
+            case 0xE7: { byte port = FetchByte(); _ports?.WriteWord(port, Regs.AX); } return 10; // OUT imm8, AX
+            case 0xEC: Regs.AL = _ports?.ReadByte(Regs.DX) ?? 0xFF; return 8; // IN AL, DX
+            case 0xED: Regs.AX = _ports?.ReadWord(Regs.DX) ?? 0xFFFF; return 8; // IN AX, DX
+            case 0xEE: _ports?.WriteByte(Regs.DX, Regs.AL); return 8; // OUT DX, AL
+            case 0xEF: _ports?.WriteWord(Regs.DX, Regs.AX); return 8; // OUT DX, AX
 
             // --- REP/REPZ/REPNZ prefixes ---
             case 0xF2: return ExecuteRep(false); // REPNZ
@@ -694,7 +807,7 @@ public sealed class Cpu8086
 
             // --- Group 3: unary (0xF6, 0xF7) ---
             case 0xF6: return ExecuteGroup3_8();
-            case 0xF7: return ExecuteGroup3_16();
+            case 0xF7: return _operandSize32 ? ExecuteGroup3_32() : ExecuteGroup3_16();
 
             // --- CLC/STC/CLI/STI/CLD/STD ---
             case 0xF8: SetFlag(CpuFlags.Carry, false); return 2;
@@ -707,17 +820,35 @@ public sealed class Cpu8086
             // --- PUSHA (80186+) ---
             case 0x60:
             {
-                ushort origSP = Regs.SP;
-                Push(Regs.AX); Push(Regs.CX); Push(Regs.DX); Push(Regs.BX);
-                Push(origSP); Push(Regs.BP); Push(Regs.SI); Push(Regs.DI);
+                if (_operandSize32)
+                {
+                    uint origESP = Regs.ESP;
+                    Push32(Regs.EAX); Push32(Regs.ECX); Push32(Regs.EDX); Push32(Regs.EBX);
+                    Push32(origESP); Push32(Regs.EBP); Push32(Regs.ESI); Push32(Regs.EDI);
+                }
+                else
+                {
+                    ushort origSP = Regs.SP;
+                    Push(Regs.AX); Push(Regs.CX); Push(Regs.DX); Push(Regs.BX);
+                    Push(origSP); Push(Regs.BP); Push(Regs.SI); Push(Regs.DI);
+                }
                 return 19;
             }
             // --- POPA (80186+) ---
             case 0x61:
             {
-                Regs.DI = Pop(); Regs.SI = Pop(); Regs.BP = Pop();
-                Pop(); // skip SP
-                Regs.BX = Pop(); Regs.DX = Pop(); Regs.CX = Pop(); Regs.AX = Pop();
+                if (_operandSize32)
+                {
+                    Regs.EDI = Pop32(); Regs.ESI = Pop32(); Regs.EBP = Pop32();
+                    Pop32(); // skip ESP
+                    Regs.EBX = Pop32(); Regs.EDX = Pop32(); Regs.ECX = Pop32(); Regs.EAX = Pop32();
+                }
+                else
+                {
+                    Regs.DI = Pop(); Regs.SI = Pop(); Regs.BP = Pop();
+                    Pop(); // skip SP
+                    Regs.BX = Pop(); Regs.DX = Pop(); Regs.CX = Pop(); Regs.AX = Pop();
+                }
                 return 19;
             }
 
@@ -736,43 +867,81 @@ public sealed class Cpu8086
             }
 
             // --- PUSH imm16 (80186+) ---
-            case 0x68: Push(FetchWord()); return 3;
+            case 0x68: if (_operandSize32) Push32(FetchDword()); else Push(FetchWord()); return 3;
             // --- IMUL r16, r/m16, imm16 (80186+) ---
             case 0x69:
             {
                 modrm = FetchByte();
                 reg = (modrm >> 3) & 7;
-                int src = (short)ReadModRM16(modrm);
-                int imm = (short)FetchWord();
-                int result = src * imm;
-                Regs.SetReg16(reg, (ushort)result);
-                bool highSet = result != (short)result;
-                SetFlag(CpuFlags.Carry, highSet);
-                SetFlag(CpuFlags.Overflow, highSet);
+                if (_operandSize32)
+                {
+                    long src = (int)ReadModRM32(modrm);
+                    long imm = (int)FetchDword();
+                    long result = src * imm;
+                    Regs.SetReg32(reg, (uint)result);
+                    bool highSet = result != (int)result;
+                    SetFlag(CpuFlags.Carry, highSet);
+                    SetFlag(CpuFlags.Overflow, highSet);
+                }
+                else
+                {
+                    int src = (short)ReadModRM16(modrm);
+                    int imm = (short)FetchWord();
+                    int result = src * imm;
+                    Regs.SetReg16(reg, (ushort)result);
+                    bool highSet = result != (short)result;
+                    SetFlag(CpuFlags.Carry, highSet);
+                    SetFlag(CpuFlags.Overflow, highSet);
+                }
                 return 21;
             }
             // --- PUSH imm8 sign-extended (80186+) ---
-            case 0x6A: Push((ushort)(short)(sbyte)FetchByte()); return 3;
+            case 0x6A: if (_operandSize32) Push32((uint)(int)(sbyte)FetchByte()); else Push((ushort)(short)(sbyte)FetchByte()); return 3;
             // --- IMUL r16, r/m16, imm8 (80186+) ---
             case 0x6B:
             {
                 modrm = FetchByte();
                 reg = (modrm >> 3) & 7;
-                int src = (short)ReadModRM16(modrm);
-                int imm = (sbyte)FetchByte();
-                int result = src * imm;
-                Regs.SetReg16(reg, (ushort)result);
-                bool highSet = result != (short)result;
-                SetFlag(CpuFlags.Carry, highSet);
-                SetFlag(CpuFlags.Overflow, highSet);
+                if (_operandSize32)
+                {
+                    long src = (int)ReadModRM32(modrm);
+                    long imm = (sbyte)FetchByte();
+                    long result = src * imm;
+                    Regs.SetReg32(reg, (uint)result);
+                    bool highSet = result != (int)result;
+                    SetFlag(CpuFlags.Carry, highSet);
+                    SetFlag(CpuFlags.Overflow, highSet);
+                }
+                else
+                {
+                    int src = (short)ReadModRM16(modrm);
+                    int imm = (sbyte)FetchByte();
+                    int result = src * imm;
+                    Regs.SetReg16(reg, (ushort)result);
+                    bool highSet = result != (short)result;
+                    SetFlag(CpuFlags.Carry, highSet);
+                    SetFlag(CpuFlags.Overflow, highSet);
+                }
                 return 21;
             }
 
-            // --- INS/OUTS (80186+) — treated as NOP (no real port I/O) ---
-            case 0x6C: Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); return 14; // INSB
-            case 0x6D: Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); return 14; // INSW
-            case 0x6E: Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); return 14; // OUTSB
-            case 0x6F: Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); return 14; // OUTSW
+            // --- INS/OUTS (80186+) — read from / write to I/O port DX ---
+            case 0x6C: // INSB: read byte from port DX, store at ES:DI
+                _mem.WriteByte(Regs.ES, Regs.DI, _ports?.ReadByte(Regs.DX) ?? 0xFF);
+                Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -1 : 1));
+                return 14;
+            case 0x6D: // INSW: read word from port DX, store at ES:DI
+                _mem.WriteWord(Regs.ES, Regs.DI, _ports?.ReadWord(Regs.DX) ?? 0xFFFF);
+                Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -2 : 2));
+                return 14;
+            case 0x6E: // OUTSB: write byte from DS:SI to port DX
+                _ports?.WriteByte(Regs.DX, _mem.ReadByte(GetDataSegment(), Regs.SI));
+                Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -1 : 1));
+                return 14;
+            case 0x6F: // OUTSW: write word from DS:SI to port DX
+                _ports?.WriteWord(Regs.DX, _mem.ReadWord(GetDataSegment(), Regs.SI));
+                Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -2 : 2));
+                return 14;
 
             // --- ENTER (80186+) ---
             case 0xC8:
@@ -924,6 +1093,12 @@ public sealed class Cpu8086
             Regs.CX--;
             switch (nextOp)
             {
+                // INS/OUTS
+                case 0x6C: _mem.WriteByte(Regs.ES, Regs.DI, _ports?.ReadByte(Regs.DX) ?? 0xFF); Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); break;
+                case 0x6D: _mem.WriteWord(Regs.ES, Regs.DI, _ports?.ReadWord(Regs.DX) ?? 0xFFFF); Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); break;
+                case 0x6E: _ports?.WriteByte(Regs.DX, _mem.ReadByte(GetDataSegment(), Regs.SI)); Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); break;
+                case 0x6F: _ports?.WriteWord(Regs.DX, _mem.ReadWord(GetDataSegment(), Regs.SI)); Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); break;
+                // String ops
                 case 0xA4: ExecuteMovs(false); break;
                 case 0xA5: ExecuteMovs(true); break;
                 case 0xA6: ExecuteCmps(false); break;
@@ -1036,11 +1211,11 @@ public sealed class Cpu8086
             }
             case 6: // DIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { ushort dividend = Regs.AX; Regs.AL = (byte)(dividend / val); Regs.AH = (byte)(dividend % val); }
+                { ushort dividend = Regs.AX; ushort q = (ushort)(dividend / val); if (q > 0xFF) { TriggerInterrupt(0); break; } Regs.AL = (byte)q; Regs.AH = (byte)(dividend % val); }
                 break;
             case 7: // IDIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { short dividend = (short)Regs.AX; Regs.AL = (byte)((sbyte)(dividend / (sbyte)val)); Regs.AH = (byte)((sbyte)(dividend % (sbyte)val)); }
+                { short dividend = (short)Regs.AX; short q = (short)(dividend / (sbyte)val); if (q > 127 || q < -128) { TriggerInterrupt(0); break; } Regs.AL = (byte)(sbyte)q; Regs.AH = (byte)(sbyte)(dividend % (sbyte)val); }
                 break;
         }
         return 4;
@@ -1087,11 +1262,11 @@ public sealed class Cpu8086
             }
             case 6: // DIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { uint dividend = (uint)(Regs.DX << 16 | Regs.AX); Regs.AX = (ushort)(dividend / val); Regs.DX = (ushort)(dividend % val); }
+                { uint dividend = (uint)(Regs.DX << 16 | Regs.AX); uint q = dividend / val; if (q > 0xFFFF) { TriggerInterrupt(0); break; } Regs.AX = (ushort)q; Regs.DX = (ushort)(dividend % val); }
                 break;
             case 7: // IDIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { int dividend = (Regs.DX << 16) | Regs.AX; Regs.AX = (ushort)((short)(dividend / (short)val)); Regs.DX = (ushort)((short)(dividend % (short)val)); }
+                { int dividend = (Regs.DX << 16) | Regs.AX; int q = dividend / (short)val; if (q > 32767 || q < -32768) { TriggerInterrupt(0); break; } Regs.AX = (ushort)(short)q; Regs.DX = (ushort)(short)(dividend % (short)val); }
                 break;
         }
         return 4;
@@ -1289,6 +1464,175 @@ public sealed class Cpu8086
 
     // --- Two-byte opcodes (0x0F prefix) ---
 
+    // --- 32-bit ModR/M accessors (for 0x66 prefix) ---
+
+    private uint ReadModRM32(byte modrm)
+    {
+        int mod = (modrm >> 6) & 3;
+        int rm = modrm & 7;
+        if (mod == 3) return Regs.GetReg32(rm);
+        var (seg, off) = DecodeModRM_Address(modrm);
+        return _mem.ReadDword(seg, off);
+    }
+
+    private void WriteModRM32(byte modrm, uint value)
+    {
+        int mod = (modrm >> 6) & 3;
+        int rm = modrm & 7;
+        if (mod == 3) { Regs.SetReg32(rm, value); return; }
+        var (seg, off) = DecodeModRM_Address(modrm);
+        _mem.WriteDword(seg, off, value);
+    }
+
+    // --- 32-bit ALU operations ---
+
+    private uint Add32(uint a, uint b, bool withCarry = false)
+    {
+        long carry = withCarry && GetFlag(CpuFlags.Carry) ? 1 : 0;
+        long result = (long)a + b + carry;
+        uint r = (uint)result;
+        SetFlag(CpuFlags.Zero, r == 0);
+        SetFlag(CpuFlags.Sign, (r & 0x80000000) != 0);
+        SetFlag(CpuFlags.Parity, Parity((byte)(r & 0xFF)));
+        SetFlag(CpuFlags.Carry, result > 0xFFFFFFFFL);
+        SetFlag(CpuFlags.Overflow, ((a ^ r) & (b ^ r) & 0x80000000) != 0);
+        SetFlag(CpuFlags.AuxCarry, ((a ^ b ^ r) & 0x10) != 0);
+        return r;
+    }
+
+    private uint Sub32(uint a, uint b, bool withBorrow = false)
+    {
+        long borrow = withBorrow && GetFlag(CpuFlags.Carry) ? 1 : 0;
+        long result = (long)a - b - borrow;
+        uint r = (uint)result;
+        SetFlag(CpuFlags.Zero, r == 0);
+        SetFlag(CpuFlags.Sign, (r & 0x80000000) != 0);
+        SetFlag(CpuFlags.Parity, Parity((byte)(r & 0xFF)));
+        SetFlag(CpuFlags.Carry, result < 0);
+        SetFlag(CpuFlags.Overflow, ((a ^ b) & (a ^ r) & 0x80000000) != 0);
+        SetFlag(CpuFlags.AuxCarry, ((a ^ b ^ r) & 0x10) != 0);
+        return r;
+    }
+
+    private uint And32(uint a, uint b) { uint r = a & b; SetFlag(CpuFlags.Zero, r == 0); SetFlag(CpuFlags.Sign, (r & 0x80000000) != 0); SetFlag(CpuFlags.Parity, Parity((byte)(r & 0xFF))); SetFlag(CpuFlags.Carry, false); SetFlag(CpuFlags.Overflow, false); return r; }
+    private uint Or32(uint a, uint b) { uint r = a | b; SetFlag(CpuFlags.Zero, r == 0); SetFlag(CpuFlags.Sign, (r & 0x80000000) != 0); SetFlag(CpuFlags.Parity, Parity((byte)(r & 0xFF))); SetFlag(CpuFlags.Carry, false); SetFlag(CpuFlags.Overflow, false); return r; }
+    private uint Xor32(uint a, uint b) { uint r = a ^ b; SetFlag(CpuFlags.Zero, r == 0); SetFlag(CpuFlags.Sign, (r & 0x80000000) != 0); SetFlag(CpuFlags.Parity, Parity((byte)(r & 0xFF))); SetFlag(CpuFlags.Carry, false); SetFlag(CpuFlags.Overflow, false); return r; }
+
+    private void UpdateFlags32(uint result)
+    {
+        SetFlag(CpuFlags.Zero, result == 0);
+        SetFlag(CpuFlags.Sign, (result & 0x80000000) != 0);
+        SetFlag(CpuFlags.Parity, Parity((byte)(result & 0xFF)));
+    }
+
+    // --- 32-bit push/pop ---
+
+    private void Push32(uint value)
+    {
+        Regs.SP -= 4;
+        _mem.WriteDword(Regs.SS, Regs.SP, value);
+    }
+
+    private uint Pop32()
+    {
+        uint val = _mem.ReadDword(Regs.SS, Regs.SP);
+        Regs.SP += 4;
+        return val;
+    }
+
+    // --- 32-bit Group instructions ---
+
+    private int ExecuteGroup1_32(bool signExtendByte)
+    {
+        byte modrm = FetchByte();
+        int op = (modrm >> 3) & 7;
+        uint val = ReadModRM32(modrm);
+        uint imm = signExtendByte ? (uint)(int)(sbyte)FetchByte() : FetchDword();
+
+        uint result = op switch
+        {
+            0 => Add32(val, imm),
+            1 => Or32(val, imm),
+            2 => Add32(val, imm, true),
+            3 => Sub32(val, imm, true),
+            4 => And32(val, imm),
+            5 => Sub32(val, imm),
+            6 => Xor32(val, imm),
+            7 => Sub32(val, imm),
+            _ => val
+        };
+
+        if (op != 7) WriteModRM32(modrm, result);
+        return 4;
+    }
+
+    private int ExecuteGroup3_32()
+    {
+        byte modrm = FetchByte();
+        int op = (modrm >> 3) & 7;
+        uint val = ReadModRM32(modrm);
+
+        switch (op)
+        {
+            case 0: case 1: And32(val, FetchDword()); break; // TEST
+            case 2: WriteModRM32(modrm, ~val); break; // NOT
+            case 3: WriteModRM32(modrm, Sub32(0, val)); SetFlag(CpuFlags.Carry, val != 0); break; // NEG
+            case 4: // MUL
+            {
+                ulong result = (ulong)Regs.EAX * val;
+                Regs.EAX = (uint)result;
+                Regs.EDX = (uint)(result >> 32);
+                bool highSet = Regs.EDX != 0;
+                SetFlag(CpuFlags.Carry, highSet);
+                SetFlag(CpuFlags.Overflow, highSet);
+                break;
+            }
+            case 5: // IMUL
+            {
+                long result = (long)(int)Regs.EAX * (int)val;
+                Regs.EAX = (uint)result;
+                Regs.EDX = (uint)(result >> 32);
+                bool highSet = Regs.EDX != (uint)((result < 0) ? 0xFFFFFFFF : 0);
+                SetFlag(CpuFlags.Carry, highSet);
+                SetFlag(CpuFlags.Overflow, highSet);
+                break;
+            }
+            case 6: // DIV
+                if (val == 0) { TriggerInterrupt(0); break; }
+                { ulong dividend = ((ulong)Regs.EDX << 32) | Regs.EAX; ulong q = dividend / val; if (q > 0xFFFFFFFF) { TriggerInterrupt(0); break; } Regs.EAX = (uint)q; Regs.EDX = (uint)(dividend % val); }
+                break;
+            case 7: // IDIV
+                if (val == 0) { TriggerInterrupt(0); break; }
+                { long dividend = ((long)Regs.EDX << 32) | Regs.EAX; long q = dividend / (int)val; if (q > int.MaxValue || q < int.MinValue) { TriggerInterrupt(0); break; } Regs.EAX = (uint)(int)q; Regs.EDX = (uint)(int)(dividend % (int)val); }
+                break;
+        }
+        return 4;
+    }
+
+    private int ExecuteShiftGroup_32(byte modrm, byte count)
+    {
+        int op = (modrm >> 3) & 7;
+        uint val = ReadModRM32(modrm);
+        count &= 0x1F;
+
+        for (int i = 0; i < count; i++)
+        {
+            switch (op)
+            {
+                case 0: { bool msb = (val & 0x80000000) != 0; val = (val << 1) | (msb ? 1u : 0u); SetFlag(CpuFlags.Carry, msb); break; } // ROL
+                case 1: { bool lsb = (val & 1) != 0; val = (val >> 1) | (lsb ? 0x80000000u : 0u); SetFlag(CpuFlags.Carry, lsb); break; } // ROR
+                case 2: { bool cf = GetFlag(CpuFlags.Carry); SetFlag(CpuFlags.Carry, (val & 0x80000000) != 0); val = (val << 1) | (cf ? 1u : 0u); break; } // RCL
+                case 3: { bool cf = GetFlag(CpuFlags.Carry); SetFlag(CpuFlags.Carry, (val & 1) != 0); val = (val >> 1) | (cf ? 0x80000000u : 0u); break; } // RCR
+                case 4: case 6: SetFlag(CpuFlags.Carry, (val & 0x80000000) != 0); val <<= 1; break; // SHL
+                case 5: SetFlag(CpuFlags.Carry, (val & 1) != 0); val >>= 1; break; // SHR
+                case 7: SetFlag(CpuFlags.Carry, (val & 1) != 0); val = (uint)((int)val >> 1); break; // SAR
+            }
+        }
+        if (count > 0) UpdateFlags32(val);
+        WriteModRM32(modrm, val);
+        return 2 + count * 4;
+    }
+
     private int DecodeAndExecute0F()
     {
         byte op2 = FetchByte();
@@ -1297,6 +1641,44 @@ public sealed class Cpu8086
 
         switch (op2)
         {
+            // --- CMOVcc (0x0F 0x40-0x4F, 386+/Pentium Pro) ---
+            case >= 0x40 and <= 0x4F:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                bool cond = (op2 & 0x0F) switch
+                {
+                    0x0 => GetFlag(CpuFlags.Overflow),
+                    0x1 => !GetFlag(CpuFlags.Overflow),
+                    0x2 => GetFlag(CpuFlags.Carry),
+                    0x3 => !GetFlag(CpuFlags.Carry),
+                    0x4 => GetFlag(CpuFlags.Zero),
+                    0x5 => !GetFlag(CpuFlags.Zero),
+                    0x6 => GetFlag(CpuFlags.Carry) || GetFlag(CpuFlags.Zero),
+                    0x7 => !GetFlag(CpuFlags.Carry) && !GetFlag(CpuFlags.Zero),
+                    0x8 => GetFlag(CpuFlags.Sign),
+                    0x9 => !GetFlag(CpuFlags.Sign),
+                    0xA => GetFlag(CpuFlags.Parity),
+                    0xB => !GetFlag(CpuFlags.Parity),
+                    0xC => GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow),
+                    0xD => GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow),
+                    0xE => GetFlag(CpuFlags.Zero) || (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow)),
+                    0xF => !GetFlag(CpuFlags.Zero) && (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow)),
+                    _ => false
+                };
+                if (_operandSize32)
+                {
+                    uint src = ReadModRM32(modrm);
+                    if (cond) Regs.SetReg32(reg, src);
+                }
+                else
+                {
+                    ushort src = ReadModRM16(modrm);
+                    if (cond) Regs.SetReg16(reg, src);
+                }
+                return 4;
+            }
+
             // --- Jcc near rel16 (0x0F 0x80 - 0x0F 0x8F) ---
             case 0x80: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JO
             case 0x81: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JNO
@@ -1343,44 +1725,59 @@ public sealed class Cpu8086
                 return 4;
             }
 
-            // --- MOVZX r16, r/m8 (0x0F 0xB6) ---
+            // --- MOVZX r16/32, r/m8 (0x0F 0xB6) ---
             case 0xB6:
                 modrm = FetchByte();
                 reg = (modrm >> 3) & 7;
-                Regs.SetReg16(reg, ReadModRM8(modrm));
+                if (_operandSize32) Regs.SetReg32(reg, ReadModRM8(modrm));
+                else Regs.SetReg16(reg, ReadModRM8(modrm));
                 return 3;
 
-            // --- MOVZX r16, r/m16 (0x0F 0xB7) — effectively a MOV ---
+            // --- MOVZX r32, r/m16 (0x0F 0xB7) ---
             case 0xB7:
                 modrm = FetchByte();
                 reg = (modrm >> 3) & 7;
-                Regs.SetReg16(reg, ReadModRM16(modrm));
+                if (_operandSize32) Regs.SetReg32(reg, ReadModRM16(modrm));
+                else Regs.SetReg16(reg, ReadModRM16(modrm));
                 return 3;
 
-            // --- MOVSX r16, r/m8 (0x0F 0xBE) ---
+            // --- MOVSX r16/32, r/m8 (0x0F 0xBE) ---
             case 0xBE:
                 modrm = FetchByte();
                 reg = (modrm >> 3) & 7;
-                Regs.SetReg16(reg, (ushort)(short)(sbyte)ReadModRM8(modrm));
+                if (_operandSize32) Regs.SetReg32(reg, (uint)(int)(sbyte)ReadModRM8(modrm));
+                else Regs.SetReg16(reg, (ushort)(short)(sbyte)ReadModRM8(modrm));
                 return 3;
 
-            // --- MOVSX r16, r/m16 (0x0F 0xBF) — effectively a MOV ---
+            // --- MOVSX r32, r/m16 (0x0F 0xBF) ---
             case 0xBF:
                 modrm = FetchByte();
                 reg = (modrm >> 3) & 7;
-                Regs.SetReg16(reg, ReadModRM16(modrm));
+                if (_operandSize32) Regs.SetReg32(reg, (uint)(int)(short)ReadModRM16(modrm));
+                else Regs.SetReg16(reg, ReadModRM16(modrm));
                 return 3;
 
-            // --- IMUL r16, r/m16 (0x0F 0xAF) ---
+            // --- IMUL r16/32, r/m16/32 (0x0F 0xAF) ---
             case 0xAF:
             {
                 modrm = FetchByte();
                 reg = (modrm >> 3) & 7;
-                int result = (short)Regs.GetReg16(reg) * (short)ReadModRM16(modrm);
-                Regs.SetReg16(reg, (ushort)result);
-                bool highSet = result != (short)result;
-                SetFlag(CpuFlags.Carry, highSet);
-                SetFlag(CpuFlags.Overflow, highSet);
+                if (_operandSize32)
+                {
+                    long result = (long)(int)Regs.GetReg32(reg) * (int)ReadModRM32(modrm);
+                    Regs.SetReg32(reg, (uint)result);
+                    bool highSet = result != (int)result;
+                    SetFlag(CpuFlags.Carry, highSet);
+                    SetFlag(CpuFlags.Overflow, highSet);
+                }
+                else
+                {
+                    int result = (short)Regs.GetReg16(reg) * (short)ReadModRM16(modrm);
+                    Regs.SetReg16(reg, (ushort)result);
+                    bool highSet = result != (short)result;
+                    SetFlag(CpuFlags.Carry, highSet);
+                    SetFlag(CpuFlags.Overflow, highSet);
+                }
                 return 21;
             }
 
@@ -1565,6 +1962,117 @@ public sealed class Cpu8086
                     case 7: WriteModRM16(modrm, (ushort)(val ^ (1 << bit))); break; // BTC
                 }
                 return 6;
+            }
+
+            // --- PUSH/POP FS/GS (386+) ---
+            case 0xA0: Push(Regs.FS); return 3; // PUSH FS
+            case 0xA1: Regs.FS = Pop(); return 3; // POP FS
+            case 0xA8: Push(Regs.GS); return 3; // PUSH GS
+            case 0xA9: Regs.GS = Pop(); return 3; // POP GS
+
+            // --- CPUID (0x0F 0xA2) ---
+            case 0xA2:
+            {
+                // Return a minimal 386-compatible CPUID
+                switch (Regs.EAX)
+                {
+                    case 0: // Max leaf + vendor string
+                        Regs.EAX = 1;
+                        Regs.EBX = 0x756E6547; // "Genu"
+                        Regs.EDX = 0x49656E69; // "ineI"
+                        Regs.ECX = 0x6C65746E; // "ntel"
+                        break;
+                    case 1: // Family/Model/Stepping + Features
+                        Regs.EAX = 0x00000300; // 386
+                        Regs.EBX = 0;
+                        Regs.ECX = 0;
+                        Regs.EDX = 0x00000001; // FPU present (lie)
+                        break;
+                    default:
+                        Regs.EAX = 0; Regs.EBX = 0; Regs.ECX = 0; Regs.EDX = 0;
+                        break;
+                }
+                return 14;
+            }
+
+            // --- LSS r16, m16:16 (0x0F 0xB2) ---
+            case 0xB2:
+                modrm = FetchByte();
+                { var (seg, off) = DecodeModRM_Address(modrm); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, _mem.ReadWord(seg, off)); Regs.SS = _mem.ReadWord(seg, (ushort)(off + 2)); }
+                return 16;
+
+            // --- LFS r16, m16:16 (0x0F 0xB4) ---
+            case 0xB4:
+                modrm = FetchByte();
+                { var (seg, off) = DecodeModRM_Address(modrm); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, _mem.ReadWord(seg, off)); Regs.FS = _mem.ReadWord(seg, (ushort)(off + 2)); }
+                return 16;
+
+            // --- LGS r16, m16:16 (0x0F 0xB5) ---
+            case 0xB5:
+                modrm = FetchByte();
+                { var (seg, off) = DecodeModRM_Address(modrm); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, _mem.ReadWord(seg, off)); Regs.GS = _mem.ReadWord(seg, (ushort)(off + 2)); }
+                return 16;
+
+            // --- CMPXCHG r/m8, reg8 (0x0F 0xB0) ---
+            case 0xB0:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                byte rm8 = ReadModRM8(modrm);
+                if (Regs.AL == rm8)
+                {
+                    SetFlag(CpuFlags.Zero, true);
+                    WriteModRM8(modrm, Regs.GetReg8(reg));
+                }
+                else
+                {
+                    SetFlag(CpuFlags.Zero, false);
+                    Regs.AL = rm8;
+                }
+                return 6;
+            }
+
+            // --- CMPXCHG r/m16, reg16 (0x0F 0xB1) ---
+            case 0xB1:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort rm16 = ReadModRM16(modrm);
+                if (Regs.AX == rm16)
+                {
+                    SetFlag(CpuFlags.Zero, true);
+                    WriteModRM16(modrm, Regs.GetReg16(reg));
+                }
+                else
+                {
+                    SetFlag(CpuFlags.Zero, false);
+                    Regs.AX = rm16;
+                }
+                return 6;
+            }
+
+            // --- XADD r/m8, reg8 (0x0F 0xC0) ---
+            case 0xC0:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                byte a8 = ReadModRM8(modrm);
+                byte b8 = Regs.GetReg8(reg);
+                Regs.SetReg8(reg, a8);
+                WriteModRM8(modrm, Add8(a8, b8));
+                return 3;
+            }
+
+            // --- XADD r/m16, reg16 (0x0F 0xC1) ---
+            case 0xC1:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort a16 = ReadModRM16(modrm);
+                ushort b16 = Regs.GetReg16(reg);
+                Regs.SetReg16(reg, a16);
+                WriteModRM16(modrm, Add16(a16, b16));
+                return 3;
             }
 
             default:

@@ -71,6 +71,30 @@ public sealed class DiskImageStreamProvider : IStreamProvider
         throw new NotSupportedException("Cannot write to disk images");
     }
 
+    public Task CreateDirectoryAsync(string path)
+    {
+        throw new NotSupportedException("Cannot modify disk images");
+    }
+
+    public Task DeleteDirectoryAsync(string path)
+    {
+        throw new NotSupportedException("Cannot modify disk images");
+    }
+
+    public Task RenameAsync(string oldPath, string newPath)
+    {
+        throw new NotSupportedException("Cannot modify disk images");
+    }
+
+    public Task<long> GetFileSizeAsync(string path)
+    {
+        string name = NormalizePath(path);
+        var entry = FindFile(name);
+        if (entry != null)
+            return Task.FromResult((long)entry.Value.Size);
+        return Task.FromResult(-1L);
+    }
+
     private DiskFileEntry? FindFile(string name)
     {
         var entries = _disk.ListRootDirectory();

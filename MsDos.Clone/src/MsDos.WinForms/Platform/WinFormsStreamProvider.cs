@@ -89,4 +89,42 @@ public sealed class WinFormsStreamProvider : IStreamProvider
         _importedFiles[normalized] = data;
         return Task.CompletedTask;
     }
+
+    public Task CreateDirectoryAsync(string path)
+    {
+        string fullPath = ResolvePath(path);
+        Directory.CreateDirectory(fullPath);
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteDirectoryAsync(string path)
+    {
+        string fullPath = ResolvePath(path);
+        if (Directory.Exists(fullPath))
+            Directory.Delete(fullPath, recursive: false);
+        return Task.CompletedTask;
+    }
+
+    public Task RenameAsync(string oldPath, string newPath)
+    {
+        string fullOld = ResolvePath(oldPath);
+        string fullNew = ResolvePath(newPath);
+        if (File.Exists(fullOld))
+            File.Move(fullOld, fullNew);
+        else if (Directory.Exists(fullOld))
+            Directory.Move(fullOld, fullNew);
+        return Task.CompletedTask;
+    }
+
+    public Task<long> GetFileSizeAsync(string path)
+    {
+        string normalized = path.Replace('\\', '/').TrimStart('/').ToUpperInvariant();
+        if (_importedFiles.TryGetValue(normalized, out var data))
+            return Task.FromResult((long)data.Length);
+
+        string fullPath = ResolvePath(path);
+        if (File.Exists(fullPath))
+            return Task.FromResult(new FileInfo(fullPath).Length);
+        return Task.FromResult(-1L);
+    }
 }

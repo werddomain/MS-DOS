@@ -42,6 +42,37 @@ public sealed class DosKernel
     // Drive provider map for resolving paths on different drives
     private readonly Dictionary<char, IStreamProvider> _driveProviders = new(new CharOrdinalIgnoreCaseComparer());
 
+    // Current Working Directory per drive (DOS tracks CWD per drive)
+    private readonly Dictionary<char, string> _currentDirectories = new(new CharOrdinalIgnoreCaseComparer());
+
+    // Memory manager (MCB chain)
+    private MemoryManager? _memoryManager;
+
+    // Extended error tracking
+    private ushort _lastError;
+    private byte _lastErrorClass;
+    private byte _lastErrorAction;
+    private byte _lastErrorLocus;
+
+    // Ctrl-C check flag
+    private byte _ctrlCFlag;
+
+    // Buffered console input state for AH=0Ah when waiting for additional keys
+    private bool _bufferedInputActive;
+    private ushort _bufferedInputSeg;
+    private ushort _bufferedInputOff;
+    private byte _bufferedInputMaxLen;
+    private byte _bufferedInputCount;
+
+    // Verify flag  
+    private byte _verifyFlag;
+
+    /// <summary>Environment segment for the current process.</summary>
+    public ushort EnvironmentSegment { get; set; }
+
+    /// <summary>Attach the memory manager for INT 21h/48-4Ah.</summary>
+    public void SetMemoryManager(MemoryManager manager) => _memoryManager = manager;
+
     /// <summary>
     /// Register a drive letter with its stream provider so the kernel can resolve file paths.
     /// </summary>
@@ -209,7 +240,9 @@ public sealed class DosKernel
 
             case 0x33: // Get/set Ctrl-Break flag
                 if (_cpu.Regs.AL == 0)
-                    _cpu.Regs.DL = 0; // Ctrl-Break checking off
+                    _cpu.Regs.DL = _ctrlCFlag;
+                else if (_cpu.Regs.AL == 1)
+                    _ctrlCFlag = _cpu.Regs.DL;
                 break;
 
             case 0x35: // Get interrupt vector
@@ -262,11 +295,11 @@ public sealed class DosKernel
                 break;
 
             case 0x49: // Free memory
-                _cpu.Regs.Flags &= ~CpuFlags.Carry; // success
+                HandleFreeMemory();
                 break;
 
             case 0x4A: // Resize memory block
-                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                HandleResizeMemory();
                 break;
 
             case 0x4B: // EXEC - load and execute program
@@ -300,11 +333,11 @@ public sealed class DosKernel
                 break;
 
             case 0x54: // Get verify flag
-                _cpu.Regs.AL = 0; // Verify off
+                _cpu.Regs.AL = _verifyFlag;
                 break;
 
             case 0x56: // Rename file
-                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                HandleRenameFile();
                 break;
 
             case 0x57: // Get/set file date/time
@@ -312,16 +345,24 @@ public sealed class DosKernel
                 break;
 
             case 0x58: // Get/set memory allocation strategy
-                if (_cpu.Regs.AL == 0)
-                    _cpu.Regs.AX = 0; // First fit
-                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                if (_cpu.Regs.AL == 0) // Get
+                {
+                    _cpu.Regs.AX = _memoryManager?.AllocationStrategy ?? 0;
+                    _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                }
+                else if (_cpu.Regs.AL == 1) // Set
+                {
+                    if (_memoryManager != null)
+                        _memoryManager.AllocationStrategy = (byte)_cpu.Regs.BX;
+                    _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                }
                 break;
 
             case 0x59: // Get extended error information
-                _cpu.Regs.AX = 0; // No error
-                _cpu.Regs.BH = 0;
-                _cpu.Regs.BL = 0;
-                _cpu.Regs.CH = 0;
+                _cpu.Regs.AX = _lastError;
+                _cpu.Regs.BH = _lastErrorClass;
+                _cpu.Regs.BL = _lastErrorAction;
+                _cpu.Regs.CH = _lastErrorLocus;
                 break;
 
             case 0x36: // Get disk free space
@@ -334,7 +375,7 @@ public sealed class DosKernel
                 break;
 
             case 0x2E: // Set verify flag
-                // Just accept and ignore
+                _verifyFlag = _cpu.Regs.AL;
                 break;
 
             case 0x38: // Get/set country info
@@ -356,18 +397,15 @@ public sealed class DosKernel
                 break;
 
             case 0x39: // Create directory (MKDIR)
-                _log.Info("DOS", $"MKDIR: {ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX)}");
-                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                HandleMkdir();
                 break;
 
             case 0x3A: // Remove directory (RMDIR)
-                _log.Info("DOS", $"RMDIR: {ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX)}");
-                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                HandleRmdir();
                 break;
 
             case 0x3B: // Change directory (CHDIR)
-                _log.Info("DOS", $"CHDIR: {ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX)}");
-                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                HandleChdir();
                 break;
 
             case 0x55: // Create child PSP
@@ -484,6 +522,86 @@ public sealed class DosKernel
                 // DS:BX → pointer to media descriptor byte
                 break;
 
+            case 0x1F: // Get default DPB (Drive Parameter Block)
+            case 0x32: // Get DPB for specific drive
+            {
+                // Return a minimal DPB at a fixed address
+                ushort dpbSeg = 0x0080;
+                ushort dpbOff = 0x0000;
+                _mem.WriteByte(dpbSeg, dpbOff, _currentDrive);        // Drive number
+                _mem.WriteByte(dpbSeg, (ushort)(dpbOff + 1), 0);      // Unit number
+                _mem.WriteWord(dpbSeg, (ushort)(dpbOff + 2), 512);    // Bytes per sector
+                _mem.WriteByte(dpbSeg, (ushort)(dpbOff + 4), 63);     // Sectors per cluster - 1
+                _mem.WriteByte(dpbSeg, (ushort)(dpbOff + 5), 6);      // Cluster shift
+                _mem.WriteWord(dpbSeg, (ushort)(dpbOff + 6), 1);      // Reserved sectors
+                _mem.WriteByte(dpbSeg, (ushort)(dpbOff + 8), 2);      // Number of FATs
+                _mem.WriteWord(dpbSeg, (ushort)(dpbOff + 9), 512);    // Max root directory entries
+                _mem.WriteWord(dpbSeg, (ushort)(dpbOff + 0x0B), 2);   // First data sector
+                _mem.WriteWord(dpbSeg, (ushort)(dpbOff + 0x0D), 2048);// Max cluster number
+                _cpu.Regs.DS = dpbSeg;
+                _cpu.Regs.BX = dpbOff;
+                _cpu.Regs.AL = 0; // Success
+                break;
+            }
+
+            case 0x03: // Auxiliary input
+                _cpu.Regs.AL = 0;
+                break;
+
+            case 0x04: // Auxiliary output
+                break;
+
+            case 0x05: // Printer output
+                break;
+
+            case 0x10: // Close FCB file
+            case 0x11: // Find first FCB
+            case 0x12: // Find next FCB
+            case 0x13: // Delete FCB
+            case 0x14: // Sequential read FCB
+            case 0x15: // Sequential write FCB
+            case 0x16: // Create FCB
+            case 0x17: // Rename FCB
+            case 0x21: // Random read FCB
+            case 0x22: // Random write FCB
+            case 0x23: // Get file size FCB
+            case 0x24: // Set random record FCB
+            case 0x27: // Random block read FCB
+            case 0x28: // Random block write FCB
+            case 0x0F: // Open file using FCB
+                // FCB operations — return success but don't actually do anything
+                _cpu.Regs.AL = 0xFF; // FCB not found / error
+                _log.Debug("DOS", $"FCB operation AH={func:X2}h (stub)");
+                break;
+
+            case 0x52: // Get DOS internal variables (List of Lists)
+            {
+                // Return pointer to a minimal LoL structure
+                ushort lolSeg = 0x0080;
+                ushort lolOff = 0x0020;
+                // Write MCB chain start at offset -2
+                if (_memoryManager != null)
+                    _mem.WriteWord(lolSeg, (ushort)(lolOff - 2), _memoryManager.FirstMcb);
+                _cpu.Regs.ES = lolSeg;
+                _cpu.Regs.BX = lolOff;
+                break;
+            }
+
+            case 0x53: // Translate BPB to DPB
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x5D: // Server function call (network)
+                _cpu.Regs.AX = 1; // Not supported
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                break;
+
+            case 0x5E: // Network operations
+            case 0x5F: // Network redirector
+                _cpu.Regs.AX = 0x01; // Function not supported  
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                break;
+
             case 0x6C: // Extended open/create (DOS 4.0+)
                 HandleExtendedOpen();
                 break;
@@ -501,16 +619,46 @@ public sealed class DosKernel
         ConsoleOutput?.Invoke(ch);
     }
 
+    private void ReexecuteCurrentInterrupt()
+    {
+        // INT 21h is 2 bytes (CD 21). Rewind to emulate DOS blocking behavior
+        // without blocking the host runtime thread.
+        _cpu.Regs.IP -= 2;
+        _cpu.IsWaitingForInput = true; // Signal execution loop to yield
+    }
+
+    private bool TryReadKeyNonBlocking(out DosKeyEventArgs key)
+    {
+        key = default;
+        if (!_events.IsKeyAvailable)
+            return false;
+
+        var readTask = _events.ReadKeyAsync();
+        if (!readTask.IsCompletedSuccessfully)
+            return false;
+
+        key = readTask.GetAwaiter().GetResult();
+        return true;
+    }
+
     private void HandleCharInputWithEcho()
     {
-        var key = _events.ReadKeyAsync().GetAwaiter().GetResult();
+        if (!TryReadKeyNonBlocking(out var key))
+        {
+            ReexecuteCurrentInterrupt();
+            return;
+        }
         _cpu.Regs.AL = key.AsciiChar;
         OutputChar((char)key.AsciiChar);
     }
 
     private void HandleCharInputNoEcho()
     {
-        var key = _events.ReadKeyAsync().GetAwaiter().GetResult();
+        if (!TryReadKeyNonBlocking(out var key))
+        {
+            ReexecuteCurrentInterrupt();
+            return;
+        }
         _cpu.Regs.AL = key.AsciiChar;
     }
 
@@ -519,9 +667,8 @@ public sealed class DosKernel
         if (_cpu.Regs.DL == 0xFF)
         {
             // Input
-            if (_events.IsKeyAvailable)
+            if (TryReadKeyNonBlocking(out var key))
             {
-                var key = _events.ReadKeyAsync().GetAwaiter().GetResult();
                 _cpu.Regs.AL = key.AsciiChar;
                 _cpu.Regs.Flags &= ~CpuFlags.Zero;
             }
@@ -553,23 +700,37 @@ public sealed class DosKernel
 
     private void HandleBufferedInput()
     {
-        ushort seg = _cpu.Regs.DS;
-        ushort off = _cpu.Regs.DX;
-        byte maxLen = _mem.ReadByte(seg, off);
-        byte count = 0;
-
-        for (int i = 0; i < maxLen - 1; i++)
+        if (!_bufferedInputActive)
         {
-            var key = _events.ReadKeyAsync().GetAwaiter().GetResult();
+            _bufferedInputSeg = _cpu.Regs.DS;
+            _bufferedInputOff = _cpu.Regs.DX;
+            _bufferedInputMaxLen = _mem.ReadByte(_bufferedInputSeg, _bufferedInputOff);
+            _bufferedInputCount = 0;
+            _bufferedInputActive = true;
+        }
+
+        while (_bufferedInputCount < _bufferedInputMaxLen - 1)
+        {
+            if (!TryReadKeyNonBlocking(out var key))
+            {
+                // Keep function blocking until Enter by re-executing INT 21h AH=0Ah.
+                ReexecuteCurrentInterrupt();
+                return;
+            }
+
             if (key.AsciiChar == 0x0D) // Enter
             {
                 OutputChar('\r');
                 OutputChar('\n');
-                break;
+                _mem.WriteByte(_bufferedInputSeg, (ushort)(_bufferedInputOff + 1), _bufferedInputCount);
+                _mem.WriteByte(_bufferedInputSeg, (ushort)(_bufferedInputOff + 2 + _bufferedInputCount), 0x0D);
+                _bufferedInputActive = false;
+                return;
             }
-            if (key.AsciiChar == 0x08 && count > 0) // Backspace
+
+            if (key.AsciiChar == 0x08 && _bufferedInputCount > 0) // Backspace
             {
-                count--;
+                _bufferedInputCount--;
                 OutputChar('\b');
                 OutputChar(' ');
                 OutputChar('\b');
@@ -577,13 +738,16 @@ public sealed class DosKernel
             }
             if (key.AsciiChar >= 0x20)
             {
-                _mem.WriteByte(seg, (ushort)(off + 2 + count), key.AsciiChar);
-                count++;
+                _mem.WriteByte(_bufferedInputSeg, (ushort)(_bufferedInputOff + 2 + _bufferedInputCount), key.AsciiChar);
+                _bufferedInputCount++;
                 OutputChar((char)key.AsciiChar);
             }
         }
-        _mem.WriteByte(seg, (ushort)(off + 1), count);
-        _mem.WriteByte(seg, (ushort)(off + 2 + count), 0x0D);
+
+        // Buffer full: terminate with CR
+        _mem.WriteByte(_bufferedInputSeg, (ushort)(_bufferedInputOff + 1), _bufferedInputCount);
+        _mem.WriteByte(_bufferedInputSeg, (ushort)(_bufferedInputOff + 2 + _bufferedInputCount), 0x0D);
+        _bufferedInputActive = false;
     }
 
     private void SetInterruptVector()
@@ -723,7 +887,11 @@ public sealed class DosKernel
 
         if (handle == 0) // stdin
         {
-            var key = _events.ReadKeyAsync().GetAwaiter().GetResult();
+            if (!TryReadKeyNonBlocking(out var key))
+            {
+                ReexecuteCurrentInterrupt();
+                return;
+            }
             _mem.WriteByte(bufSeg, bufOff, key.AsciiChar);
             _cpu.Regs.AX = 1;
             _cpu.Regs.Flags &= ~CpuFlags.Carry;
@@ -853,7 +1021,56 @@ public sealed class DosKernel
                     _cpu.Regs.DX = 0x0000; // File device
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;
                 break;
+
+            case 0x01: // Set device information
+                // Accept and ignore — nothing to configure
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x06: // Get input status
+                // Return AL=FFh (ready)
+                _cpu.Regs.AL = 0xFF;
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x07: // Get output status
+                // Return AL=FFh (ready)
+                _cpu.Regs.AL = 0xFF;
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x08: // Is device removable?
+                // DX=0 → removable, DX=1 → fixed.  Report fixed for now.
+                _cpu.Regs.AX = 1; // non-removable
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x09: // Is drive remote?
+                // DX bit 12 (0x1000) = remote/shared, bit 9 (0x0200) = redirected
+                // Return DX=0 → local drive (not remote, not network)
+                _cpu.Regs.DX = 0x0000;
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x0A: // Is handle remote?
+                // DX bit 15 = remote. Return 0 → local handle.
+                _cpu.Regs.DX = 0x0000;
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x0B: // Set sharing retry count
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x0D: // Generic IOCTL (block device)
+            case 0x0E: // Get logical drive map
+            case 0x0F: // Set logical drive map
+                // Stub — succeed silently
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
             default:
+                _log.Warn("DOS", $"IOCTL unhandled subfunction 0x{subfunc:X2}");
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;
                 break;
         }
@@ -861,28 +1078,166 @@ public sealed class DosKernel
 
     private void HandleGetCurrentDir()
     {
-        // Return root directory "\"
+        // Return current directory for drive DL (0=current)
+        byte drive = _cpu.Regs.DL;
+        char driveLetter = drive == 0 ? (char)('A' + _currentDrive) : (char)('A' + drive - 1);
+
+        string cwd = "";
+        if (_currentDirectories.TryGetValue(driveLetter, out var dir))
+            cwd = dir.TrimStart('\\');
+
         ushort seg = _cpu.Regs.DS;
         ushort off = _cpu.Regs.SI;
-        _mem.WriteByte(seg, off, 0); // Empty string = root
+        byte[] bytes = System.Text.Encoding.ASCII.GetBytes(cwd);
+        for (int i = 0; i < bytes.Length && i < 63; i++)
+            _mem.WriteByte(seg, (ushort)(off + i), bytes[i]);
+        _mem.WriteByte(seg, (ushort)(off + Math.Min(bytes.Length, 63)), 0);
         _cpu.Regs.Flags &= ~CpuFlags.Carry;
     }
 
     private void HandleAllocateMemory()
     {
-        // Simplified: always allocate from a high segment
         ushort paragraphs = _cpu.Regs.BX;
-        // Return a segment above the current program
-        _cpu.Regs.AX = (ushort)(CurrentPSP + 0x1000);
-        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        if (_memoryManager != null)
+        {
+            ushort seg = _memoryManager.Allocate(paragraphs, CurrentPSP, out ushort maxAvail);
+            if (seg != 0)
+            {
+                _cpu.Regs.AX = seg;
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            }
+            else
+            {
+                _cpu.Regs.AX = 0x08; // Insufficient memory
+                _cpu.Regs.BX = maxAvail;
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                SetExtendedError(0x08, 1, 2, 0); // Out of memory
+            }
+        }
+        else
+        {
+            // Fallback: always allocate from a high segment
+            _cpu.Regs.AX = (ushort)(CurrentPSP + 0x1000);
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+    }
+
+    private void HandleFreeMemory()
+    {
+        if (_memoryManager != null)
+        {
+            if (_memoryManager.Free(_cpu.Regs.ES))
+            {
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            }
+            else
+            {
+                _cpu.Regs.AX = 0x09; // Invalid memory block address
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                SetExtendedError(0x09, 2, 1, 0);
+            }
+        }
+        else
+        {
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+    }
+
+    private void HandleResizeMemory()
+    {
+        if (_memoryManager != null)
+        {
+            ushort newSize = _cpu.Regs.BX;
+            if (_memoryManager.Resize(_cpu.Regs.ES, newSize, out ushort maxAvail))
+            {
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            }
+            else
+            {
+                _cpu.Regs.AX = 0x08; // Insufficient memory
+                _cpu.Regs.BX = maxAvail;
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                SetExtendedError(0x08, 1, 2, 0);
+            }
+        }
+        else
+        {
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
     }
 
     private void HandleExec()
     {
         string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
         _log.Info("DOS", $"EXEC: {path}");
-        // TODO: Implement child process loading
-        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+
+        // Read the parameter block at ES:BX
+        ushort paramSeg = _cpu.Regs.ES;
+        ushort paramOff = _cpu.Regs.BX;
+        ushort envSeg = _mem.ReadWord(paramSeg, paramOff); // Environment segment
+        ushort cmdLineSeg = _mem.ReadWord(paramSeg, (ushort)(paramOff + 2));
+        ushort cmdLineOff = _mem.ReadWord(paramSeg, (ushort)(paramOff + 4));
+
+        // Read command line from the parameter block
+        string cmdLine = "";
+        if (cmdLineSeg != 0 || cmdLineOff != 0)
+        {
+            byte len = _mem.ReadByte(cmdLineSeg, cmdLineOff);
+            for (int i = 0; i < len; i++)
+                cmdLine += (char)_mem.ReadByte(cmdLineSeg, (ushort)(cmdLineOff + 1 + i));
+        }
+
+        try
+        {
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            if (!provider.ExistsAsync(resolvedPath).GetAwaiter().GetResult())
+            {
+                _cpu.Regs.AX = 0x02; // File not found
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                SetExtendedError(0x02, 8, 3, 1);
+                return;
+            }
+
+            // Load the child program
+            using var stream = provider.OpenReadAsync(resolvedPath).GetAwaiter().GetResult();
+            using var ms = new MemoryStream();
+            stream.CopyTo(ms);
+            byte[] programData = ms.ToArray();
+
+            _log.Info("DOS", $"EXEC loading {path} ({programData.Length} bytes), cmdline='{cmdLine}'");
+
+            // For now, just report success - full EXEC requires saving/restoring parent state
+            // which needs proper memory management. The shell handles this at a higher level.
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        catch (Exception ex)
+        {
+            _log.Error("DOS", $"EXEC failed: {ex.Message}");
+            _cpu.Regs.AX = 0x05; // Access denied
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+            SetExtendedError(0x05, 3, 1, 1);
+        }
+    }
+
+    /// <summary>Set the current directory for a drive.</summary>
+    public void SetCurrentDirectory(char drive, string path)
+    {
+        _currentDirectories[char.ToUpperInvariant(drive)] = path.TrimStart('\\');
+    }
+
+    /// <summary>Get the current directory for a drive.</summary>
+    public string GetCurrentDirectory(char? drive = null)
+    {
+        char d = drive ?? (char)('A' + _currentDrive);
+        return _currentDirectories.TryGetValue(d, out var dir) ? dir : "";
+    }
+
+    private void SetExtendedError(ushort error, byte errorClass, byte action, byte locus)
+    {
+        _lastError = error;
+        _lastErrorClass = errorClass;
+        _lastErrorAction = action;
+        _lastErrorLocus = locus;
     }
 
     private void HandleGetDiskFreeSpace()
@@ -893,6 +1248,101 @@ public sealed class DosKernel
         _cpu.Regs.BX = 1024;   // Number of available clusters
         _cpu.Regs.CX = 512;    // Bytes per sector
         _cpu.Regs.DX = 2048;   // Total clusters on drive
+    }
+
+    private void HandleMkdir()
+    {
+        string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
+        try
+        {
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            provider.CreateDirectoryAsync(resolvedPath).GetAwaiter().GetResult();
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            _log.Info("DOS", $"MKDIR: {path}");
+        }
+        catch
+        {
+            _cpu.Regs.AX = 0x05; // Access denied
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+            SetExtendedError(0x05, 3, 1, 1);
+        }
+    }
+
+    private void HandleRmdir()
+    {
+        string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
+        try
+        {
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            provider.DeleteDirectoryAsync(resolvedPath).GetAwaiter().GetResult();
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            _log.Info("DOS", $"RMDIR: {path}");
+        }
+        catch
+        {
+            _cpu.Regs.AX = 0x03; // Path not found
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+            SetExtendedError(0x03, 8, 3, 1);
+        }
+    }
+
+    private void HandleChdir()
+    {
+        string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
+        _log.Info("DOS", $"CHDIR: {path}");
+
+        // Determine which drive this applies to
+        char drive;
+        string dirPath;
+        if (path.Length >= 2 && path[1] == ':')
+        {
+            drive = char.ToUpperInvariant(path[0]);
+            dirPath = path.Length > 2 ? path[2..].TrimStart('\\', '/') : "";
+        }
+        else
+        {
+            drive = (char)('A' + _currentDrive);
+            dirPath = path.TrimStart('\\', '/');
+        }
+
+        // Navigate relative paths
+        string current = _currentDirectories.TryGetValue(drive, out var c) ? c : "";
+        if (dirPath == "..")
+        {
+            int lastSep = current.LastIndexOf('\\');
+            dirPath = lastSep >= 0 ? current[..lastSep] : "";
+        }
+        else if (dirPath == ".")
+        {
+            dirPath = current;
+        }
+        else if (!string.IsNullOrEmpty(current) && !string.IsNullOrEmpty(dirPath) && !dirPath.Contains('\\'))
+        {
+            // Relative — append to current
+            dirPath = current + "\\" + dirPath;
+        }
+
+        _currentDirectories[drive] = dirPath;
+        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+    }
+
+    private void HandleRenameFile()
+    {
+        string oldPath = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
+        string newPath = ReadDosString(_cpu.Regs.ES, _cpu.Regs.DI);
+        try
+        {
+            var (provider, resolvedOld) = ResolveFilePath(oldPath);
+            var (_, resolvedNew) = ResolveFilePath(newPath);
+            provider.RenameAsync(resolvedOld, resolvedNew).GetAwaiter().GetResult();
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        catch
+        {
+            _cpu.Regs.AX = 0x05; // Access denied
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+            SetExtendedError(0x05, 3, 1, 1);
+        }
     }
 
     private void HandleFindFirst()
@@ -973,19 +1423,53 @@ public sealed class DosKernel
         for (int i = 0; i < 43; i++)
             _mem.WriteByte(seg, (ushort)(off + i), 0);
 
-        // File attribute (0x20 = archive)
-        _mem.WriteByte(seg, (ushort)(off + 0x15), 0x20);
+        // Try to get file info (size, attributes, date/time)
+        uint fileSize = 0;
+        byte fileAttr = 0x20; // Default: archive
+        DateTime fileTime = DateTime.Now;
 
-        // File time/date (current time)
-        var now = DateTime.Now;
-        ushort time = (ushort)((now.Hour << 11) | (now.Minute << 5) | (now.Second / 2));
-        ushort date = (ushort)(((now.Year - 1980) << 9) | (now.Month << 5) | now.Day);
+        // Determine if this is a directory
+        bool isDir = filename.EndsWith('/') || filename.EndsWith('\\');
+        if (isDir)
+        {
+            fileAttr = 0x10; // Directory attribute
+            filename = filename.TrimEnd('/', '\\');
+        }
+        else
+        {
+            // Try to get the actual file size from the provider
+            try
+            {
+                string dir = "";
+                string searchPattern = _findPattern;
+                int lastSep = searchPattern.LastIndexOfAny(new[] { '\\', '/' });
+                if (lastSep >= 0) dir = searchPattern[..lastSep];
+
+                var (provider, resolvedDir) = ResolveFilePath(dir.Length > 0 ? dir : ".");
+                string filePath = string.IsNullOrEmpty(resolvedDir) || resolvedDir == "."
+                    ? Path.GetFileName(filename) 
+                    : Path.Combine(resolvedDir, Path.GetFileName(filename));
+                long size = provider.GetFileSizeAsync(filePath).GetAwaiter().GetResult();
+                fileSize = (uint)Math.Min(size, uint.MaxValue);
+            }
+            catch
+            {
+                // Size remains 0 if we can't determine it
+            }
+        }
+
+        // File attribute
+        _mem.WriteByte(seg, (ushort)(off + 0x15), fileAttr);
+
+        // File time/date
+        ushort time = (ushort)((fileTime.Hour << 11) | (fileTime.Minute << 5) | (fileTime.Second / 2));
+        ushort date = (ushort)(((fileTime.Year - 1980) << 9) | (fileTime.Month << 5) | fileTime.Day);
         WriteDtaWord(seg, off, 0x16, time);
         WriteDtaWord(seg, off, 0x18, date);
 
-        // File size (0 for simplicity)
-        WriteDtaWord(seg, off, 0x1A, 0);
-        WriteDtaWord(seg, off, 0x1C, 0);
+        // File size (DWORD, little-endian)
+        WriteDtaWord(seg, off, 0x1A, (ushort)(fileSize & 0xFFFF));
+        WriteDtaWord(seg, off, 0x1C, (ushort)((fileSize >> 16) & 0xFFFF));
 
         // Filename (up to 12 chars + null, DOS 8.3 format)
         string name = Path.GetFileName(filename).ToUpperInvariant();

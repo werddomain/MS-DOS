@@ -64,6 +64,10 @@
 
     <div class="status-bar">
         <span>@_statusText</span>
+        @if (_biosWaitPending)
+        {
+            <span class="status-wait">BIOS WAIT…</span>
+        }
     </div>
 
     @* ── Debug Toolbar ── *@
@@ -128,6 +132,8 @@
     private BlazorEventRegistry? _events;
     private BlazorStreamProvider? _streams;
     private CancellationTokenSource? _cts;
+    private CancellationTokenSource? _uiPumpCts;
+    private Task? _uiPumpTask;
     private bool _loaded;
     private bool _running;
     private string _statusText = "Ready - Upload a COM/EXE file or start Shell";
@@ -145,6 +151,7 @@
     private int _activeDebugTab;
     private string _registerText = "Registers: (load a program to see register state)";
     private string? _memoryDiffHtml;
+    private bool _biosWaitPending;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -152,7 +159,44 @@
         {
             await JS.InvokeVoidAsync("dosRenderer.init", "dosCanvas");
             InitializeMachine();
+            StartUiWaitPump();
             await _containerRef.FocusAsync();
+        }
+    }
+
+    private void StartUiWaitPump()
+    {
+        _uiPumpCts?.Cancel();
+        _uiPumpCts = new CancellationTokenSource();
+        var token = _uiPumpCts.Token;
+
+        _uiPumpTask = UiWaitPumpLoopAsync(token);
+    }
+
+    private async Task UiWaitPumpLoopAsync(CancellationToken token)
+    {
+        var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(token))
+            {
+                _machine?.PumpBiosWaitFromHostClock();
+
+                bool pending = _machine?.IsBiosWaitPending == true;
+                if (pending != _biosWaitPending)
+                {
+                    _biosWaitPending = pending;
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown
+        }
+        finally
+        {
+            timer.Dispose();
         }
     }
 
@@ -410,7 +454,18 @@
         _cts?.Cancel();
         _machine?.Reset();
         _running = false;
-        _statusText = "Machine reset - Upload a file or start Shell";
+
+        // Show which drives are still attached after reset
+        var drives = _machine?.GetMountedDrives();
+        if (drives != null && drives.Count > 1) // More than just default C:
+        {
+            var driveList = string.Join(", ", drives.Select(c => $"{c}:"));
+            _statusText = $"Machine reset - Drives still attached: {driveList}";
+        }
+        else
+        {
+            _statusText = "Machine reset - Upload a file or start Shell";
+        }
     }
 
     private async Task OnStartShell()
@@ -418,7 +473,14 @@
         try
         {
             _cts?.Cancel();
-            InitializeMachine();
+
+            // Only initialize the machine if it doesn't exist yet;
+            // preserve existing machine (and its mounted disks) on subsequent calls
+            if (_machine == null)
+            {
+                InitializeMachine();
+            }
+
             await JS.InvokeVoidAsync("dosRenderer.init", "dosCanvas");
 
             _running = true;
@@ -431,6 +493,7 @@
 
             try
             {
+                // RunShellAsync calls Reset() internally, which preserves mounted drives
                 await _machine!.RunShellAsync(_cts.Token);
             }
             catch (OperationCanceledException) { }
@@ -517,6 +580,11 @@
 
     public async ValueTask DisposeAsync()
     {
+        _uiPumpCts?.Cancel();
+        if (_uiPumpTask != null)
+        {
+            try { await _uiPumpTask; } catch (OperationCanceledException) { }
+        }
         _cts?.Cancel();
         _machine?.Stop();
     }

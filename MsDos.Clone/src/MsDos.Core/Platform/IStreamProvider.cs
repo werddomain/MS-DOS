@@ -30,4 +30,16 @@ public interface IStreamProvider
     /// The data is provided as a byte array along with a target path/name.
     /// </summary>
     Task ImportBinaryAsync(string targetPath, byte[] data);
+
+    /// <summary>Create a directory at the given path.</summary>
+    Task CreateDirectoryAsync(string path);
+
+    /// <summary>Delete a directory at the given path.</summary>
+    Task DeleteDirectoryAsync(string path);
+
+    /// <summary>Rename or move a file or directory.</summary>
+    Task RenameAsync(string oldPath, string newPath);
+
+    /// <summary>Get the size of a file in bytes. Returns -1 if not found.</summary>
+    Task<long> GetFileSizeAsync(string path);
 }

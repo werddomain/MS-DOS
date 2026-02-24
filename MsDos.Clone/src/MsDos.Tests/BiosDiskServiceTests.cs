@@ -133,4 +133,46 @@ public class BiosDiskServiceTests
         Assert.Equal((byte)0, _cpu.Regs.AH); // Success
         Assert.False((_cpu.Regs.Flags & CpuFlags.Carry) != 0);
     }
+
+    // ─── AH=05h — Format Track ─────────────────────────────────────
+
+    [Fact]
+    public void FormatTrack_FillsSectorsWithF6()
+    {
+        // Create a 1.44M floppy image: 2 heads, 18 SPT, 80 cylinders
+        var image = new byte[1474560];
+        _disk.RegisterDisk(0x00, image, 2, 18, 80);
+
+        // Format track: cylinder 0, head 0
+        _cpu.Regs.AH = 0x05;
+        _cpu.Regs.DL = 0x00; // Drive A:
+        _cpu.Regs.CH = 0;    // Cylinder 0
+        _cpu.Regs.CL = 0;    // (track info)
+        _cpu.Regs.DH = 0;    // Head 0
+        _disk.Handle();
+
+        Assert.Equal((byte)0, _cpu.Regs.AH);
+        Assert.False((_cpu.Regs.Flags & CpuFlags.Carry) != 0);
+
+        // Verify all 18 sectors (0-based: sectors 0..17) are filled with 0xF6
+        // Each sector is 512 bytes, total = 18*512 = 9216 bytes at start of image
+        for (int s = 0; s < 18; s++)
+        {
+            long offset = s * 512;
+            Assert.Equal(0xF6, image[offset]);
+            Assert.Equal(0xF6, image[offset + 255]);
+            Assert.Equal(0xF6, image[offset + 511]);
+        }
+    }
+
+    [Fact]
+    public void FormatTrack_UnregisteredDrive_Fails()
+    {
+        _cpu.Regs.AH = 0x05;
+        _cpu.Regs.DL = 0x03; // Unregistered
+        _disk.Handle();
+
+        Assert.True((_cpu.Regs.Flags & CpuFlags.Carry) != 0);
+        Assert.Equal((byte)0x0C, _cpu.Regs.AH); // Unsupported track
+    }
 }

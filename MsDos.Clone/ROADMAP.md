@@ -152,6 +152,8 @@ Legend: ✅ Implemented | 🔧 Partial | ❌ Not implemented
 | 9B | WAIT/FWAIT | ✅ | NOP (no FPU) |
 | F0 | LOCK prefix | ✅ | NOP (no multiprocessor) |
 | 26,2E,36,3E | Segment override prefixes (ES/CS/SS/DS) | ✅ | |
+| D8-DF | ESC (x87 FPU coprocessor) | ✅ | NOP — consumes ModR/M + displacement, no FPU |
+| D6 | SALC/SETALC (undocumented) | ❌ | Set AL=FF if CF=1, else AL=0. Used by some programs |
 
 ### 1.8 Two-byte Opcodes (0x0F prefix) — 80186/80286+
 
@@ -173,6 +175,28 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 0F B0/B1 | CMPXCHG | ❌ | 80486+ |
 | 0F C0/C1 | XADD | ❌ | 80486+ |
 | 0F 01 | LGDT/SGDT/LIDT/SIDT | ❌ | Protected mode, low priority |
+| 0F 00 | SLDT/STR/LLDT/LTR/VERR/VERW | ❌ | Protected mode, low priority |
+| 0F 02/03 | LAR/LSL | ❌ | Protected mode, low priority |
+| 0F A0/A1 | PUSH FS / POP FS | ❌ | 80386+, some programs use FS/GS |
+| 0F A8/A9 | PUSH GS / POP GS | ❌ | 80386+, some programs use FS/GS |
+
+### 1.9 CPU Functional Gaps
+
+These are not missing opcodes but missing *behaviors* within implemented instructions.
+
+| Feature | Status | Severity | Notes |
+|---------|--------|----------|-------|
+| I/O port space (ports 0x00-0xFFFF) | ❌ | Medium | IN/OUT are NOPs — no PIT (0x40-0x43), PIC (0x20-0x21), keyboard (0x60-0x64), CRT (0x3D4-0x3D5), or game port (0x201) |
+| PIT timer port 0x40 read | ❌ | Medium | Many programs read port 0x40 for high-resolution timing / random seeds |
+| PIC ports 0x20/0x21 (EOI, mask) | ❌ | Medium | Programs that install hardware IRQ handlers issue EOI via OUT 0x20,0x20 |
+| Keyboard controller port 0x60 | ❌ | Low | Low-level keyboard programs read scan codes directly from port 0x60 |
+| CRT controller ports 0x3D4-0x3D5 | ❌ | Low | Programs that do CRT tricks (smooth scroll, split screen) probe these |
+| VGA DAC ports 0x3C7-0x3C9 | ❌ | Medium | VGA palette programming — programs write RGB values via port I/O |
+| Game port 0x201 | ❌ | Low | Joystick reading |
+| Trap Flag (TF) single-step INT 1 | ❌ | Low | DEBUG.COM uses TF for single-stepping — INT 1 is never generated |
+| Overflow flag (OF) on 1-bit shifts | ❌ | Low | ROL/ROR/SHL/SHR should set OF specifically for count=1 shifts |
+| REP with INS/OUTS (0x6C-0x6F) | ❌ | Low | REP handler doesn't dispatch 0x6C-0x6F |
+| BIOS Data Area (0040:0000) | ❌ | Medium | Not populated — programs probing BDA for video mode, drive count, keyboard buffer, etc. get zeros |
 
 ---
 
@@ -213,8 +237,8 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 17h | Rename file (FCB) | ❌ | Legacy FCB, low priority |
 | 19h | Get current default drive | ✅ | |
 | 1Ah | Set DTA | ✅ | |
-| 1Bh | Get allocation info (default drive) | ❌ | |
-| 1Ch | Get allocation info (specific drive) | ❌ | |
+| 1Bh | Get allocation info (default drive) | 🔧 | Returns hardcoded values, no media descriptor pointer |
+| 1Ch | Get allocation info (specific drive) | 🔧 | Returns hardcoded values, no media descriptor pointer |
 | 21h | Random read (FCB) | ❌ | Legacy FCB, low priority |
 | 22h | Random write (FCB) | ❌ | Legacy FCB, low priority |
 | 23h | Get file size (FCB) | ❌ | Legacy FCB, low priority |
@@ -259,7 +283,7 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 41h | Delete file | ✅ | |
 | 42h | Move file pointer (LSEEK) | ✅ | |
 | 43h | Get/set file attributes | 🔧 | Always returns archive |
-| 44h | IOCTL | 🔧 | Only subfunc 00h |
+| 44h | IOCTL | 🔧 | Subfuncs 00h-01h,06h-0Bh,0Dh-0Fh stubbed; missing 02h-05h (read/write IOCTL data) |
 | 45h | Duplicate handle (DUP) | ✅ | |
 | 46h | Force duplicate handle (DUP2) | ✅ | |
 | 47h | Get current directory | ✅ | Always returns root |
@@ -269,16 +293,16 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 4Bh | EXEC (load and execute) | 🔧 | Logs only, no child process |
 | 4Ch | Terminate with return code | ✅ | |
 | 4Dh | Get return code | ✅ | |
-| 4Eh | Find first matching file | ✅ | |
-| 4Fh | Find next matching file | ✅ | |
+| 4Eh | Find first matching file | 🔧 | File size always returned as 0 in DTA |
+| 4Fh | Find next matching file | 🔧 | File size always returned as 0 in DTA |
 | 50h | Set PSP segment | ✅ | |
 | 51h | Get PSP segment | ✅ | |
 | 54h | Get verify flag | ✅ | |
-| 55h | Create child PSP | ✅ | Stub |
-| 56h | Rename file | ✅ | Stub |
+| 55h | Create child PSP | 🔧 | Copies PSP bytes but doesn't set INT 22h/23h/24h vectors |
+| 56h | Rename file | 🔧 | Accepts and succeeds without actually renaming |
 | 57h | Get/set file date/time | ✅ | |
 | 58h | Get/set memory allocation strategy | ✅ | |
-| 59h | Get extended error information | ✅ | Always returns "no error" |
+| 59h | Get extended error information | 🔧 | Always returns "no error" — no error state tracking |
 | 5Ah | Create temporary file | ✅ | |
 | 5Bh | Create new file (fail if exists) | ✅ | |
 | 5Ch | Lock/unlock file region | ❌ | |
@@ -294,6 +318,23 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 68h | Commit file (flush) | ✅ | |
 | 6Ch | Extended open/create | ✅ | DOS 4.0+ |
 
+### 2.5 DOS Kernel Infrastructure Gaps
+
+These are missing internal systems that multiple INT 21h functions depend on.
+
+| Feature | Status | Severity | Notes |
+|---------|--------|----------|-------|
+| MCB (Memory Control Block) chain | ❌ | Critical | 48h/49h/4Ah just fake it — no arena, programs corrupt each other |
+| Environment block | ❌ | High | Programs can't read PATH, COMSPEC, or any env vars; EXEC needs this |
+| Current working directory tracking | ❌ | High | CWD is always \ — CHDIR is cosmetic only; path resolution ignores CWD |
+| Per-drive CWD (CDS table) | ❌ | High | DOS maintains a separate CWD per drive letter |
+| Error code tracking | ❌ | Medium | INT 21h/59h always says "no error"; no error propagation between calls |
+| SFT (System File Table) | ❌ | Medium | File handles use a simple Dictionary; no SFT entries for inheritance |
+| SDA (Swappable Data Area) | ❌ | Low | Advanced programs/TSRs may probe this |
+| File sharing / SHARE.EXE | ❌ | Low | No record locking across handles |
+| InDOS flag (real tracking) | ❌ | Low | Flag at 0070:0000 is always 0; should be 1 while inside INT 21h |
+| Handle inheritance on EXEC | ❌ | Medium | Child processes should inherit parent's open file handles |
+
 ---
 
 ## 3. BIOS Interrupts
@@ -302,26 +343,28 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | AH | Function | Status | Notes |
 |----|----------|--------|-------|
-| 00h | Set video mode | ✅ | Modes 03h, 04h, 06h, 13h |
+| 00h | Set video mode | 🔧 | Only modes 03h, 04h, 06h, 13h. Missing: 00h-02h (40-col text), 05h (320x200 B&W), 0Dh-12h (EGA/VGA) |
 | 01h | Set cursor shape | ✅ | |
 | 02h | Set cursor position | ✅ | |
 | 03h | Get cursor position/shape | ✅ | |
 | 04h | Get light pen position | ❌ | Rarely used |
-| 05h | Set active display page | ✅ | |
-| 06h | Scroll up | ✅ | |
-| 07h | Scroll down | ✅ | Proper implementation |
+| 05h | Set active display page | 🔧 | Page number stored but no multi-page video memory |
+| 06h | Scroll up | 🔧 | Window corner registers (CH/CL/DH/DL) not used — always full-screen scroll |
+| 07h | Scroll down | 🔧 | Window corner registers (CH/CL/DH/DL) not used — always full-screen scroll |
 | 08h | Read char/attr at cursor | ✅ | |
 | 09h | Write char/attr at cursor | ✅ | |
 | 0Ah | Write char at cursor (keep attr) | ✅ | |
-| 0Bh | Set color palette | ✅ | Stub |
-| 0Ch | Write pixel | ✅ | |
-| 0Dh | Read pixel | ✅ | |
+| 0Bh | Set color palette | 🔧 | Stub — no CGA palette switching |
+| 0Ch | Write pixel | 🔧 | Only mode 13h (linear A000). CGA modes 04h/06h interlaced memory not emulated |
+| 0Dh | Read pixel | 🔧 | Only mode 13h. CGA modes return 0 |
 | 0Eh | TTY output | ✅ | |
 | 0Fh | Get video mode | ✅ | |
-| 10h | Set palette registers | 🔧 | Stub |
-| 11h | Character generator | ✅ | Font info query supported |
+| 10h | Set palette registers | ❌ | Stub only — VGA DAC palette writes have no effect |
+| 11h | Character generator | 🔧 | Only AH=30h (get font info). Missing: load user font, set 8x8/8x14/8x16 |
 | 12h | Video subsystem configuration | ✅ | |
 | 13h | Write string | ✅ | |
+| 1Ah | Get/set display combination | ❌ | VGA — returns active/alternate display |
+| 1Bh | Get video functionality info | ❌ | VGA — returns state buffer |
 
 ### 3.2 INT 11h — Equipment List
 
@@ -344,10 +387,19 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 02h | Read sectors | ✅ | |
 | 03h | Write sectors | ✅ | |
 | 04h | Verify sectors | ✅ | |
-| 05h | Format track | ❌ | |
-| 08h | Get drive parameters | ✅ | |
+| 05h | Format track | ❌ | Needed by FORMAT.COM |
+| 06h | Format track and set bad sector flags | ❌ | Hard disk only |
+| 07h | Format drive from specified track | ❌ | Hard disk only |
+| 08h | Get drive parameters | 🔧 | DL always returns 1 drive; should reflect actual mounted count |
+| 09h | Initialize drive pair characteristics | ❌ | Hard disk only |
+| 0Ah | Read long sectors (with ECC) | ❌ | Rarely used |
+| 0Bh | Write long sectors (with ECC) | ❌ | Rarely used |
+| 0Ch | Seek to cylinder | ❌ | Low priority |
+| 0Dh | Alternate disk reset | ❌ | Hard disk only |
 | 15h | Get disk type | ✅ | |
 | 16h | Detect disk change | ✅ | |
+| 17h | Set disk type for format | ❌ | Used by FORMAT.COM |
+| 18h | Set media type for format | ❌ | Used by FORMAT.COM |
 
 ### 3.5 INT 14h — Serial Port Services
 
@@ -362,23 +414,27 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 | AH | Function | Status | Notes |
 |----|----------|--------|-------|
+| 41h | Wait on external event | ✅ | Stub — returns immediately |
+| 4Fh | Keyboard intercept | ❌ | Called by INT 09h to allow TSRs to filter keystrokes |
 | 86h | Wait | ✅ | |
-| 87h | Extended memory copy | ❌ | |
-| 88h | Get extended memory size | ✅ | |
-| C0h | Get system config | ✅ | Returns unsupported |
+| 87h | Extended memory block move (GDT) | ❌ | Requires protected mode switch; some programs use for >1MB copy |
+| 88h | Get extended memory size | ✅ | Returns 0 (no extended memory) |
+| 89h | Switch to protected mode | ❌ | Low priority — 80286+ only |
+| C0h | Get system configuration table | 🔧 | Returns unsupported; should return pointer to config table |
+| C1h | Get extended BIOS data area segment | ❌ | Low priority |
 
 ### 3.7 INT 16h — Keyboard Services
 
 | AH | Function | Status | Notes |
 |----|----------|--------|-------|
 | 00h | Wait for keypress | ✅ | |
-| 01h | Check for keypress | ✅ | |
-| 02h | Get shift flags | ✅ | Always returns 0 |
-| 03h | Set typematic rate | ❌ | |
-| 05h | Store key in buffer | ❌ | |
+| 01h | Check for keypress | 🔧 | Peek is destructive — consumes key instead of leaving it in buffer |
+| 02h | Get shift flags | 🔧 | Always returns 0 — programs can't detect Shift/Ctrl/Alt state |
+| 03h | Set typematic rate/delay | ❌ | |
+| 05h | Store key in buffer | ❌ | TSRs use this to inject keystrokes |
 | 10h | Wait for keypress (enhanced) | ✅ | |
-| 11h | Check for keypress (enhanced) | ✅ | |
-| 12h | Get extended shift flags | ✅ | |
+| 11h | Check for keypress (enhanced) | 🔧 | Same destructive peek issue as AH=01h |
+| 12h | Get extended shift flags | 🔧 | Always returns 0 — same as AH=02h |
 
 ### 3.8 INT 17h — Printer Services
 
@@ -414,9 +470,43 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | 0002h | Hide cursor | ✅ | |
 | 0003h | Get position/button status | ✅ | |
 | 0004h | Set position | ✅ | |
+| 0005h | Get button press info | ✅ | Press count always 0 |
+| 0006h | Get button release info | ✅ | Release count always 0 |
 | 0007h | Set horizontal limits | ✅ | |
 | 0008h | Set vertical limits | ✅ | |
-| 000Ch | Set interrupt subroutine | ✅ | Stub — accepted but ignored |
+| 0009h | Set graphics cursor shape | ❌ | |
+| 000Ah | Set text cursor type | ❌ | |
+| 000Bh | Read motion counters | ✅ | Always returns 0 mickeys |
+| 000Ch | Set user subroutine (callback) | 🔧 | Accepted but ignored — mouse-driven programs that rely on callbacks won't get events |
+| 000Dh | Light pen emulation on | ❌ | Rarely used |
+| 000Eh | Light pen emulation off | ❌ | Rarely used |
+| 000Fh | Set mickey/pixel ratio | ❌ | |
+| 0010h | Set mouse exclusion area | ❌ | |
+| 0013h | Set double-speed threshold | ❌ | |
+| 0014h | Swap user subroutine | ❌ | |
+| 0015h | Get mouse driver state size | ❌ | |
+| 0016h | Save mouse driver state | ❌ | |
+| 0017h | Restore mouse driver state | ❌ | |
+| 001Ah | Set mouse sensitivity | ❌ | |
+| 001Bh | Get mouse sensitivity | ❌ | |
+
+### 3.12 Hardware Interrupt Infrastructure
+
+These are not BIOS service interrupts but hardware-level mechanisms that many programs depend on.
+
+| Feature | Status | Severity | Notes |
+|---------|--------|----------|-------|
+| INT 08h — IRQ 0 Timer tick (18.2 Hz) | ❌ | High | Many programs (clocks, games, PRINT.COM) hook INT 08h for timing |
+| INT 09h — IRQ 1 Keyboard hardware | ❌ | Low | Low-level keyboard; works around it via managed handler |
+| INT 0Bh-0Ch — IRQ 3/4 Serial ports | ❌ | Low | Serial I/O programs |
+| INT 0Eh — IRQ 6 Floppy disk | ❌ | Low | |
+| INT 23h — Ctrl-C handler | ❌ | Medium | Ctrl-C doesn't invoke program's registered handler |
+| INT 24h — Critical error handler | ❌ | Medium | Disk errors should invoke the user's critical error handler |
+| INT 28h — DOS idle interrupt | ❌ | Low | TSR programs hook this to run during DOS idle |
+| INT 2Fh — Multiplex interrupt | ❌ | Medium | Used by PRINT, ASSIGN, SHARE, APPEND, DOSKEY, many TSRs |
+| PIC (8259) emulation | ❌ | Medium | No IRQ masking, no EOI — OUT 0x20,0x20 is a NOP |
+| PIT (8253/8254) timer emulation | ❌ | Medium | No periodic tick generation; port 0x40 reads return nothing |
+| DMA controller (8237) | ❌ | Low | Floppy disk and sound card DMA |
 
 ---
 
@@ -428,9 +518,12 @@ These are needed by many real-world DOS programs compiled for 80186+.
 |---------|--------|-------|
 | 1 MB address space | ✅ | MemoryBus class |
 | Segment:offset addressing | ✅ | |
-| MCB (Memory Control Block) chain | ❌ | For proper alloc/free |
+| MCB (Memory Control Block) chain | ❌ | Critical — for proper alloc/free/EXEC |
 | UMB (Upper Memory Blocks) | ❌ | Low priority |
 | HMA (High Memory Area) | ❌ | Low priority |
+| I/O port address space (64K ports) | ❌ | IN/OUT go nowhere — need at least PIT, PIC, keyboard, VGA ports |
+| BIOS Data Area (0040:0000-0040:00FF) | ❌ | Not populated — keyboard buffer, video state, drive count, timer ticks all zero |
+| ROM area (F000:0000+) write protection | ❌ | Low priority — writable in emulator |
 
 ### 4.2 File System
 
@@ -439,12 +532,16 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | FAT12 disk image reading | ✅ | DiskImageLoader |
 | FAT16 disk image reading | ✅ | DiskImageLoader |
 | FAT12 disk image writing | ✅ | DiskImageWriter |
+| FAT16 disk image writing | ❌ | Only FAT12 blanks can be created |
 | FAT chain following | ✅ | |
-| Subdirectory traversal | ❌ | Only root directory |
+| Subdirectory traversal | ❌ | Only root directory — CD \SUBDIR and paths like \DOS\EDIT.COM fail on disk images |
+| Subdirectory creation/deletion | ❌ | MKDIR/RMDIR accepted but do nothing |
 | Long filename support | ❌ | Not needed (DOS 8.3 only) |
-| File attribute support | 🔧 | Always returns archive |
-| Volume label support | ❌ | |
-| Disk image write-through | ❌ | Writes are in-memory only |
+| File attribute support | 🔧 | Always returns archive — get/set both stubbed |
+| File size in FindFirst/FindNext | ❌ | DTA always writes size=0; programs checking file size get wrong data |
+| Volume label read/write | ❌ | |
+| Disk image write-through / persist | ❌ | Writes go to in-memory byte array only — not saved unless explicitly exported |
+| Correct media descriptor byte | ❌ | INT 21h/1Bh DS:BX should point to media descriptor; currently doesn't |
 
 ### 4.3 Process Management
 
@@ -454,9 +551,14 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | EXE (MZ) file loading | ✅ | BinaryLoader with relocations |
 | PSP setup | ✅ | |
 | Command tail | ✅ | |
-| Child process execution (EXEC) | ❌ | INT 21h/4Bh stub only |
-| TSR (Terminate and Stay Resident) | ❌ | |
-| Environment block | ❌ | |
+| Child process execution (EXEC) | ❌ | Critical — INT 21h/4Bh logs only, no child process loading |
+| EXEC overlay loading (4Bh/03h) | ❌ | Load overlay without creating PSP |
+| TSR (Terminate and Stay Resident) | ❌ | INT 21h/31h not implemented; INT 27h not handled |
+| Environment block | ❌ | No COMSPEC=, PATH=, or custom env vars available to programs |
+| Environment block passing to child | ❌ | EXEC should pass or inherit environment |
+| Handle inheritance on EXEC | ❌ | Child processes should inherit parent's open file handles |
+| Program return to parent | ❌ | After child exits, parent (COMMAND.COM or caller) should resume |
+| INT 22h/23h/24h vector save/restore | ❌ | PSP should store these; EXEC should set/restore them |
 
 ### 4.4 Device Drivers
 
@@ -478,10 +580,10 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | TYPE | ✅ | |
 | COPY | ✅ | Including cross-drive |
 | DEL/ERASE | ✅ | |
-| REN/RENAME | ✅ | |
-| MKDIR/MD | ✅ | |
-| RMDIR/RD | ✅ | |
-| CD/CHDIR | ✅ | Partial (no real path tracking) |
+| REN/RENAME | 🔧 | Prints "not yet implemented" |
+| MKDIR/MD | 🔧 | Prints success but doesn't actually create directory |
+| RMDIR/RD | 🔧 | Prints success but doesn't actually delete directory |
+| CD/CHDIR | 🔧 | Partial — no real path tracking, no validation |
 | CLS | ✅ | |
 | VER | ✅ | |
 | DATE | ✅ | |
@@ -513,6 +615,14 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | MODE | ❌ | |
 | TREE | ❌ | |
 | ATTRIB | ❌ | |
+| LABEL | ❌ | |
+| VOL | ❌ | |
+| VERIFY | ❌ | |
+| BREAK | ❌ | |
+| CTTY | ❌ | |
+| RECOVER | ❌ | |
+| EDLIN | ❌ | |
+| DEBUG | ❌ | |
 
 ### 4.6 Disk Image Support
 
@@ -524,8 +634,10 @@ These are needed by many real-world DOS programs compiled for 80186+.
 | Import IMG to C: drive | ✅ | |
 | Auto-detect FAT12/FAT16 | ✅ | |
 | Floppy geometries (160K-1.44MB) | ✅ | |
-| Hard disk images | ❌ | |
+| Hard disk images (raw) | ❌ | No MBR / partition table parsing |
 | Partition table support | ❌ | |
+| Boot sector execution | ❌ | Boot sector loaded but not executed as 8086 code |
+| VHD/VMDK/QCOW2 formats | ❌ | Low priority — only raw IMG supported |
 
 ### 4.7 Platform Support
 
@@ -543,42 +655,83 @@ These are needed by many real-world DOS programs compiled for 80186+.
 
 ## 5. Implementation Priority
 
-### Phase 1 — Core CPU Completeness (Highest Priority)
+### Phase 1 — Core CPU Completeness ✅ (Complete)
 1. ✅ **0x0F two-byte opcodes**: Jcc near (0F 80-8F) — used by virtually all compiled programs
 2. ✅ **ENTER/LEAVE** (C8/C9) — used by compiled C programs for stack frames
 3. ✅ **PUSHA/POPA** (60/61) — used widely by 80186+ programs
 4. ✅ **PUSH imm** (68/6A) — used by compilers for pushing constants
 5. ✅ **IMUL imm** (69/6B) — three-operand multiply used by compilers
 6. ✅ **MOVZX/MOVSX** (0F B6/BE) — used by 386+ compiled code
+7. ✅ **ESC opcodes** (D8-DF) — x87 FPU stubs, skip ModR/M correctly
 
-### Phase 2 — Critical DOS Services
-1. ❌ **INT 21h/4Bh EXEC** — properly load and execute child programs
-2. ✅ **INT 21h/29h Parse filename** — needed by many programs
-3. ❌ **INT 21h/43h File attributes** — proper implementation
-4. ❌ **INT 21h/44h IOCTL** — additional subfunctions
-5. ✅ **INT 21h/45h-46h DUP/DUP2** — handle duplication
-6. ✅ **INT 21h/5Ah-5Bh** — temp file / create new
-7. ❌ **MCB chain** — proper memory management
+### Phase 2 — Critical DOS Kernel Infrastructure
+1. ❌ **MCB chain** — proper memory management (alloc/free/resize), foundation for EXEC
+2. ❌ **INT 21h/4Bh EXEC** — properly load and execute child programs with PSP/env/handle inheritance
+3. ❌ **Environment block** — programs need PATH, COMSPEC, and custom env vars
+4. ❌ **Current working directory tracking** — per-drive CWD (CDS table), real CHDIR
+5. ❌ **Error code tracking** — last-error state for INT 21h/59h
+6. ✅ **INT 21h/29h Parse filename** — needed by many programs
+7. ✅ **INT 21h/45h-46h DUP/DUP2** — handle duplication
+8. ✅ **INT 21h/5Ah-5Bh** — temp file / create new
+9. 🔧 **INT 21h/44h IOCTL** — subfuncs 00h-0Bh done; need 02h-05h (read/write IOCTL data)
 
-### Phase 3 — BIOS Services
+### Phase 3 — File System Completeness
+1. ❌ **Subdirectory traversal** in FAT images — CD \SUBDIR, nested paths
+2. ❌ **Proper file size** in FindFirst/FindNext DTA results
+3. ❌ **MKDIR/RMDIR** real implementation on disk images
+4. ❌ **Rename file** (INT 21h/56h) real implementation
+5. ❌ **File attributes** (INT 21h/43h) — read actual attrs from FAT directory entry
+
+### Phase 4 — Hardware & Interrupt Infrastructure
+1. ❌ **INT 08h timer tick** (18.2 Hz) — many programs depend on this for timing
+2. ❌ **BIOS Data Area** (0040:0000) — keyboard buffer, video state, timer ticks, drive count
+3. ❌ **PIT timer** (port 0x40) — programs read this for high-res timing and random seeds
+4. ❌ **PIC emulation** (ports 0x20/0x21) — IRQ masking and EOI for hardware interrupt handlers
+5. ❌ **INT 23h Ctrl-C handler** — invoke program's registered handler
+6. ❌ **INT 24h Critical error handler** — invoke on disk errors
+7. ❌ **INT 2Fh Multiplex** — used by PRINT, SHARE, DOSKEY, and many TSRs
+8. ❌ **VGA palette ports** (0x3C7-0x3C9) — programs set RGB palette via port I/O
+
+### Phase 5 — BIOS Improvements
 1. ✅ **INT 13h Disk services** — sector-level disk I/O for boot/install
 2. ✅ **INT 10h/0Ch-0Dh** — pixel read/write for graphics modes
 3. ✅ **INT 10h/07h** — proper scroll down
 4. ✅ **INT 33h Mouse** — mouse driver services
 5. ✅ **INT 15h/86h Wait** — timed delays
+6. ❌ **INT 13h/05h Format track** — needed by FORMAT.COM
+7. ❌ **INT 10h/10h VGA palette** — program-settable palette
+8. ❌ **INT 10h scroll window** — use CH/CL/DH/DL corner coordinates instead of full-screen
+9. ❌ **INT 16h shift flags** — report actual Shift/Ctrl/Alt state
+10. ❌ **INT 16h/01h non-destructive peek** — check key without removing from buffer
+11. ❌ **CGA/EGA graphics memory** — modes 04h/06h interlaced memory layout
+12. ❌ **Additional video modes** — modes 00h-02h (40-col), 0Dh-12h (EGA/VGA)
 
-### Phase 4 — Shell & Utilities
+### Phase 6 — Shell & Utilities
 1. ❌ I/O redirection (>, >>, <)
 2. ❌ Piping (|)
 3. ❌ IF/FOR/CALL in batch files
-4. ❌ Environment variable expansion
-5. ❌ PROMPT command
-6. ❌ Additional commands (MORE, FIND, ATTRIB, TREE)
+4. ❌ Environment variable expansion (%VAR%)
+5. ❌ PROMPT command (with $P$G etc.)
+6. ❌ Additional commands (MORE, FIND, SORT, ATTRIB, TREE, FORMAT, CHKDSK, MODE, LABEL, VOL)
+7. ❌ Real REN/RENAME implementation
+8. ❌ Real MKDIR/RMDIR implementation
 
-### Phase 5 — Advanced Features
-1. ❌ Subdirectory traversal in FAT images
-2. ❌ FCB-based file operations (compatibility)
-3. ❌ TSR support
-4. ❌ Device driver support
-5. ❌ Environment block for processes
-6. ❌ Hard disk image support
+### Phase 7 — Advanced Features
+1. ❌ FCB-based file operations (compatibility with older programs)
+2. ❌ TSR support (INT 21h/31h, INT 27h)
+3. ❌ Installable device driver support (CONFIG.SYS DEVICE=)
+4. ❌ Hard disk image support with partition tables
+5. ❌ Boot sector execution as 8086 code
+6. ❌ EMS/XMS memory (HIMEM.SYS, EMM386)
+7. ❌ Sound (PC speaker via PIT channel 2)
+
+---
+
+## 6. Gap Summary
+
+| Severity | Count | Top Items |
+|----------|-------|-----------|
+| **Critical** | 2 | EXEC (child process loading), MCB memory chain |
+| **High** | 7 | Subdirectory traversal, I/O redirection, INT 08h timer tick, environment block, CWD tracking, TSR, MKDIR/RMDIR real impl |
+| **Medium** | ~25 | BDA population, I/O ports, shift key detection, file attributes, IOCTL subfuncs, FindFirst file sizes, CGA graphics memory, VGA palette, keyboard peek vs consume, scroll window coords, rename file, hardware IRQs, critical error handler, INT 2Fh multiplex |
+| **Low** | ~30 | Serial/printer, protected mode opcodes, light pen, advanced mouse functions, RTC set, CMPXCHG/XADD, ROM write protection, boot sector execution, EMS/XMS, sound |

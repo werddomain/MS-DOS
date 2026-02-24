@@ -103,6 +103,16 @@ dotnet run --project src/MsDos.WinForms
 dotnet run --project src/MsDos.Blazor
 ```
 
+### Build original MS-DOS 4.0 artifacts for this clone
+
+From repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\MsDos.Clone\scripts\build-msdos4.ps1
+```
+
+This launches DOSBox, builds `v4.0/src` with the original toolchain, and copies generated DOS binaries into `MsDos.Clone/assets/msdos4`.
+
 ## Importing and Running Binary Files
 
 ### WinForms

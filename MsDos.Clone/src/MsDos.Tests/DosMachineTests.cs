@@ -105,6 +105,16 @@ public class DosMachineTests
             _files[targetPath] = data;
             return Task.CompletedTask;
         }
+
+        public Task CreateDirectoryAsync(string path) => Task.CompletedTask;
+        public Task DeleteDirectoryAsync(string path) => Task.CompletedTask;
+        public Task RenameAsync(string oldPath, string newPath)
+        {
+            if (_files.Remove(oldPath, out var d)) _files[newPath] = d;
+            return Task.CompletedTask;
+        }
+        public Task<long> GetFileSizeAsync(string path) =>
+            Task.FromResult(_files.TryGetValue(path, out var d) ? (long)d.Length : -1L);
     }
 
     [Fact]
@@ -343,5 +353,208 @@ public class DosMachineTests
         // Eject should remove it
         machine.EjectFloppyDisk('A');
         Assert.DoesNotContain('A', machine.GetMountedDrives());
+    }
+
+    [Fact]
+    public void Reset_PreservesFloppyDiskImages()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Mount a floppy disk on A:
+        var image = new byte[368640]; // 360K
+        bool mounted = machine.MountDiskImage('A', image);
+        Assert.True(mounted);
+        Assert.True(machine.Floppy.SlotA.HasDisk);
+
+        // Reset the machine
+        machine.Reset();
+
+        // Verify disk is still mounted after reset
+        Assert.Contains('A', machine.GetMountedDrives());
+        Assert.NotNull(machine.GetDriveProvider('A'));
+        Assert.True(machine.Floppy.SlotA.HasDisk);
+    }
+
+    [Fact]
+    public void Reset_PreservesHardDiskImages()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Mount a small HDD image on C: (overriding default stream provider)
+        var image = new byte[368640]; // 360K — small image for test
+        bool mounted = machine.MountDiskImage('C', image);
+        Assert.True(mounted);
+
+        // Reset the machine
+        machine.Reset();
+
+        // Verify C: is still mounted
+        Assert.Contains('C', machine.GetMountedDrives());
+        Assert.NotNull(machine.GetDriveProvider('C'));
+    }
+
+    [Fact]
+    public void Reset_PreservesMultipleDrives()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Mount A: and B:
+        var imageA = new byte[368640];
+        var imageB = new byte[368640];
+        machine.MountDiskImage('A', imageA);
+        machine.MountDiskImage('B', imageB);
+
+        // Also verify C: is default-mounted
+        Assert.Contains('C', machine.GetMountedDrives());
+
+        // Reset
+        machine.Reset();
+
+        // All three drives should survive
+        Assert.Contains('A', machine.GetMountedDrives());
+        Assert.Contains('B', machine.GetMountedDrives());
+        Assert.Contains('C', machine.GetMountedDrives());
+        Assert.True(machine.Floppy.SlotA.HasDisk);
+        Assert.True(machine.Floppy.SlotB.HasDisk);
+    }
+
+    [Fact]
+    public void LoadBinary_PreservesDiskMountsAcrossReset()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Mount floppy first
+        var image = new byte[368640];
+        machine.MountDiskImage('A', image);
+
+        // Load a binary (which calls Reset internally)
+        byte[] com = { 0xB4, 0x4C, 0xB0, 0x00, 0xCD, 0x21 };
+        bool loaded = machine.LoadBinary(com);
+        Assert.True(loaded);
+
+        // Verify floppy is still mounted after LoadBinary's internal reset
+        Assert.Contains('A', machine.GetMountedDrives());
+        Assert.True(machine.Floppy.SlotA.HasDisk);
+    }
+
+    [Fact]
+    public void MountDiskThenBootSequence_FindsFloppyDisk()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Mount a floppy on A: before powering on
+        var image = new byte[368640];
+        machine.MountDiskImage('A', image);
+
+        // Reset simulates power-on preparation
+        machine.Reset();
+
+        // Boot sequence should find A: drive
+        var bootDrive = machine.CheckBootSequence();
+        Assert.Equal('A', bootDrive);
+    }
+
+    [Fact]
+    public void Int15Wait_PausesManualExecution_AndResumesViaUiSignal()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams)
+        {
+            ManualClockMode = true
+        };
+
+        // Program:
+        // MOV AH,86h
+        // MOV CX,004Ch
+        // MOV DX,4B40h   ; 5,000,000 us (~5s)
+        // INT 15h
+        // MOV AH,4Ch
+        // MOV AL,07h
+        // INT 21h
+        byte[] com =
+        {
+            0xB4, 0x86,
+            0xB9, 0x4C, 0x00,
+            0xBA, 0x40, 0x4B,
+            0xCD, 0x15,
+            0xB4, 0x4C,
+            0xB0, 0x07,
+            0xCD, 0x21,
+        };
+
+        Assert.True(machine.LoadBinary(com));
+
+        machine.StepInstruction(); // MOV AH,86
+        machine.StepInstruction(); // MOV CX,004C
+        machine.StepInstruction(); // MOV DX,4B40
+        machine.StepInstruction(); // INT 15h -> starts wait gate
+
+        Assert.True(machine.IsBiosWaitPending);
+
+        ushort ipBefore = machine.Cpu.Regs.IP;
+        int blockedCycles = machine.StepInstruction(); // must not advance while waiting
+        Assert.Equal(0, blockedCycles);
+        Assert.Equal(ipBefore, machine.Cpu.Regs.IP);
+
+        machine.ResumeBiosWait();
+        Assert.False(machine.IsBiosWaitPending);
+
+        int resumedCycles = machine.StepInstruction(); // MOV AH,4C should execute
+        Assert.True(resumedCycles > 0);
+        Assert.NotEqual(ipBefore, machine.Cpu.Regs.IP);
+    }
+
+    [Fact]
+    public async Task Int15Wait_AutoResumesByTimeout_DuringRunAsync()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Program with short BIOS wait then terminate with code 9
+        // MOV AH,86h
+        // MOV CX,0000h
+        // MOV DX,03E8h ; 1000 us = 1ms
+        // INT 15h
+        // MOV AH,4Ch
+        // MOV AL,09h
+        // INT 21h
+        byte[] com =
+        {
+            0xB4, 0x86,
+            0xB9, 0x00, 0x00,
+            0xBA, 0xE8, 0x03,
+            0xCD, 0x15,
+            0xB4, 0x4C,
+            0xB0, 0x09,
+            0xCD, 0x21,
+        };
+
+        Assert.True(machine.LoadBinary(com));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await machine.RunAsync(cts.Token);
+
+        Assert.True(machine.IsTerminated);
+        Assert.Equal((byte)9, machine.ExitCode);
+        Assert.False(machine.IsBiosWaitPending);
     }
 }

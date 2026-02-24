@@ -106,6 +106,37 @@ public sealed class BiosDiskService
                 }
                 break;
 
+            case 0x05: // Format track
+                if (_diskImages.ContainsKey(drive) && _geometry.ContainsKey(drive))
+                {
+                    // Accept format — fill the track with 0xF6 (standard format fill byte)
+                    var geo2 = _geometry[drive];
+                    ushort cx = _cpu.Regs.CX;
+                    int cyl = ((cx >> 8) & 0xFF) | ((cx & 0xC0) << 2);
+                    int head = _cpu.Regs.DH;
+                    var img = _diskImages[drive];
+
+                    for (int s = 1; s <= geo2.spt; s++)
+                    {
+                        long lba = ((long)cyl * geo2.heads + head) * geo2.spt + (s - 1);
+                        long off = lba * geo2.bps;
+                        if (off >= 0 && off + geo2.bps <= img.Length)
+                        {
+                            for (int b = 0; b < geo2.bps; b++)
+                                img[off + b] = 0xF6;
+                        }
+                    }
+                    _cpu.Regs.AH = 0;
+                    _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                    _log.Debug("INT13", $"Formatted track: C={cyl} H={head}");
+                }
+                else
+                {
+                    _cpu.Regs.AH = 0x0C;
+                    _cpu.Regs.Flags |= CpuFlags.Carry;
+                }
+                break;
+
             case 0x08: // Get drive parameters
                 GetDriveParameters(drive);
                 break;

@@ -6,16 +6,11 @@ namespace MsDos.Core.Cpu;
 /// </summary>
 public sealed class Registers
 {
-    // General-purpose registers (stored as 16-bit)
-    private ushort _ax, _bx, _cx, _dx;
+    // General-purpose registers (stored as 32-bit for 386+ support)
+    private uint _eax, _ebx, _ecx, _edx;
 
-    // Index registers
-    public ushort SI { get; set; }
-    public ushort DI { get; set; }
-
-    // Pointer registers
-    public ushort SP { get; set; }
-    public ushort BP { get; set; }
+    // Index / pointer registers (32-bit backing for 386+ support)
+    private uint _esi, _edi, _esp, _ebp;
 
     // Instruction pointer
     public ushort IP { get; set; }
@@ -25,24 +20,40 @@ public sealed class Registers
     public ushort DS { get; set; }
     public ushort ES { get; set; }
     public ushort SS { get; set; }
+    public ushort FS { get; set; } // 386+
+    public ushort GS { get; set; } // 386+
 
-    // 16-bit register accessors
-    public ushort AX { get => _ax; set => _ax = value; }
-    public ushort BX { get => _bx; set => _bx = value; }
-    public ushort CX { get => _cx; set => _cx = value; }
-    public ushort DX { get => _dx; set => _dx = value; }
+    // --- 32-bit register accessors (386+) ---
+    public uint EAX { get => _eax; set => _eax = value; }
+    public uint EBX { get => _ebx; set => _ebx = value; }
+    public uint ECX { get => _ecx; set => _ecx = value; }
+    public uint EDX { get => _edx; set => _edx = value; }
+    public uint ESI { get => _esi; set => _esi = value; }
+    public uint EDI { get => _edi; set => _edi = value; }
+    public uint ESP { get => _esp; set => _esp = value; }
+    public uint EBP { get => _ebp; set => _ebp = value; }
+
+    // --- 16-bit register accessors (low word of 32-bit registers) ---
+    public ushort AX { get => (ushort)(_eax & 0xFFFF); set => _eax = (_eax & 0xFFFF0000) | value; }
+    public ushort BX { get => (ushort)(_ebx & 0xFFFF); set => _ebx = (_ebx & 0xFFFF0000) | value; }
+    public ushort CX { get => (ushort)(_ecx & 0xFFFF); set => _ecx = (_ecx & 0xFFFF0000) | value; }
+    public ushort DX { get => (ushort)(_edx & 0xFFFF); set => _edx = (_edx & 0xFFFF0000) | value; }
+    public ushort SI { get => (ushort)(_esi & 0xFFFF); set => _esi = (_esi & 0xFFFF0000) | value; }
+    public ushort DI { get => (ushort)(_edi & 0xFFFF); set => _edi = (_edi & 0xFFFF0000) | value; }
+    public ushort SP { get => (ushort)(_esp & 0xFFFF); set => _esp = (_esp & 0xFFFF0000) | value; }
+    public ushort BP { get => (ushort)(_ebp & 0xFFFF); set => _ebp = (_ebp & 0xFFFF0000) | value; }
 
     // 8-bit low byte accessors
-    public byte AL { get => (byte)(_ax & 0xFF); set => _ax = (ushort)((_ax & 0xFF00) | value); }
-    public byte BL { get => (byte)(_bx & 0xFF); set => _bx = (ushort)((_bx & 0xFF00) | value); }
-    public byte CL { get => (byte)(_cx & 0xFF); set => _cx = (ushort)((_cx & 0xFF00) | value); }
-    public byte DL { get => (byte)(_dx & 0xFF); set => _dx = (ushort)((_dx & 0xFF00) | value); }
+    public byte AL { get => (byte)(_eax & 0xFF); set => _eax = (_eax & 0xFFFFFF00) | value; }
+    public byte BL { get => (byte)(_ebx & 0xFF); set => _ebx = (_ebx & 0xFFFFFF00) | value; }
+    public byte CL { get => (byte)(_ecx & 0xFF); set => _ecx = (_ecx & 0xFFFFFF00) | value; }
+    public byte DL { get => (byte)(_edx & 0xFF); set => _edx = (_edx & 0xFFFFFF00) | value; }
 
     // 8-bit high byte accessors
-    public byte AH { get => (byte)((_ax >> 8) & 0xFF); set => _ax = (ushort)((_ax & 0x00FF) | (value << 8)); }
-    public byte BH { get => (byte)((_bx >> 8) & 0xFF); set => _bx = (ushort)((_bx & 0x00FF) | (value << 8)); }
-    public byte CH { get => (byte)((_cx >> 8) & 0xFF); set => _cx = (ushort)((_cx & 0x00FF) | (value << 8)); }
-    public byte DH { get => (byte)((_dx >> 8) & 0xFF); set => _dx = (ushort)((_dx & 0x00FF) | (value << 8)); }
+    public byte AH { get => (byte)((_eax >> 8) & 0xFF); set => _eax = (_eax & 0xFFFF00FF) | ((uint)value << 8); }
+    public byte BH { get => (byte)((_ebx >> 8) & 0xFF); set => _ebx = (_ebx & 0xFFFF00FF) | ((uint)value << 8); }
+    public byte CH { get => (byte)((_ecx >> 8) & 0xFF); set => _ecx = (_ecx & 0xFFFF00FF) | ((uint)value << 8); }
+    public byte DH { get => (byte)((_edx >> 8) & 0xFF); set => _edx = (_edx & 0xFFFF00FF) | ((uint)value << 8); }
 
     // Flags register
     public CpuFlags Flags { get; set; }
@@ -75,6 +86,30 @@ public sealed class Registers
         }
     }
 
+    /// <summary>Get/set a 32-bit register by its 3-bit encoding (386+).</summary>
+    public uint GetReg32(int index) => index switch
+    {
+        0 => EAX, 1 => ECX, 2 => EDX, 3 => EBX,
+        4 => ESP, 5 => EBP, 6 => ESI, 7 => EDI,
+        _ => throw new ArgumentOutOfRangeException(nameof(index))
+    };
+
+    public void SetReg32(int index, uint value)
+    {
+        switch (index)
+        {
+            case 0: EAX = value; break;
+            case 1: ECX = value; break;
+            case 2: EDX = value; break;
+            case 3: EBX = value; break;
+            case 4: ESP = value; break;
+            case 5: EBP = value; break;
+            case 6: ESI = value; break;
+            case 7: EDI = value; break;
+            default: throw new ArgumentOutOfRangeException(nameof(index));
+        }
+    }
+
     /// <summary>Get/set an 8-bit register by its 3-bit encoding.</summary>
     public byte GetReg8(int index) => index switch
     {
@@ -99,10 +134,11 @@ public sealed class Registers
         }
     }
 
-    /// <summary>Get a segment register by 2-bit encoding.</summary>
+    /// <summary>Get a segment register by 2-bit encoding (0-3) or extended (4-5 for FS/GS).</summary>
     public ushort GetSegReg(int index) => index switch
     {
         0 => ES, 1 => CS, 2 => SS, 3 => DS,
+        4 => FS, 5 => GS,
         _ => throw new ArgumentOutOfRangeException(nameof(index))
     };
 
@@ -114,15 +150,18 @@ public sealed class Registers
             case 1: CS = value; break;
             case 2: SS = value; break;
             case 3: DS = value; break;
+            case 4: FS = value; break;
+            case 5: GS = value; break;
             default: throw new ArgumentOutOfRangeException(nameof(index));
         }
     }
 
     public void Reset()
     {
-        _ax = _bx = _cx = _dx = 0;
-        SI = DI = SP = BP = IP = 0;
-        CS = DS = ES = SS = 0;
+        _eax = _ebx = _ecx = _edx = 0;
+        _esi = _edi = _esp = _ebp = 0;
+        IP = 0;
+        CS = DS = ES = SS = FS = GS = 0;
         Flags = CpuFlags.None;
     }
 }

@@ -78,13 +78,15 @@ public sealed class WinFormsRenderer : IGraphicsRenderer, IDisposable
 
     private void ResizeBuffer(int w, int h)
     {
+        var old = _buffer;
         _gfx.Dispose();
-        _buffer.Dispose();
         _buffer = new Bitmap(w, h);
         _gfx = Graphics.FromImage(_buffer);
         _gfx.TextRenderingHint = TextRenderingHint.SingleBitPerPixel;
         _gfx.InterpolationMode = InterpolationMode.NearestNeighbor;
         _gfx.Clear(Color.Black);
+        _pictureBox.Image = _buffer;
+        old.Dispose();
         _charWidth = w / _textCols;
         _charHeight = h / _textRows;
     }

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using MsDos.Core.Platform;
 
 namespace MsDos.Blazor.Platform;
@@ -9,8 +10,14 @@ namespace MsDos.Blazor.Platform;
 /// </summary>
 public sealed class BlazorEventRegistry : IEventRegistry
 {
-    private readonly ConcurrentQueue<DosKeyEventArgs> _keyBuffer = new();
-    private readonly SemaphoreSlim _keySemaphore = new(0);
+    private readonly Channel<DosKeyEventArgs> _keyChannel = Channel.CreateUnbounded<DosKeyEventArgs>(
+        new UnboundedChannelOptions
+        {
+            SingleReader = false,
+            SingleWriter = false,
+            AllowSynchronousContinuations = false,
+        });
+    private int _pendingKeyCount;
 
     public event Action<DosKeyEventArgs>? KeyDown;
     public event Action<DosKeyEventArgs>? KeyUp;
@@ -18,13 +25,13 @@ public sealed class BlazorEventRegistry : IEventRegistry
     public event Action<DosMouseEventArgs>? MouseDown;
     public event Action<DosMouseEventArgs>? MouseUp;
 
-    public bool IsKeyAvailable => !_keyBuffer.IsEmpty;
+    public bool IsKeyAvailable => Volatile.Read(ref _pendingKeyCount) > 0;
 
     public async Task<DosKeyEventArgs> ReadKeyAsync(CancellationToken cancellationToken = default)
     {
-        await _keySemaphore.WaitAsync(cancellationToken);
-        _keyBuffer.TryDequeue(out var key);
-        return key ?? new DosKeyEventArgs();
+        var key = await _keyChannel.Reader.ReadAsync(cancellationToken);
+        Interlocked.Decrement(ref _pendingKeyCount);
+        return key;
     }
 
     /// <summary>Called from Blazor component when a key is pressed.</summary>
@@ -38,8 +45,8 @@ public sealed class BlazorEventRegistry : IEventRegistry
             Ctrl = ctrl,
             Alt = alt,
         };
-        _keyBuffer.Enqueue(dosKey);
-        _keySemaphore.Release();
+        _keyChannel.Writer.TryWrite(dosKey);
+        Interlocked.Increment(ref _pendingKeyCount);
         KeyDown?.Invoke(dosKey);
     }
 

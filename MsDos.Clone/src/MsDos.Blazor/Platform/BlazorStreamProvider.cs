@@ -64,6 +64,42 @@ public sealed class BlazorStreamProvider : IStreamProvider
         return Task.CompletedTask;
     }
 
+    public Task CreateDirectoryAsync(string path)
+    {
+        // In-memory: directories are implicit from file paths, nothing to create
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteDirectoryAsync(string path)
+    {
+        string prefix = Normalize(path);
+        if (!prefix.EndsWith("/")) prefix += "/";
+        var keys = _files.Keys.Where(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)).ToList();
+        foreach (var key in keys)
+            _files.Remove(key);
+        return Task.CompletedTask;
+    }
+
+    public Task RenameAsync(string oldPath, string newPath)
+    {
+        string oldKey = Normalize(oldPath);
+        string newKey = Normalize(newPath);
+        if (_files.TryGetValue(oldKey, out var data))
+        {
+            _files.Remove(oldKey);
+            _files[newKey] = data;
+        }
+        return Task.CompletedTask;
+    }
+
+    public Task<long> GetFileSizeAsync(string path)
+    {
+        string key = Normalize(path);
+        if (_files.TryGetValue(key, out var data))
+            return Task.FromResult((long)data.Length);
+        return Task.FromResult(-1L);
+    }
+
     private static string Normalize(string path) =>
         path.Replace('\\', '/').TrimStart('/').ToUpperInvariant();
 

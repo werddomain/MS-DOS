@@ -9,3 +9,8 @@ obj/
 *.pdb
 .vs/
 *.nupkg
+
+# Keep DOS4 artifacts versioned under assets
+!assets/
+!assets/msdos4/
+!assets/msdos4/**

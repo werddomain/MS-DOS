@@ -58,6 +58,10 @@ public class FloppyDriveTests
         public Task DeleteAsync(string path) { _files.Remove(path); return Task.CompletedTask; }
         public Task<IReadOnlyList<string>> ListEntriesAsync(string dir) => Task.FromResult<IReadOnlyList<string>>(_files.Keys.ToList());
         public Task ImportBinaryAsync(string p, byte[] d) { _files[p] = d; return Task.CompletedTask; }
+        public Task CreateDirectoryAsync(string path) => Task.CompletedTask;
+        public Task DeleteDirectoryAsync(string path) => Task.CompletedTask;
+        public Task RenameAsync(string oldPath, string newPath) { if (_files.Remove(oldPath, out var d)) _files[newPath] = d; return Task.CompletedTask; }
+        public Task<long> GetFileSizeAsync(string path) => Task.FromResult(_files.TryGetValue(path, out var d) ? (long)d.Length : -1L);
     }
 
     private DosMachine CreateMachine()

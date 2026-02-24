@@ -46,15 +46,9 @@ public sealed class InterruptController
 
             if (handlerSeg != 0 || handlerOff != 0)
             {
-                // Jump to IVT handler (flags, CS, IP already on stack from CPU)
-                // Don't pop - let the IRET in the handler do it
-                _cpu.Regs.IP = Pop();
-                _cpu.Regs.CS = Pop();
-                _cpu.Regs.Flags = (CpuFlags)Pop();
-                // Re-push for the IVT handler
-                Push((ushort)_cpu.Regs.Flags);
-                Push(_cpu.Regs.CS);
-                Push(_cpu.Regs.IP);
+                // Stack already has FLAGS/CS/IP from TriggerInterrupt.
+                // Just redirect execution to the IVT handler.
+                // IRET in the handler will pop and restore FLAGS/CS/IP.
                 _cpu.Regs.CS = handlerSeg;
                 _cpu.Regs.IP = handlerOff;
             }

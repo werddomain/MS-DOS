@@ -13,12 +13,14 @@ public partial class MainForm : Form
     private WinFormsEventRegistry? _events;
     private WinFormsStreamProvider? _streams;
     private CancellationTokenSource? _cts;
+    private System.Windows.Forms.Timer? _uiWaitPumpTimer;
 
     // Main UI components
     private PictureBox _screen = null!;
     private MenuStrip _menu = null!;
     private StatusStrip _statusBar = null!;
     private ToolStripStatusLabel _statusLabel = null!;
+    private ToolStripStatusLabel _biosWaitLabel = null!;
 
     // Floppy drive panels
     private Panel _drivePanel = null!;
@@ -52,6 +54,7 @@ public partial class MainForm : Form
     private Button _stepButton = null!;
     private CheckBox _traceCheck = null!;
     private ComboBox _logLevelFilter = null!;
+    private bool _adjustingMainSplit;
 
     public MainForm()
     {
@@ -103,13 +106,11 @@ public partial class MainForm : Form
         {
             Dock = DockStyle.Fill,
             Orientation = Orientation.Vertical,
-            SplitterDistance = 700,
             BackColor = System.Drawing.Color.FromArgb(30, 30, 50),
-            Panel1MinSize = 500,
-            Panel2MinSize = 250,
         };
         Controls.Add(_mainSplit);
         _mainSplit.BringToFront();
+        _mainSplit.SizeChanged += (_, _) => AdjustMainSplitterDistance();
 
         // ── Left side: screen + floppy drive panel ──
         _screen = new PictureBox
@@ -130,8 +131,70 @@ public partial class MainForm : Form
         // ── Status bar ──
         _statusBar = new StatusStrip();
         _statusLabel = new ToolStripStatusLabel("Ready - Load a COM/EXE file or start Shell");
+        _biosWaitLabel = new ToolStripStatusLabel("")
+        {
+            ForeColor = System.Drawing.Color.Gold,
+            Font = new System.Drawing.Font("Segoe UI", 9, FontStyle.Bold)
+        };
         _statusBar.Items.Add(_statusLabel);
+        _statusBar.Items.Add(new ToolStripStatusLabel { Spring = true });
+        _statusBar.Items.Add(_biosWaitLabel);
         Controls.Add(_statusBar);
+
+        // Initial splitter distance is applied in OnLoad once a window handle exists.
+    }
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        AdjustMainSplitterDistance();
+    }
+
+    private void AdjustMainSplitterDistance()
+    {
+        if (_adjustingMainSplit || _mainSplit == null || _mainSplit.IsDisposed)
+            return;
+        int width = _mainSplit.ClientSize.Width;
+        if (width <= 0)
+            return;
+
+        _adjustingMainSplit = true;
+        try
+        {
+            const int desiredLeftMin = 500;
+            const int desiredRightMin = 250;
+
+            // Keep constraints valid for current width.
+            int leftMin = Math.Min(desiredLeftMin, width);
+            int rightMin = Math.Min(desiredRightMin, Math.Max(0, width - leftMin));
+            if (leftMin + rightMin > width)
+                leftMin = Math.Max(0, width - rightMin);
+
+            // Make current splitter safe before tightening panel min sizes.
+            int safeCurrent = Math.Clamp(_mainSplit.SplitterDistance, 0, Math.Max(0, width - rightMin));
+            if (_mainSplit.SplitterDistance != safeCurrent)
+                _mainSplit.SplitterDistance = safeCurrent;
+
+            _mainSplit.Panel1MinSize = leftMin;
+            _mainSplit.Panel2MinSize = rightMin;
+
+            int min = leftMin;
+            int max = Math.Max(min, width - rightMin);
+            int target = Math.Clamp(700, min, max);
+            if (_mainSplit.SplitterDistance != target)
+                _mainSplit.SplitterDistance = target;
+        }
+        catch (InvalidOperationException)
+        {
+            // Fallback during transient layout states.
+            _mainSplit.Panel1MinSize = 0;
+            _mainSplit.Panel2MinSize = 0;
+            _mainSplit.SplitterDistance = Math.Max(0, width / 2);
+        }
+        finally
+        {
+            _adjustingMainSplit = false;
+        }
     }
 
     private static ToolStripMenuItem MakeMenuItem(string text, Keys shortcut, EventHandler handler)
@@ -391,6 +454,18 @@ public partial class MainForm : Form
         _events.Attach(this);
 
         _machine = new DosMachine(_renderer, _events, _streams);
+
+        // UI host clock pump: resumes pending BIOS waits when their timeout elapses.
+        _uiWaitPumpTimer?.Stop();
+        _uiWaitPumpTimer?.Dispose();
+        _uiWaitPumpTimer = new System.Windows.Forms.Timer { Interval = 5 };
+        _uiWaitPumpTimer.Tick += (_, _) =>
+        {
+            _machine?.PumpBiosWaitFromHostClock();
+            bool pending = _machine?.IsBiosWaitPending == true;
+            _biosWaitLabel.Text = pending ? "BIOS WAIT…" : string.Empty;
+        };
+        _uiWaitPumpTimer.Start();
 
         // Wire process exit
         _machine.OnProcessExit += code =>
@@ -836,7 +911,18 @@ public partial class MainForm : Form
     {
         _cts?.Cancel();
         _machine?.Reset();
-        _statusLabel.Text = "Machine reset - Load a COM or EXE file to start";
+
+        // Show which drives are still attached after reset
+        var drives = _machine?.GetMountedDrives();
+        if (drives != null && drives.Count > 1) // More than just default C:
+        {
+            var driveList = string.Join(", ", drives.Select(c => $"{c}:"));
+            _statusLabel.Text = $"Machine reset - Drives still attached: {driveList}";
+        }
+        else
+        {
+            _statusLabel.Text = "Machine reset - Load a COM or EXE file to start";
+        }
     }
 
     private async void OnStartShell(object? sender, EventArgs e)
@@ -857,6 +943,9 @@ public partial class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        _uiWaitPumpTimer?.Stop();
+        _uiWaitPumpTimer?.Dispose();
+        _uiWaitPumpTimer = null;
         _cts?.Cancel();
         _machine?.Stop();
         _renderer?.Dispose();

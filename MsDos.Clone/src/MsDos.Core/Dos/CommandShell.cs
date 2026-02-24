@@ -63,6 +63,9 @@ public sealed class CommandShell
     {
         _currentDrive = char.ToUpperInvariant(driveLetter);
         _currentDir = "\\";
+        // Update COMSPEC to point to the boot drive where COMMAND.COM resides
+        _envVars["COMSPEC"] = $"{_currentDrive}:\\COMMAND.COM";
+        _envVars["PATH"] = $"{_currentDrive}:\\";
     }
 
     /// <summary>
@@ -158,8 +161,25 @@ public sealed class CommandShell
         }
     }
 
+    // Environment variables
+    private readonly Dictionary<string, string> _envVars = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["COMSPEC"] = "C:\\COMMAND.COM",
+        ["PATH"] = "C:\\",
+        ["PROMPT"] = "$P$G",
+    };
+
+    /// <summary>
+    /// Get a copy of the current environment variables for use in PSP environment blocks.
+    /// </summary>
+    public Dictionary<string, string> GetEnvironmentVariables()
+        => new(_envVars, StringComparer.OrdinalIgnoreCase);
+
     private async Task ExecuteCommand(string commandLine, CancellationToken ct)
     {
+        // Expand environment variables (%VAR%)
+        commandLine = ExpandEnvironmentVars(commandLine);
+
         // Split command and arguments
         string command;
         string args;
@@ -246,7 +266,7 @@ public sealed class CommandShell
                 break;
             case "REN":
             case "RENAME":
-                PrintLine("REN command not yet implemented. Syntax: REN <oldname> <newname>");
+                await CmdRen(args);
                 break;
             case "DEL":
             case "ERASE":
@@ -254,11 +274,34 @@ public sealed class CommandShell
                 break;
             case "MKDIR":
             case "MD":
-                PrintLine($"Directory created: {args}");
+                await CmdMkdir(args);
                 break;
             case "RMDIR":
             case "RD":
-                PrintLine($"Directory removed: {args}");
+                await CmdRmdir(args);
+                break;
+            case "IF":
+                await CmdIf(args, ct);
+                break;
+            case "FOR":
+                await CmdFor(args, ct);
+                break;
+            case "CALL":
+                await CmdCall(args, ct);
+                break;
+            case "GOTO":
+                // GOTO only meaningful in batch files — ignore at prompt
+                break;
+            case "PAUSE":
+                PrintLine("Press any key to continue . . .");
+                await _events.ReadKeyAsync(ct);
+                break;
+            case "VOL":
+                PrintLine($" Volume in drive {_currentDrive} has no label");
+                PrintLine($" Volume Serial Number is 1234-5678");
+                break;
+            case "VERIFY":
+                PrintLine("VERIFY is off");
                 break;
             default:
                 // Try to load and execute as binary
@@ -434,10 +477,52 @@ public sealed class CommandShell
     {
         if (string.IsNullOrEmpty(args))
         {
-            PrintLine("COMSPEC=C:\\COMMAND.COM");
-            PrintLine("PATH=C:\\");
-            PrintLine("PROMPT=$P$G");
+            foreach (var kv in _envVars.OrderBy(k => k.Key))
+                PrintLine($"{kv.Key}={kv.Value}");
+            return;
         }
+
+        int eq = args.IndexOf('=');
+        if (eq < 0)
+        {
+            // Display single variable
+            string varName = args.Trim().ToUpperInvariant();
+            if (_envVars.TryGetValue(varName, out var val))
+                PrintLine($"{varName}={val}");
+            else
+                PrintLine($"Environment variable {varName} not defined");
+            return;
+        }
+
+        string name = args[..eq].Trim();
+        string value = args[(eq + 1)..];
+        if (string.IsNullOrEmpty(value))
+            _envVars.Remove(name);
+        else
+            _envVars[name] = value;
+    }
+
+    private string ExpandEnvironmentVars(string input)
+    {
+        int start = 0;
+        while (true)
+        {
+            int pct1 = input.IndexOf('%', start);
+            if (pct1 < 0) break;
+            int pct2 = input.IndexOf('%', pct1 + 1);
+            if (pct2 < 0) break;
+            string varName = input[(pct1 + 1)..pct2];
+            if (_envVars.TryGetValue(varName, out var val))
+            {
+                input = string.Concat(input.AsSpan(0, pct1), val, input.AsSpan(pct2 + 1));
+                start = pct1 + val.Length;
+            }
+            else
+            {
+                start = pct2 + 1;
+            }
+        }
+        return input;
     }
 
     private async Task<bool> TryLoadBinary(string command, string args)
@@ -504,7 +589,7 @@ public sealed class CommandShell
                     }
                     catch (Exception ex)
                     {
-                        _log.Warn("Shell", $"Binary execution error: {ex.Message}");
+                        _log.Warn("Shell", $"Binary execution error: {ex}");
                     }
 
                     // Restore shell state after binary exits
@@ -706,6 +791,233 @@ public sealed class CommandShell
         {
             PrintLine($"File not found - {args}");
             _log.Debug("Shell", $"DEL error: {ex.Message}");
+        }
+    }
+
+    private async Task CmdRen(string args)
+    {
+        if (string.IsNullOrEmpty(args))
+        {
+            PrintLine("Syntax: REN <oldname> <newname>");
+            return;
+        }
+        var parts = args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+        {
+            PrintLine("Required parameter missing");
+            return;
+        }
+        try
+        {
+            await CurrentStreams.RenameAsync(parts[0], parts[1]);
+            PrintLine($"        1 file(s) renamed");
+        }
+        catch (Exception ex)
+        {
+            PrintLine($"File not found - {parts[0]}");
+            _log.Debug("Shell", $"REN error: {ex.Message}");
+        }
+    }
+
+    private async Task CmdMkdir(string args)
+    {
+        if (string.IsNullOrEmpty(args))
+        {
+            PrintLine("Required parameter missing");
+            return;
+        }
+        try
+        {
+            await CurrentStreams.CreateDirectoryAsync(args);
+            _log.Info("Shell", $"Created directory: {args}");
+        }
+        catch (Exception ex)
+        {
+            PrintLine($"Unable to create directory - {args}");
+            _log.Debug("Shell", $"MKDIR error: {ex.Message}");
+        }
+    }
+
+    private async Task CmdRmdir(string args)
+    {
+        if (string.IsNullOrEmpty(args))
+        {
+            PrintLine("Required parameter missing");
+            return;
+        }
+        try
+        {
+            await CurrentStreams.DeleteDirectoryAsync(args);
+            _log.Info("Shell", $"Removed directory: {args}");
+        }
+        catch (Exception ex)
+        {
+            PrintLine($"Invalid path, not directory, or directory not empty");
+            _log.Debug("Shell", $"RMDIR error: {ex.Message}");
+        }
+    }
+
+    private async Task CmdIf(string args, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(args))
+        {
+            PrintLine("Syntax Error");
+            return;
+        }
+
+        bool negate = false;
+        string remaining = args;
+
+        if (remaining.StartsWith("NOT ", StringComparison.OrdinalIgnoreCase))
+        {
+            negate = true;
+            remaining = remaining[4..].TrimStart();
+        }
+
+        bool condition = false;
+
+        if (remaining.StartsWith("EXIST ", StringComparison.OrdinalIgnoreCase))
+        {
+            // IF EXIST filename command
+            remaining = remaining[6..].TrimStart();
+            int spaceIdx = remaining.IndexOf(' ');
+            if (spaceIdx < 0) return;
+            string filename = remaining[..spaceIdx];
+            remaining = remaining[(spaceIdx + 1)..].TrimStart();
+            try { condition = await CurrentStreams.ExistsAsync(filename); } catch { }
+        }
+        else if (remaining.StartsWith("ERRORLEVEL ", StringComparison.OrdinalIgnoreCase))
+        {
+            // IF ERRORLEVEL n command
+            remaining = remaining[11..].TrimStart();
+            int spaceIdx = remaining.IndexOf(' ');
+            if (spaceIdx < 0) return;
+            if (int.TryParse(remaining[..spaceIdx], out int level))
+            {
+                condition = _machine.ExitCode >= level;
+            }
+            remaining = remaining[(spaceIdx + 1)..].TrimStart();
+        }
+        else
+        {
+            // IF string1==string2 command
+            int eqIdx = remaining.IndexOf("==", StringComparison.Ordinal);
+            if (eqIdx > 0)
+            {
+                string left = remaining[..eqIdx].Trim().Trim('"');
+                remaining = remaining[(eqIdx + 2)..];
+                int spaceIdx = remaining.IndexOf(' ');
+                string right = (spaceIdx >= 0 ? remaining[..spaceIdx] : remaining).Trim().Trim('"');
+                remaining = spaceIdx >= 0 ? remaining[(spaceIdx + 1)..].TrimStart() : "";
+                condition = string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        if (negate) condition = !condition;
+
+        if (condition && !string.IsNullOrEmpty(remaining))
+        {
+            await ExecuteCommand(remaining, ct);
+        }
+    }
+
+    private async Task CmdFor(string args, CancellationToken ct)
+    {
+        // FOR %v IN (set) DO command
+        // Simplified: FOR %x IN (*.COM *.EXE) DO ECHO %x
+        if (string.IsNullOrEmpty(args)) { PrintLine("Syntax Error"); return; }
+
+        // Parse: %variable IN (set) DO command
+        string remaining = args;
+        if (!remaining.StartsWith("%", StringComparison.Ordinal) &&
+            !remaining.StartsWith("%%", StringComparison.Ordinal))
+        { PrintLine("Syntax Error"); return; }
+
+        int inIdx = remaining.IndexOf(" IN ", StringComparison.OrdinalIgnoreCase);
+        if (inIdx < 0) { PrintLine("Syntax Error"); return; }
+        string varName = remaining[..inIdx].Trim();
+        remaining = remaining[(inIdx + 4)..].TrimStart();
+
+        int openParen = remaining.IndexOf('(');
+        int closeParen = remaining.IndexOf(')');
+        if (openParen < 0 || closeParen < 0 || closeParen <= openParen)
+        { PrintLine("Syntax Error"); return; }
+
+        string setStr = remaining[(openParen + 1)..closeParen].Trim();
+        remaining = remaining[(closeParen + 1)..].TrimStart();
+
+        if (!remaining.StartsWith("DO ", StringComparison.OrdinalIgnoreCase))
+        { PrintLine("Syntax Error"); return; }
+        string cmdTemplate = remaining[3..].TrimStart();
+
+        var items = setStr.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        foreach (string item in items)
+        {
+            // If item contains wildcard, expand it
+            if (item.Contains('*') || item.Contains('?'))
+            {
+                try
+                {
+                    var entries = await CurrentStreams.ListEntriesAsync(_currentDir);
+                    foreach (var entry in entries)
+                    {
+                        string name = Path.GetFileName(entry);
+                        if (DosKernel.MatchWildcard(item, name))
+                        {
+                            string cmd = cmdTemplate.Replace(varName, name, StringComparison.OrdinalIgnoreCase);
+                            await ExecuteCommand(cmd, ct);
+                        }
+                    }
+                }
+                catch { }
+            }
+            else
+            {
+                string cmd = cmdTemplate.Replace(varName, item, StringComparison.OrdinalIgnoreCase);
+                await ExecuteCommand(cmd, ct);
+            }
+        }
+    }
+
+    private async Task CmdCall(string args, CancellationToken ct)
+    {
+        // CALL executes another batch file inline
+        if (string.IsNullOrEmpty(args))
+        {
+            PrintLine("Required parameter missing");
+            return;
+        }
+
+        string batchFile = args.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
+        if (!batchFile.EndsWith(".BAT", StringComparison.OrdinalIgnoreCase))
+            batchFile += ".BAT";
+
+        try
+        {
+            if (await CurrentStreams.ExistsAsync(batchFile))
+            {
+                using var stream = await CurrentStreams.OpenReadAsync(batchFile);
+                using var reader = new StreamReader(stream);
+                var content = await reader.ReadToEndAsync();
+                // Execute batch file — reuse existing batch execution logic
+                foreach (string rawLine in content.Split('\n', '\r'))
+                {
+                    if (ct.IsCancellationRequested) break;
+                    string line = rawLine.Trim();
+                    if (string.IsNullOrEmpty(line) || line.StartsWith("REM", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (line.StartsWith("@")) line = line[1..];
+                    if (line.StartsWith(":")) continue;
+                    await ExecuteCommand(line, ct);
+                }
+            }
+            else
+            {
+                PrintLine($"Batch file not found - {batchFile}");
+            }
+        }
+        catch (Exception ex)
+        {
+            PrintLine($"Error: {ex.Message}");
         }
     }
 

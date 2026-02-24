@@ -15,6 +15,12 @@ public sealed class BinaryLoader
     /// <summary>Default load segment for COM files.</summary>
     private const ushort DefaultLoadSegment = 0x1000;
 
+    /// <summary>
+    /// Environment variables to write into the PSP environment block.
+    /// If null or empty, defaults (COMSPEC, PATH) are derived from the program path.
+    /// </summary>
+    public Dictionary<string, string>? EnvironmentVariables { get; set; }
+
     public BinaryLoader(MemoryBus mem, Cpu8086 cpu)
     {
         _mem = mem;
@@ -174,17 +180,33 @@ public sealed class BinaryLoader
         // 3. Full program pathname (null-terminated)
         ushort envOffset = 0;
 
-        // Write COMSPEC=C:\COMMAND.COM environment variable (required by most DOS programs)
-        byte[] comspecVar = System.Text.Encoding.ASCII.GetBytes("COMSPEC=C:\\COMMAND.COM");
-        _mem.LoadData(envSegment, envOffset, comspecVar);
-        envOffset += (ushort)comspecVar.Length;
-        _mem.WriteByte(envSegment, envOffset++, 0); // null terminator
+        // Determine the drive letter for default COMSPEC/PATH from the program path
+        string defaultDrive = "C";
+        if (_programPath != null && _programPath.Length >= 2 && _programPath[1] == ':')
+            defaultDrive = _programPath[..1].ToUpperInvariant();
 
-        // Write PATH=C:\ environment variable
-        byte[] pathVar = System.Text.Encoding.ASCII.GetBytes("PATH=C:\\");
-        _mem.LoadData(envSegment, envOffset, pathVar);
-        envOffset += (ushort)pathVar.Length;
-        _mem.WriteByte(envSegment, envOffset++, 0); // null terminator for this string
+        // Build environment variables - use caller-provided ones or derive defaults
+        var envVars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (EnvironmentVariables != null && EnvironmentVariables.Count > 0)
+        {
+            foreach (var kv in EnvironmentVariables)
+                envVars[kv.Key] = kv.Value;
+        }
+        // Ensure COMSPEC and PATH are always present
+        if (!envVars.ContainsKey("COMSPEC"))
+            envVars["COMSPEC"] = $"{defaultDrive}:\\COMMAND.COM";
+        if (!envVars.ContainsKey("PATH"))
+            envVars["PATH"] = $"{defaultDrive}:\\";
+
+        // Write all environment variables
+        foreach (var kv in envVars)
+        {
+            string envString = $"{kv.Key}={kv.Value}";
+            byte[] envBytes = System.Text.Encoding.ASCII.GetBytes(envString);
+            _mem.LoadData(envSegment, envOffset, envBytes);
+            envOffset += (ushort)envBytes.Length;
+            _mem.WriteByte(envSegment, envOffset++, 0); // null terminator
+        }
 
         // Double-null: end of environment strings
         _mem.WriteByte(envSegment, envOffset++, 0);

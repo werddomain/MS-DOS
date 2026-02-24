@@ -35,6 +35,24 @@ public sealed class MemoryBus
         _data[(address + 1) & 0xFFFFF] = (byte)((value >> 8) & 0xFF);
     }
 
+    public uint ReadDword(uint address)
+    {
+        address &= 0xFFFFF;
+        return (uint)(_data[address]
+            | (_data[(address + 1) & 0xFFFFF] << 8)
+            | (_data[(address + 2) & 0xFFFFF] << 16)
+            | (_data[(address + 3) & 0xFFFFF] << 24));
+    }
+
+    public void WriteDword(uint address, uint value)
+    {
+        address &= 0xFFFFF;
+        _data[address] = (byte)(value & 0xFF);
+        _data[(address + 1) & 0xFFFFF] = (byte)((value >> 8) & 0xFF);
+        _data[(address + 2) & 0xFFFFF] = (byte)((value >> 16) & 0xFF);
+        _data[(address + 3) & 0xFFFFF] = (byte)((value >> 24) & 0xFF);
+    }
+
     // --- Segment:offset convenience ---
 
     public byte ReadByte(ushort segment, ushort offset) =>
@@ -48,6 +66,12 @@ public sealed class MemoryBus
 
     public void WriteWord(ushort segment, ushort offset, ushort value) =>
         WriteWord(Cpu.Registers.PhysicalAddress(segment, offset), value);
+
+    public uint ReadDword(ushort segment, ushort offset) =>
+        ReadDword(Cpu.Registers.PhysicalAddress(segment, offset));
+
+    public void WriteDword(ushort segment, ushort offset, uint value) =>
+        WriteDword(Cpu.Registers.PhysicalAddress(segment, offset), value);
 
     /// <summary>Load a block of data at a physical address.</summary>
     public void LoadData(uint address, ReadOnlySpan<byte> data)
