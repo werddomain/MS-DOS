@@ -243,4 +243,112 @@ public class Cpu8086Tests
         _cpu.Step();
         Assert.Equal(0x21, triggeredVector);
     }
+
+    [Fact]
+    public void SAHF_StoresAHIntoFlags()
+    {
+        var mem = new MsDos.Core.Memory.MemoryBus();
+        var cpu = new MsDos.Core.Cpu.Cpu8086(mem);
+        cpu.Regs.CS = 0x1000;
+        cpu.Regs.IP = 0x0100;
+        cpu.Regs.AH = 0xD5; // SF=1, ZF=1, AF=1, PF=1, CF=1
+
+        mem.WriteByte(0x1000, 0x0100, 0x9E); // SAHF
+        cpu.Step();
+
+        // Check that the low byte of flags reflects AH
+        Assert.True((cpu.Regs.Flags & MsDos.Core.Cpu.CpuFlags.Carry) != 0);
+        Assert.True((cpu.Regs.Flags & MsDos.Core.Cpu.CpuFlags.Parity) != 0);
+    }
+
+    [Fact]
+    public void LAHF_LoadsFlagsIntoAH()
+    {
+        var mem = new MsDos.Core.Memory.MemoryBus();
+        var cpu = new MsDos.Core.Cpu.Cpu8086(mem);
+        cpu.Regs.CS = 0x1000;
+        cpu.Regs.IP = 0x0100;
+        cpu.Regs.Flags = MsDos.Core.Cpu.CpuFlags.Carry | MsDos.Core.Cpu.CpuFlags.Zero;
+
+        mem.WriteByte(0x1000, 0x0100, 0x9F); // LAHF
+        cpu.Step();
+
+        // AH should contain flags low byte
+        byte ah = cpu.Regs.AH;
+        Assert.True((ah & 0x01) != 0); // CF
+        Assert.True((ah & 0x40) != 0); // ZF
+    }
+
+    [Fact]
+    public void XLAT_TranslatesAL()
+    {
+        var mem = new MsDos.Core.Memory.MemoryBus();
+        var cpu = new MsDos.Core.Cpu.Cpu8086(mem);
+        cpu.Regs.CS = 0x1000;
+        cpu.Regs.IP = 0x0100;
+        cpu.Regs.DS = 0x2000;
+        cpu.Regs.BX = 0x0050;
+        cpu.Regs.AL = 5;
+
+        // Put translation table value at DS:BX+AL = 2000:0055
+        mem.WriteByte(0x2000, 0x0055, 0x42); // 'B'
+        mem.WriteByte(0x1000, 0x0100, 0xD7); // XLAT
+        cpu.Step();
+
+        Assert.Equal(0x42, cpu.Regs.AL);
+    }
+
+    [Fact]
+    public void AAM_DividesALBy10()
+    {
+        var mem = new MsDos.Core.Memory.MemoryBus();
+        var cpu = new MsDos.Core.Cpu.Cpu8086(mem);
+        cpu.Regs.CS = 0x1000;
+        cpu.Regs.IP = 0x0100;
+        cpu.Regs.AL = 35; // 35 / 10 = 3 remainder 5
+
+        mem.WriteByte(0x1000, 0x0100, 0xD4); // AAM
+        mem.WriteByte(0x1000, 0x0101, 0x0A); // base 10
+        cpu.Step();
+
+        Assert.Equal(3, cpu.Regs.AH);
+        Assert.Equal(5, cpu.Regs.AL);
+    }
+
+    [Fact]
+    public void AAD_CombinesAHAL()
+    {
+        var mem = new MsDos.Core.Memory.MemoryBus();
+        var cpu = new MsDos.Core.Cpu.Cpu8086(mem);
+        cpu.Regs.CS = 0x1000;
+        cpu.Regs.IP = 0x0100;
+        cpu.Regs.AH = 3;
+        cpu.Regs.AL = 5; // 3 * 10 + 5 = 35
+
+        mem.WriteByte(0x1000, 0x0100, 0xD5); // AAD
+        mem.WriteByte(0x1000, 0x0101, 0x0A); // base 10
+        cpu.Step();
+
+        Assert.Equal(35, cpu.Regs.AL);
+        Assert.Equal(0, cpu.Regs.AH);
+    }
+
+    [Fact]
+    public void DAA_AdjustsAfterBCDAdd()
+    {
+        var mem = new MsDos.Core.Memory.MemoryBus();
+        var cpu = new MsDos.Core.Cpu.Cpu8086(mem);
+        cpu.Regs.CS = 0x1000;
+        cpu.Regs.IP = 0x0100;
+        // Set AL to result of 0x19 + 0x19 = 0x32 (invalid BCD)
+        cpu.Regs.AL = 0x19 + 0x19; // = 0x32
+        cpu.Regs.Flags |= MsDos.Core.Cpu.CpuFlags.AuxCarry; // Half-carry set from add
+
+        mem.WriteByte(0x1000, 0x0100, 0x27); // DAA
+        cpu.Step();
+
+        // After DAA, should be adjusted: 0x32 + 6 = 0x38
+        // (low nibble > 9 or AF set, so add 6)
+        Assert.Equal(0x38, cpu.Regs.AL);
+    }
 }
