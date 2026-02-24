@@ -68,8 +68,7 @@ public sealed class BiosVideoService
                 break;
 
             case 0x07: // Scroll down
-                // Simplified: treat as scroll up
-                ScrollUp(_cpu.Regs.AL);
+                ScrollDown(_cpu.Regs.AL);
                 break;
 
             case 0x08: // Read character and attribute at cursor
@@ -82,6 +81,18 @@ public sealed class BiosVideoService
 
             case 0x0A: // Write character at cursor (use existing attribute)
                 WriteCharAtCursor(_cpu.Regs.AL, 0x07, _cpu.Regs.CX, true);
+                break;
+
+            case 0x0B: // Set color palette
+                // Simplified: accept but don't change palette
+                break;
+
+            case 0x0C: // Write pixel
+                WritePixel(_cpu.Regs.CX, _cpu.Regs.DX, _cpu.Regs.AL);
+                break;
+
+            case 0x0D: // Read pixel
+                _cpu.Regs.AL = ReadPixel(_cpu.Regs.CX, _cpu.Regs.DX);
                 break;
 
             case 0x0E: // TTY output
@@ -98,6 +109,11 @@ public sealed class BiosVideoService
                 break;
 
             case 0x11: // Character generator (simplified)
+                if (_cpu.Regs.AL == 0x30) // Get font info
+                {
+                    _cpu.Regs.CX = 16; // Bytes per character (8x16 font)
+                    _cpu.Regs.DL = (byte)(_textRows - 1);
+                }
                 break;
 
             case 0x12: // Video subsystem configuration
@@ -249,5 +265,38 @@ public sealed class BiosVideoService
                 TtyOutput((char)ch);
             }
         }
+    }
+
+    private void ScrollDown(byte lines)
+    {
+        if (lines == 0)
+        {
+            _renderer.Clear((byte)(_cpu.Regs.BH & 0x0F));
+            return;
+        }
+        _renderer.ScrollDown(lines, (byte)((_cpu.Regs.BH >> 4) & 0x0F));
+    }
+
+    /// <summary>Write a pixel at (x, y) in graphics mode.</summary>
+    private void WritePixel(ushort x, ushort y, byte color)
+    {
+        // Store in video memory (for mode 13h: linear A000:0000)
+        if (_currentMode == 0x13)
+        {
+            uint addr = Registers.PhysicalAddress(0xA000, (ushort)(y * 320 + x));
+            _mem.WriteByte(addr, color);
+        }
+        _renderer.DrawPixel(x, y, color);
+    }
+
+    /// <summary>Read a pixel at (x, y) in graphics mode.</summary>
+    private byte ReadPixel(ushort x, ushort y)
+    {
+        if (_currentMode == 0x13)
+        {
+            uint addr = Registers.PhysicalAddress(0xA000, (ushort)(y * 320 + x));
+            return _mem.ReadByte(addr);
+        }
+        return 0;
     }
 }

@@ -331,6 +331,104 @@ public sealed class DosKernel
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;
                 break;
 
+            case 0x0D: // Disk reset (flush buffers)
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x26: // Create new PSP (copy)
+            {
+                ushort newSeg = _cpu.Regs.DX;
+                // Copy first 256 bytes of current PSP to new segment
+                for (int i = 0; i < 256; i++)
+                    _mem.WriteByte(newSeg, (ushort)i, _mem.ReadByte(CurrentPSP, (ushort)i));
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+            }
+
+            case 0x29: // Parse filename into FCB
+                HandleParseFilename();
+                break;
+
+            case 0x2B: // Set date
+                // Accept but ignore
+                _cpu.Regs.AL = 0; // success
+                break;
+
+            case 0x2D: // Set time
+                // Accept but ignore
+                _cpu.Regs.AL = 0; // success
+                break;
+
+            case 0x34: // Get InDOS flag address
+                // Return a fixed address in low memory where InDOS flag resides
+                _cpu.Regs.ES = 0x0070;
+                _cpu.Regs.BX = 0x0000;
+                _mem.WriteByte(0x0070, 0x0000, 0); // InDOS flag = 0 (not in DOS)
+                break;
+
+            case 0x37: // Get/set switch character
+                if (_cpu.Regs.AL == 0) // Get
+                {
+                    _cpu.Regs.DL = (byte)'/'; // Standard DOS switch char
+                    _cpu.Regs.AL = 0;
+                }
+                else if (_cpu.Regs.AL == 1) // Set
+                    _cpu.Regs.AL = 0; // Accept but ignore
+                break;
+
+            case 0x45: // Duplicate file handle (DUP)
+                HandleDupHandle();
+                break;
+
+            case 0x46: // Force duplicate file handle (DUP2)
+                HandleForceDupHandle();
+                break;
+
+            case 0x5A: // Create temporary file
+                HandleCreateTempFile();
+                break;
+
+            case 0x5B: // Create new file (fail if exists)
+                HandleCreateNewFile();
+                break;
+
+            case 0x60: // Canonicalize filename
+                HandleCanonicalizePath();
+                break;
+
+            case 0x67: // Set handle count
+                // Accept - we don't have a real limit
+                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+
+            case 0x68: // Commit file (flush)
+            {
+                ushort handle = _cpu.Regs.BX;
+                if (_fileHandles.TryGetValue(handle, out var fh))
+                {
+                    fh.Stream.Flush();
+                    _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                }
+                else
+                {
+                    _cpu.Regs.AX = 0x06;
+                    _cpu.Regs.Flags |= CpuFlags.Carry;
+                }
+                break;
+            }
+
+            case 0x1B: // Get allocation info (default drive)
+            case 0x1C: // Get allocation info (specific drive)
+                _cpu.Regs.AL = 64;  // sectors per cluster
+                _cpu.Regs.CX = 512; // bytes per sector
+                _cpu.Regs.DX = 2048; // total clusters
+                // DS:BX → pointer to media descriptor byte
+                break;
+
+            case 0x6C: // Extended open/create (DOS 4.0+)
+                HandleExtendedOpen();
+                break;
+
             default:
                 _log.Warn("DOS", $"Unhandled INT 21h AH={func:X2}h");
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;
@@ -881,5 +979,241 @@ public sealed class DosKernel
         public string Path { get; }
         public Stream Stream { get; }
         public DosFileHandle(string path, Stream stream) { Path = path; Stream = stream; }
+    }
+
+    private void HandleParseFilename()
+    {
+        ushort siSeg = _cpu.Regs.DS;
+        ushort siOff = _cpu.Regs.SI;
+        ushort diSeg = _cpu.Regs.ES;
+        ushort diOff = _cpu.Regs.DI;
+
+        // Read the input string
+        string input = ReadDosString(siSeg, siOff);
+
+        // Parse drive, filename, extension
+        byte drive = 0;
+        int pos = 0;
+
+        // Skip leading separators based on AL flags
+        while (pos < input.Length && (input[pos] == ' ' || input[pos] == '\t'))
+            pos++;
+
+        // Check for drive letter
+        if (pos + 1 < input.Length && input[pos + 1] == ':')
+        {
+            drive = (byte)(char.ToUpperInvariant(input[pos]) - 'A' + 1);
+            pos += 2;
+        }
+
+        // Write drive byte to FCB
+        _mem.WriteByte(diSeg, diOff, drive);
+
+        // Parse filename (8 chars, space-padded)
+        for (int i = 0; i < 8; i++)
+        {
+            if (pos < input.Length && input[pos] != '.' && input[pos] != ' ' && input[pos] != 0)
+            {
+                _mem.WriteByte(diSeg, (ushort)(diOff + 1 + i), (byte)char.ToUpperInvariant(input[pos]));
+                pos++;
+            }
+            else
+                _mem.WriteByte(diSeg, (ushort)(diOff + 1 + i), (byte)' ');
+        }
+
+        // Skip dot
+        if (pos < input.Length && input[pos] == '.') pos++;
+
+        // Parse extension (3 chars, space-padded)
+        for (int i = 0; i < 3; i++)
+        {
+            if (pos < input.Length && input[pos] != ' ' && input[pos] != 0)
+            {
+                _mem.WriteByte(diSeg, (ushort)(diOff + 9 + i), (byte)char.ToUpperInvariant(input[pos]));
+                pos++;
+            }
+            else
+                _mem.WriteByte(diSeg, (ushort)(diOff + 9 + i), (byte)' ');
+        }
+
+        // AL = 0 if no wildcards, 1 if wildcards present
+        _cpu.Regs.AL = (byte)(input.Contains('*') || input.Contains('?') ? 1 : 0);
+        // DS:SI points past the parsed name
+        _cpu.Regs.SI = (ushort)(siOff + pos);
+    }
+
+    private void HandleDupHandle()
+    {
+        ushort handle = _cpu.Regs.BX;
+        if (handle <= 4 || _fileHandles.ContainsKey(handle))
+        {
+            ushort newHandle = _nextHandle++;
+            if (_fileHandles.TryGetValue(handle, out var fh))
+                _fileHandles[newHandle] = new DosFileHandle(fh.Path, fh.Stream);
+            _cpu.Regs.AX = newHandle;
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        else
+        {
+            _cpu.Regs.AX = 0x06; // Invalid handle
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
+    }
+
+    private void HandleForceDupHandle()
+    {
+        ushort srcHandle = _cpu.Regs.BX;
+        ushort dstHandle = _cpu.Regs.CX;
+
+        // Close destination if it's an open file
+        if (_fileHandles.TryGetValue(dstHandle, out var existing))
+        {
+            existing.Stream.Dispose();
+            _fileHandles.Remove(dstHandle);
+        }
+
+        if (_fileHandles.TryGetValue(srcHandle, out var fh))
+            _fileHandles[dstHandle] = new DosFileHandle(fh.Path, fh.Stream);
+
+        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+    }
+
+    private void HandleCreateTempFile()
+    {
+        string dir = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
+        string tempName = $"~DOS{_nextHandle:X4}.TMP";
+        string path = string.IsNullOrEmpty(dir) ? tempName : $"{dir}\\{tempName}";
+
+        try
+        {
+            var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+            ushort handle = _nextHandle++;
+            _fileHandles[handle] = new DosFileHandle(path, stream);
+            _cpu.Regs.AX = handle;
+
+            // Write the temp filename back to DS:DX
+            byte[] nameBytes = System.Text.Encoding.ASCII.GetBytes(path);
+            ushort off = _cpu.Regs.DX;
+            for (int i = 0; i < nameBytes.Length; i++)
+                _mem.WriteByte(_cpu.Regs.DS, (ushort)(off + i), nameBytes[i]);
+            _mem.WriteByte(_cpu.Regs.DS, (ushort)(off + nameBytes.Length), 0);
+
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        catch
+        {
+            _cpu.Regs.AX = 0x05;
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
+    }
+
+    private void HandleCreateNewFile()
+    {
+        string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
+        try
+        {
+            bool exists = _streams.ExistsAsync(path).GetAwaiter().GetResult();
+            if (exists)
+            {
+                _cpu.Regs.AX = 0x50; // File already exists
+                _cpu.Regs.Flags |= CpuFlags.Carry;
+                return;
+            }
+            var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+            ushort handle = _nextHandle++;
+            _fileHandles[handle] = new DosFileHandle(path, stream);
+            _cpu.Regs.AX = handle;
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        catch
+        {
+            _cpu.Regs.AX = 0x05;
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
+    }
+
+    private void HandleCanonicalizePath()
+    {
+        string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.SI);
+        // Convert to uppercase, add drive letter if missing
+        string canonical = path.ToUpperInvariant().Replace('/', '\\');
+        if (canonical.Length < 2 || canonical[1] != ':')
+            canonical = $"{(char)('A' + _currentDrive)}:\\{canonical}";
+
+        // Write result to ES:DI
+        byte[] bytes = System.Text.Encoding.ASCII.GetBytes(canonical);
+        for (int i = 0; i < bytes.Length; i++)
+            _mem.WriteByte(_cpu.Regs.ES, (ushort)(_cpu.Regs.DI + i), bytes[i]);
+        _mem.WriteByte(_cpu.Regs.ES, (ushort)(_cpu.Regs.DI + bytes.Length), 0);
+        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+    }
+
+    private void HandleExtendedOpen()
+    {
+        // Extended open/create (DOS 4.0+)
+        // BX = open mode, CX = attributes, DX = action
+        // DS:SI = filename
+        string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.SI);
+        ushort action = _cpu.Regs.DX;
+        byte mode = (byte)(_cpu.Regs.BX & 3);
+
+        try
+        {
+            bool exists = _streams.ExistsAsync(path).GetAwaiter().GetResult();
+
+            if (exists)
+            {
+                if ((action & 0x01) != 0) // Open if exists
+                {
+                    Stream stream = mode switch
+                    {
+                        0 => _streams.OpenReadAsync(path).GetAwaiter().GetResult(),
+                        1 => _streams.OpenWriteAsync(path).GetAwaiter().GetResult(),
+                        _ => _streams.OpenReadWriteAsync(path).GetAwaiter().GetResult()
+                    };
+                    ushort handle = _nextHandle++;
+                    _fileHandles[handle] = new DosFileHandle(path, stream);
+                    _cpu.Regs.AX = handle;
+                    _cpu.Regs.CX = 1; // File existed and was opened
+                }
+                else if ((action & 0x02) != 0) // Replace if exists
+                {
+                    var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+                    ushort handle = _nextHandle++;
+                    _fileHandles[handle] = new DosFileHandle(path, stream);
+                    _cpu.Regs.AX = handle;
+                    _cpu.Regs.CX = 3; // File existed and was replaced
+                }
+                else
+                {
+                    _cpu.Regs.AX = 0x50; // File exists
+                    _cpu.Regs.Flags |= CpuFlags.Carry;
+                    return;
+                }
+            }
+            else
+            {
+                if ((action & 0x10) != 0) // Create if not exists
+                {
+                    var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+                    ushort handle = _nextHandle++;
+                    _fileHandles[handle] = new DosFileHandle(path, stream);
+                    _cpu.Regs.AX = handle;
+                    _cpu.Regs.CX = 2; // File created
+                }
+                else
+                {
+                    _cpu.Regs.AX = 0x02; // File not found
+                    _cpu.Regs.Flags |= CpuFlags.Carry;
+                    return;
+                }
+            }
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        catch
+        {
+            _cpu.Regs.AX = 0x05;
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+        }
     }
 }

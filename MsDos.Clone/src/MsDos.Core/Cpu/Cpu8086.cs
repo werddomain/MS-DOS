@@ -280,7 +280,7 @@ public sealed class Cpu8086
             case 0x06: Push(Regs.ES); return 10;
             case 0x07: Regs.ES = Pop(); return 8;
             case 0x0E: Push(Regs.CS); return 10;
-            case 0x0F: Regs.CS = Pop(); return 8;
+            // 0x0F is the two-byte opcode prefix on 80186+, handled below
             case 0x16: Push(Regs.SS); return 10;
             case 0x17: Regs.SS = Pop(); return 8;
             case 0x1E: Push(Regs.DS); return 10;
@@ -683,6 +683,105 @@ public sealed class Cpu8086
             case 0xFB: SetFlag(CpuFlags.Interrupt, true); return 2;
             case 0xFC: SetFlag(CpuFlags.Direction, false); return 2;
             case 0xFD: SetFlag(CpuFlags.Direction, true); return 2;
+
+            // --- PUSHA (80186+) ---
+            case 0x60:
+            {
+                ushort origSP = Regs.SP;
+                Push(Regs.AX); Push(Regs.CX); Push(Regs.DX); Push(Regs.BX);
+                Push(origSP); Push(Regs.BP); Push(Regs.SI); Push(Regs.DI);
+                return 19;
+            }
+            // --- POPA (80186+) ---
+            case 0x61:
+            {
+                Regs.DI = Pop(); Regs.SI = Pop(); Regs.BP = Pop();
+                Pop(); // skip SP
+                Regs.BX = Pop(); Regs.DX = Pop(); Regs.CX = Pop(); Regs.AX = Pop();
+                return 19;
+            }
+
+            // --- BOUND (80186+) ---
+            case 0x62:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                short val = (short)Regs.GetReg16(reg);
+                var (bseg, boff) = DecodeModRM_Address(modrm);
+                short lower = (short)_mem.ReadWord(bseg, boff);
+                short upper = (short)_mem.ReadWord(bseg, (ushort)(boff + 2));
+                if (val < lower || val > upper)
+                    TriggerInterrupt(5);
+                return 10;
+            }
+
+            // --- PUSH imm16 (80186+) ---
+            case 0x68: Push(FetchWord()); return 3;
+            // --- IMUL r16, r/m16, imm16 (80186+) ---
+            case 0x69:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                int src = (short)ReadModRM16(modrm);
+                int imm = (short)FetchWord();
+                int result = src * imm;
+                Regs.SetReg16(reg, (ushort)result);
+                bool highSet = result != (short)result;
+                SetFlag(CpuFlags.Carry, highSet);
+                SetFlag(CpuFlags.Overflow, highSet);
+                return 21;
+            }
+            // --- PUSH imm8 sign-extended (80186+) ---
+            case 0x6A: Push((ushort)(short)(sbyte)FetchByte()); return 3;
+            // --- IMUL r16, r/m16, imm8 (80186+) ---
+            case 0x6B:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                int src = (short)ReadModRM16(modrm);
+                int imm = (sbyte)FetchByte();
+                int result = src * imm;
+                Regs.SetReg16(reg, (ushort)result);
+                bool highSet = result != (short)result;
+                SetFlag(CpuFlags.Carry, highSet);
+                SetFlag(CpuFlags.Overflow, highSet);
+                return 21;
+            }
+
+            // --- INS/OUTS (80186+) — treated as NOP (no real port I/O) ---
+            case 0x6C: Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); return 14; // INSB
+            case 0x6D: Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); return 14; // INSW
+            case 0x6E: Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); return 14; // OUTSB
+            case 0x6F: Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); return 14; // OUTSW
+
+            // --- ENTER (80186+) ---
+            case 0xC8:
+            {
+                ushort frameSize = FetchWord();
+                byte nestLevel = (byte)(FetchByte() & 0x1F);
+                Push(Regs.BP);
+                ushort framePtr = Regs.SP;
+                if (nestLevel > 0)
+                {
+                    for (int i = 1; i < nestLevel; i++)
+                    {
+                        Regs.BP -= 2;
+                        Push(_mem.ReadWord(Regs.SS, Regs.BP));
+                    }
+                    Push(framePtr);
+                }
+                Regs.BP = framePtr;
+                Regs.SP -= frameSize;
+                return 15;
+            }
+            // --- LEAVE (80186+) ---
+            case 0xC9:
+                Regs.SP = Regs.BP;
+                Regs.BP = Pop();
+                return 5;
+
+            // --- Two-byte opcodes (0x0F prefix) ---
+            case 0x0F: return DecodeAndExecute0F();
 
             // --- Group 4/5 (INC/DEC/CALL/JMP/PUSH) ---
             case 0xFE: return ExecuteGroup4();
@@ -1166,5 +1265,291 @@ public sealed class Cpu8086
         if (count > 0) UpdateFlags16(val);
         WriteModRM16(modrm, val);
         return 2 + count * 4;
+    }
+
+    // --- Two-byte opcodes (0x0F prefix) ---
+
+    private int DecodeAndExecute0F()
+    {
+        byte op2 = FetchByte();
+        byte modrm;
+        int reg;
+
+        switch (op2)
+        {
+            // --- Jcc near rel16 (0x0F 0x80 - 0x0F 0x8F) ---
+            case 0x80: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JO
+            case 0x81: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JNO
+            case 0x82: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JB
+            case 0x83: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JNB
+            case 0x84: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JZ
+            case 0x85: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JNZ
+            case 0x86: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Carry) || GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JBE
+            case 0x87: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Carry) && !GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JA
+            case 0x88: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JS
+            case 0x89: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JNS
+            case 0x8A: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JP
+            case 0x8B: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JNP
+            case 0x8C: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JL
+            case 0x8D: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JGE
+            case 0x8E: { short off = (short)FetchWord(); if (GetFlag(CpuFlags.Zero) || (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JLE
+            case 0x8F: { short off = (short)FetchWord(); if (!GetFlag(CpuFlags.Zero) && (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off); return 7; } // JG
+
+            // --- SETcc (0x0F 0x90-0x9F) ---
+            case >= 0x90 and <= 0x9F:
+            {
+                modrm = FetchByte();
+                bool cond = (op2 & 0x0F) switch
+                {
+                    0x0 => GetFlag(CpuFlags.Overflow),
+                    0x1 => !GetFlag(CpuFlags.Overflow),
+                    0x2 => GetFlag(CpuFlags.Carry),
+                    0x3 => !GetFlag(CpuFlags.Carry),
+                    0x4 => GetFlag(CpuFlags.Zero),
+                    0x5 => !GetFlag(CpuFlags.Zero),
+                    0x6 => GetFlag(CpuFlags.Carry) || GetFlag(CpuFlags.Zero),
+                    0x7 => !GetFlag(CpuFlags.Carry) && !GetFlag(CpuFlags.Zero),
+                    0x8 => GetFlag(CpuFlags.Sign),
+                    0x9 => !GetFlag(CpuFlags.Sign),
+                    0xA => GetFlag(CpuFlags.Parity),
+                    0xB => !GetFlag(CpuFlags.Parity),
+                    0xC => GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow),
+                    0xD => GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow),
+                    0xE => GetFlag(CpuFlags.Zero) || (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow)),
+                    0xF => !GetFlag(CpuFlags.Zero) && (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow)),
+                    _ => false
+                };
+                WriteModRM8(modrm, cond ? (byte)1 : (byte)0);
+                return 4;
+            }
+
+            // --- MOVZX r16, r/m8 (0x0F 0xB6) ---
+            case 0xB6:
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                Regs.SetReg16(reg, ReadModRM8(modrm));
+                return 3;
+
+            // --- MOVZX r16, r/m16 (0x0F 0xB7) — effectively a MOV ---
+            case 0xB7:
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                Regs.SetReg16(reg, ReadModRM16(modrm));
+                return 3;
+
+            // --- MOVSX r16, r/m8 (0x0F 0xBE) ---
+            case 0xBE:
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                Regs.SetReg16(reg, (ushort)(short)(sbyte)ReadModRM8(modrm));
+                return 3;
+
+            // --- MOVSX r16, r/m16 (0x0F 0xBF) — effectively a MOV ---
+            case 0xBF:
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                Regs.SetReg16(reg, ReadModRM16(modrm));
+                return 3;
+
+            // --- IMUL r16, r/m16 (0x0F 0xAF) ---
+            case 0xAF:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                int result = (short)Regs.GetReg16(reg) * (short)ReadModRM16(modrm);
+                Regs.SetReg16(reg, (ushort)result);
+                bool highSet = result != (short)result;
+                SetFlag(CpuFlags.Carry, highSet);
+                SetFlag(CpuFlags.Overflow, highSet);
+                return 21;
+            }
+
+            // --- SHLD r/m16, reg, imm8 (0x0F 0xA4) ---
+            case 0xA4:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort dst = ReadModRM16(modrm);
+                ushort src = Regs.GetReg16(reg);
+                byte cnt = (byte)(FetchByte() & 0x1F);
+                if (cnt > 0)
+                {
+                    uint combined = (uint)(dst << 16) | src;
+                    combined <<= cnt;
+                    ushort result = (ushort)(combined >> 16);
+                    SetFlag(CpuFlags.Carry, ((dst << (cnt - 1)) & 0x8000) != 0);
+                    WriteModRM16(modrm, result);
+                    UpdateFlags16(result);
+                }
+                return 3;
+            }
+            // --- SHLD r/m16, reg, CL (0x0F 0xA5) ---
+            case 0xA5:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort dst = ReadModRM16(modrm);
+                ushort src = Regs.GetReg16(reg);
+                byte cnt = (byte)(Regs.CL & 0x1F);
+                if (cnt > 0)
+                {
+                    uint combined = (uint)(dst << 16) | src;
+                    combined <<= cnt;
+                    ushort result = (ushort)(combined >> 16);
+                    SetFlag(CpuFlags.Carry, ((dst << (cnt - 1)) & 0x8000) != 0);
+                    WriteModRM16(modrm, result);
+                    UpdateFlags16(result);
+                }
+                return 3;
+            }
+
+            // --- SHRD r/m16, reg, imm8 (0x0F 0xAC) ---
+            case 0xAC:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort dst = ReadModRM16(modrm);
+                ushort src = Regs.GetReg16(reg);
+                byte cnt = (byte)(FetchByte() & 0x1F);
+                if (cnt > 0)
+                {
+                    uint combined = (uint)(src << 16) | dst;
+                    combined >>= cnt;
+                    ushort result = (ushort)combined;
+                    SetFlag(CpuFlags.Carry, ((dst >> (cnt - 1)) & 1) != 0);
+                    WriteModRM16(modrm, result);
+                    UpdateFlags16(result);
+                }
+                return 3;
+            }
+            // --- SHRD r/m16, reg, CL (0x0F 0xAD) ---
+            case 0xAD:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort dst = ReadModRM16(modrm);
+                ushort src = Regs.GetReg16(reg);
+                byte cnt = (byte)(Regs.CL & 0x1F);
+                if (cnt > 0)
+                {
+                    uint combined = (uint)(src << 16) | dst;
+                    combined >>= cnt;
+                    ushort result = (ushort)combined;
+                    SetFlag(CpuFlags.Carry, ((dst >> (cnt - 1)) & 1) != 0);
+                    WriteModRM16(modrm, result);
+                    UpdateFlags16(result);
+                }
+                return 3;
+            }
+
+            // --- BT r/m16, reg (0x0F 0xA3) ---
+            case 0xA3:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort val = ReadModRM16(modrm);
+                int bit = Regs.GetReg16(reg) & 0x0F;
+                SetFlag(CpuFlags.Carry, (val & (1 << bit)) != 0);
+                return 3;
+            }
+
+            // --- BTS r/m16, reg (0x0F 0xAB) ---
+            case 0xAB:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort val = ReadModRM16(modrm);
+                int bit = Regs.GetReg16(reg) & 0x0F;
+                SetFlag(CpuFlags.Carry, (val & (1 << bit)) != 0);
+                WriteModRM16(modrm, (ushort)(val | (1 << bit)));
+                return 6;
+            }
+
+            // --- BTR r/m16, reg (0x0F 0xB3) ---
+            case 0xB3:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort val = ReadModRM16(modrm);
+                int bit = Regs.GetReg16(reg) & 0x0F;
+                SetFlag(CpuFlags.Carry, (val & (1 << bit)) != 0);
+                WriteModRM16(modrm, (ushort)(val & ~(1 << bit)));
+                return 6;
+            }
+
+            // --- BTC r/m16, reg (0x0F 0xBB) ---
+            case 0xBB:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort val = ReadModRM16(modrm);
+                int bit = Regs.GetReg16(reg) & 0x0F;
+                SetFlag(CpuFlags.Carry, (val & (1 << bit)) != 0);
+                WriteModRM16(modrm, (ushort)(val ^ (1 << bit)));
+                return 6;
+            }
+
+            // --- BSF r16, r/m16 (0x0F 0xBC) ---
+            case 0xBC:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort val = ReadModRM16(modrm);
+                if (val == 0)
+                {
+                    SetFlag(CpuFlags.Zero, true);
+                }
+                else
+                {
+                    SetFlag(CpuFlags.Zero, false);
+                    int pos = 0;
+                    while ((val & (1 << pos)) == 0) pos++;
+                    Regs.SetReg16(reg, (ushort)pos);
+                }
+                return 10;
+            }
+
+            // --- BSR r16, r/m16 (0x0F 0xBD) ---
+            case 0xBD:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                ushort val = ReadModRM16(modrm);
+                if (val == 0)
+                {
+                    SetFlag(CpuFlags.Zero, true);
+                }
+                else
+                {
+                    SetFlag(CpuFlags.Zero, false);
+                    int pos = 15;
+                    while ((val & (1 << pos)) == 0) pos--;
+                    Regs.SetReg16(reg, (ushort)pos);
+                }
+                return 10;
+            }
+
+            // --- Group BT imm (0x0F 0xBA) ---
+            case 0xBA:
+            {
+                modrm = FetchByte();
+                int op = (modrm >> 3) & 7;
+                ushort val = ReadModRM16(modrm);
+                int bit = FetchByte() & 0x0F;
+                SetFlag(CpuFlags.Carry, (val & (1 << bit)) != 0);
+                switch (op)
+                {
+                    case 4: break; // BT
+                    case 5: WriteModRM16(modrm, (ushort)(val | (1 << bit))); break; // BTS
+                    case 6: WriteModRM16(modrm, (ushort)(val & ~(1 << bit))); break; // BTR
+                    case 7: WriteModRM16(modrm, (ushort)(val ^ (1 << bit))); break; // BTC
+                }
+                return 6;
+            }
+
+            default:
+                _log?.Warn("CPU", $"Unimplemented 0x0F opcode: 0x0F 0x{op2:X2} at {Regs.CS:X4}:{(ushort)(Regs.IP - 2):X4}");
+                return 1;
+        }
     }
 }

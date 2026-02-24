@@ -30,6 +30,7 @@ public class DosMachineTests
         public void SetCursorPosition(int col, int row) { CursorCol = col; CursorRow = row; }
         public void SetCursorVisible(bool visible) => CursorVisible = visible;
         public void ScrollUp(int lines, byte backgroundColorIndex) { }
+        public void ScrollDown(int lines, byte backgroundColorIndex) { }
         public Task FlushAsync() => Task.CompletedTask;
     }
 

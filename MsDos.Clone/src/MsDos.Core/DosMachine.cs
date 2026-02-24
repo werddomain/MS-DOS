@@ -19,6 +19,8 @@ public sealed class DosMachine
     public BiosVideoService Video { get; }
     public BiosKeyboardService Keyboard { get; }
     public BiosMiscService BiosMisc { get; }
+    public BiosDiskService Disk { get; }
+    public BiosMouseService Mouse { get; }
     public DosKernel Dos { get; }
     public BinaryLoader Loader { get; }
     public CommandShell Shell { get; }
@@ -65,6 +67,8 @@ public sealed class DosMachine
         Video = new BiosVideoService(Cpu, Memory, renderer);
         Keyboard = new BiosKeyboardService(Cpu, events);
         BiosMisc = new BiosMiscService(Cpu);
+        Disk = new BiosDiskService(Cpu, Memory, Log);
+        Mouse = new BiosMouseService(Cpu, events);
         Dos = new DosKernel(Cpu, Memory, streams, events, renderer, Video, Log);
         Loader = new BinaryLoader(Memory, Cpu);
         Shell = new CommandShell(Dos, Memory, Cpu, streams, events, Video, renderer, Log, this);
@@ -74,12 +78,16 @@ public sealed class DosMachine
 
         // Register interrupt handlers
         Interrupts.RegisterHandler(0x10, Video.Handle);
+        Interrupts.RegisterHandler(0x13, Disk.Handle);
         Interrupts.RegisterHandler(0x16, Keyboard.Handle);
         Interrupts.RegisterHandler(0x11, BiosMisc.HandleInt11);
         Interrupts.RegisterHandler(0x12, BiosMisc.HandleInt12);
         Interrupts.RegisterHandler(0x1A, BiosMisc.HandleInt1A);
+        Interrupts.RegisterHandler(0x15, HandleInt15);     // System services
+        Interrupts.RegisterHandler(0x19, () => { Reset(); Log.Info("INT19", "Bootstrap requested"); }); // Reboot
         Interrupts.RegisterHandler(0x20, () => Dos.Terminate(0)); // INT 20h = terminate
         Interrupts.RegisterHandler(0x21, Dos.Handle);
+        Interrupts.RegisterHandler(0x33, Mouse.Handle);
 
         // Handle process termination
         Dos.ProcessTerminated += code =>
@@ -95,6 +103,7 @@ public sealed class DosMachine
 
     /// <summary>
     /// Mount a disk image (IMG/RAW) as a drive letter.
+    /// Also registers it with INT 13h disk services for sector-level access.
     /// </summary>
     /// <param name="driveLetter">Drive letter (A-Z).</param>
     /// <param name="imageData">Raw disk image bytes.</param>
@@ -111,6 +120,16 @@ public sealed class DosMachine
 
         var provider = new DiskImageStreamProvider(diskLoader, Log);
         _drives[driveLetter] = provider;
+
+        // Register with INT 13h for sector-level access
+        byte biosDrive = driveLetter switch
+        {
+            'A' => 0x00,
+            'B' => 0x01,
+            _ => (byte)(0x80 + (driveLetter - 'C'))
+        };
+        Disk.RegisterDiskAuto(biosDrive, imageData);
+
         Log.Info("Machine", $"Mounted disk image on {driveLetter}: ({imageData.Length} bytes, {diskLoader.DetectedFatType})");
         return true;
     }
@@ -385,4 +404,40 @@ public sealed class DosMachine
 
     /// <summary>The exit code from the last terminated process.</summary>
     public byte ExitCode => _exitCode;
+
+    /// <summary>INT 15h — System services (simplified).</summary>
+    private void HandleInt15()
+    {
+        switch (Cpu.Regs.AH)
+        {
+            case 0x86: // Wait (microseconds in CX:DX)
+            {
+                uint microseconds = (uint)(Cpu.Regs.CX << 16) | Cpu.Regs.DX;
+                int millis = (int)(microseconds / 1000);
+                if (millis > 0 && millis < 60000)
+                    Thread.Sleep(millis);
+                Cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+            }
+            case 0x87: // Extended memory block move
+                Cpu.Regs.AH = 0x86; // Not supported
+                Cpu.Regs.Flags |= CpuFlags.Carry;
+                break;
+            case 0x88: // Get extended memory size
+                Cpu.Regs.AX = 0; // No extended memory in 8086
+                Cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+            case 0xC0: // Get system configuration
+                Cpu.Regs.AH = 0x86; // Not supported
+                Cpu.Regs.Flags |= CpuFlags.Carry;
+                break;
+            case 0x41: // Wait on external event
+                Cpu.Regs.Flags &= ~CpuFlags.Carry;
+                break;
+            default:
+                Log.Debug("INT15", $"Unhandled AH={Cpu.Regs.AH:X2}h");
+                Cpu.Regs.Flags |= CpuFlags.Carry;
+                break;
+        }
+    }
 }

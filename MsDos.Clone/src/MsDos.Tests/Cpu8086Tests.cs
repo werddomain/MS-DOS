@@ -351,4 +351,177 @@ public class Cpu8086Tests
         // (low nibble > 9 or AF set, so add 6)
         Assert.Equal(0x38, cpu.Regs.AL);
     }
+
+    [Fact]
+    public void PUSHA_POPA_PreservesRegisters()
+    {
+        _cpu.Regs.AX = 0x1111;
+        _cpu.Regs.CX = 0x2222;
+        _cpu.Regs.DX = 0x3333;
+        _cpu.Regs.BX = 0x4444;
+        _cpu.Regs.BP = 0x5555;
+        _cpu.Regs.SI = 0x6666;
+        _cpu.Regs.DI = 0x7777;
+        ushort origSP = _cpu.Regs.SP;
+        LoadCode(0x60, 0x61); // PUSHA, POPA
+        _cpu.Step(); // PUSHA
+        Assert.Equal((ushort)(origSP - 16), _cpu.Regs.SP); // 8 words pushed
+        _cpu.Step(); // POPA
+        Assert.Equal(origSP, _cpu.Regs.SP);
+        Assert.Equal((ushort)0x1111, _cpu.Regs.AX);
+        Assert.Equal((ushort)0x2222, _cpu.Regs.CX);
+        Assert.Equal((ushort)0x3333, _cpu.Regs.DX);
+        Assert.Equal((ushort)0x4444, _cpu.Regs.BX);
+        Assert.Equal((ushort)0x5555, _cpu.Regs.BP);
+        Assert.Equal((ushort)0x6666, _cpu.Regs.SI);
+        Assert.Equal((ushort)0x7777, _cpu.Regs.DI);
+    }
+
+    [Fact]
+    public void PUSH_Imm16_PushesValue()
+    {
+        ushort origSP = _cpu.Regs.SP;
+        LoadCode(0x68, 0xAD, 0xDE); // PUSH 0xDEAD
+        _cpu.Step();
+        Assert.Equal((ushort)(origSP - 2), _cpu.Regs.SP);
+        Assert.Equal((ushort)0xDEAD, _mem.ReadWord(_cpu.Regs.SS, _cpu.Regs.SP));
+    }
+
+    [Fact]
+    public void PUSH_Imm8_SignExtends()
+    {
+        ushort origSP = _cpu.Regs.SP;
+        LoadCode(0x6A, 0xFE); // PUSH -2 (sign-extended to 0xFFFE)
+        _cpu.Step();
+        Assert.Equal((ushort)(origSP - 2), _cpu.Regs.SP);
+        Assert.Equal((ushort)0xFFFE, _mem.ReadWord(_cpu.Regs.SS, _cpu.Regs.SP));
+    }
+
+    [Fact]
+    public void ENTER_LEAVE_StackFrame()
+    {
+        _cpu.Regs.BP = 0x1234;
+        LoadCode(
+            0xC8, 0x10, 0x00, 0x00, // ENTER 16, 0
+            0xC9                      // LEAVE
+        );
+        ushort origSP = _cpu.Regs.SP;
+        _cpu.Step(); // ENTER
+        // BP should be set to the frame pointer
+        ushort frameBP = _cpu.Regs.BP;
+        Assert.Equal((ushort)(origSP - 2), frameBP); // BP = old SP - 2
+        Assert.Equal((ushort)(frameBP - 16), _cpu.Regs.SP); // SP = BP - 16
+
+        _cpu.Step(); // LEAVE
+        Assert.Equal(origSP, _cpu.Regs.SP);
+        Assert.Equal((ushort)0x1234, _cpu.Regs.BP);
+    }
+
+    [Fact]
+    public void IMUL_Imm16_ThreeOperand()
+    {
+        _cpu.Regs.BX = 100;
+        // IMUL AX, BX, 7  → opcode 0x6B, modrm = 0xC3 (reg=AX, rm=BX), imm8 = 7
+        LoadCode(0x6B, 0xC3, 0x07);
+        _cpu.Step();
+        Assert.Equal((ushort)700, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void MOVZX_ZeroExtendsR8ToR16()
+    {
+        _cpu.Regs.BX = 0xFFFF; // Will be overwritten
+        _cpu.Regs.CL = 0x80;   // 128 in unsigned
+        // MOVZX BX, CL → 0x0F B6 modrm=0xD9 (reg=BX(3), rm=CL(1))
+        LoadCode(0x0F, 0xB6, 0xD9);
+        _cpu.Step();
+        Assert.Equal((ushort)0x0080, _cpu.Regs.BX);
+    }
+
+    [Fact]
+    public void MOVSX_SignExtendsR8ToR16()
+    {
+        _cpu.Regs.BX = 0x0000;
+        _cpu.Regs.CL = 0x80; // -128 in signed
+        // MOVSX BX, CL → 0x0F BE modrm=0xD9
+        LoadCode(0x0F, 0xBE, 0xD9);
+        _cpu.Step();
+        Assert.Equal((ushort)0xFF80, _cpu.Regs.BX);
+    }
+
+    [Fact]
+    public void Jcc_Near_JumpsWithRel16()
+    {
+        // Set Zero flag, then JZ near (+5 from end of instruction)
+        _cpu.Regs.Flags |= CpuFlags.Zero;
+        LoadCode(0x0F, 0x84, 0x05, 0x00); // JZ near +5
+        ushort ipAfterInstruction = (ushort)(_cpu.Regs.IP + 4); // 4-byte instruction
+        _cpu.Step();
+        Assert.Equal((ushort)(ipAfterInstruction + 5), _cpu.Regs.IP);
+    }
+
+    [Fact]
+    public void Jcc_Near_NoJumpWhenConditionFalse()
+    {
+        // Clear Zero flag, JZ near should NOT jump
+        _cpu.Regs.Flags &= ~CpuFlags.Zero;
+        LoadCode(0x0F, 0x84, 0x05, 0x00); // JZ near +5
+        ushort ipAfterInstruction = (ushort)(_cpu.Regs.IP + 4);
+        _cpu.Step();
+        Assert.Equal(ipAfterInstruction, _cpu.Regs.IP); // Did not jump
+    }
+
+    [Fact]
+    public void IMUL_r16_rm16_TwoOperand()
+    {
+        _cpu.Regs.AX = 25;
+        _cpu.Regs.BX = 4;
+        // IMUL AX, BX → 0x0F AF modrm=0xC3 (reg=AX(0), rm=BX(3))
+        LoadCode(0x0F, 0xAF, 0xC3);
+        _cpu.Step();
+        Assert.Equal((ushort)100, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void BSF_FindsLowestSetBit()
+    {
+        _cpu.Regs.BX = 0x0040; // Bit 6 is lowest set bit
+        // BSF AX, BX → 0x0F BC modrm=0xC3
+        LoadCode(0x0F, 0xBC, 0xC3);
+        _cpu.Step();
+        Assert.Equal((ushort)6, _cpu.Regs.AX);
+        Assert.False((_cpu.Regs.Flags & CpuFlags.Zero) != 0);
+    }
+
+    [Fact]
+    public void BSR_FindsHighestSetBit()
+    {
+        _cpu.Regs.BX = 0x0040; // Bit 6 is highest set bit
+        // BSR AX, BX → 0x0F BD modrm=0xC3
+        LoadCode(0x0F, 0xBD, 0xC3);
+        _cpu.Step();
+        Assert.Equal((ushort)6, _cpu.Regs.AX);
+    }
+
+    [Fact]
+    public void BT_TestsBit()
+    {
+        _cpu.Regs.BX = 0x0004; // Bit 2 set
+        _cpu.Regs.CX = 2;       // Test bit 2
+        // BT BX, CX → 0x0F A3 modrm=0xCB (reg=CX(1), rm=BX(3))
+        LoadCode(0x0F, 0xA3, 0xCB);
+        _cpu.Step();
+        Assert.True((_cpu.Regs.Flags & CpuFlags.Carry) != 0); // Bit was set
+    }
+
+    [Fact]
+    public void SETcc_SetsOnCondition()
+    {
+        _cpu.Regs.Flags |= CpuFlags.Zero;
+        _cpu.Regs.CL = 0xFF; // Will be overwritten
+        // SETZ CL → 0x0F 0x94 modrm=0xC1
+        LoadCode(0x0F, 0x94, 0xC1);
+        _cpu.Step();
+        Assert.Equal((byte)1, _cpu.Regs.CL);
+    }
 }

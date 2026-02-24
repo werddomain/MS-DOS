@@ -172,6 +172,35 @@ public sealed class WinFormsRenderer : IGraphicsRenderer, IDisposable
         RedrawAll(backgroundColorIndex);
     }
 
+    public void ScrollDown(int lines, byte backgroundColorIndex)
+    {
+        if (lines <= 0) return;
+
+        // Shift character buffers down
+        for (int row = _textRows - 1 - lines; row >= 0; row--)
+        {
+            for (int col = 0; col < _textCols; col++)
+            {
+                _charBuffer[col, row + lines] = _charBuffer[col, row];
+                _fgBuffer[col, row + lines] = _fgBuffer[col, row];
+                _bgBuffer[col, row + lines] = _bgBuffer[col, row];
+            }
+        }
+
+        // Clear top lines
+        for (int row = 0; row < lines && row < _textRows; row++)
+        {
+            for (int col = 0; col < _textCols; col++)
+            {
+                _charBuffer[col, row] = '\0';
+                _fgBuffer[col, row] = 7;
+                _bgBuffer[col, row] = backgroundColorIndex;
+            }
+        }
+
+        RedrawAll(backgroundColorIndex);
+    }
+
     private void RedrawAll(byte defaultBg)
     {
         _gfx.Clear(ToColor(defaultBg));

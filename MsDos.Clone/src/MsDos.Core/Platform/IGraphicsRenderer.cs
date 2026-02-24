@@ -33,6 +33,9 @@ public interface IGraphicsRenderer
     /// <summary>Scroll the text display up by the specified number of lines.</summary>
     void ScrollUp(int lines, byte backgroundColorIndex);
 
+    /// <summary>Scroll the text display down by the specified number of lines.</summary>
+    void ScrollDown(int lines, byte backgroundColorIndex);
+
     /// <summary>
     /// Flush any buffered drawing commands to the display surface.
     /// Called once per frame or after a batch of draw operations.
