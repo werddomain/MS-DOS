@@ -110,10 +110,10 @@ public class BinaryLoaderTests
         // Read environment segment from PSP at offset 0x002C
         ushort envSeg = _mem.ReadWord(0x1000, 0x002C);
 
-        // The environment should contain "PATH=C:\" + \0 + \0 + WORD(1) + "A:\RUNME.EXE" + \0
+        // The environment should contain "COMSPEC=C:\COMMAND.COM" + \0 + "PATH=C:\" + \0 + \0 + WORD(1) + "A:\RUNME.EXE" + \0
         // Find the double-null terminator
         int offset = 0;
-        while (offset < 256)
+        while (offset < 512)
         {
             byte b = _mem.ReadByte(envSeg, (ushort)offset);
             if (b == 0)
@@ -150,6 +150,26 @@ public class BinaryLoaderTests
     }
 
     [Fact]
+    public void BuildPSP_EnvironmentContainsComspec()
+    {
+        byte[] com = { 0x90 };
+        _loader.Load(com);
+
+        ushort envSeg = _mem.ReadWord(0x1000, 0x002C);
+
+        // First env variable should be COMSPEC=C:\COMMAND.COM
+        var envBytes = new System.Collections.Generic.List<byte>();
+        for (int i = 0; i < 50; i++)
+        {
+            byte b = _mem.ReadByte(envSeg, (ushort)i);
+            if (b == 0) break;
+            envBytes.Add(b);
+        }
+        string firstEnv = System.Text.Encoding.ASCII.GetString(envBytes.ToArray());
+        Assert.Equal("COMSPEC=C:\\COMMAND.COM", firstEnv);
+    }
+
+    [Fact]
     public void BuildPSP_DefaultProgramPathWhenNoneProvided()
     {
         byte[] com = { 0x90 };
@@ -159,7 +179,7 @@ public class BinaryLoaderTests
 
         // Scan past environment strings to find program path
         int offset = 0;
-        while (offset < 256)
+        while (offset < 512)
         {
             byte b = _mem.ReadByte(envSeg, (ushort)offset);
             if (b == 0)

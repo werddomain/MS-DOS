@@ -15,6 +15,13 @@ public sealed class Cpu8086
     private bool _halted;
     private int? _segmentOverride; // null = default, 0-3 = ES/CS/SS/DS
 
+    // ModR/M address cache: prevents double-decode when an instruction both reads and writes
+    // the same ModR/M operand (e.g., ADD [BX+disp], reg). Without caching, the displacement
+    // bytes are fetched twice from the instruction stream, corrupting IP.
+    private bool _modrmCached;
+    private ushort _modrmCacheSeg;
+    private ushort _modrmCacheOff;
+
     /// <summary>Raised when an INT instruction is executed.</summary>
     public event Action<byte>? InterruptTriggered;
 
@@ -42,6 +49,7 @@ public sealed class Cpu8086
     {
         if (_halted) return 1;
         _segmentOverride = null;
+        _modrmCached = false;
         return DecodeAndExecute();
     }
 
@@ -93,6 +101,12 @@ public sealed class Cpu8086
 
     private (ushort segment, ushort offset) DecodeModRM_Address(byte modrm)
     {
+        // Return cached result if already decoded for this instruction.
+        // This prevents consuming displacement bytes twice when an instruction
+        // both reads and writes the same ModR/M operand.
+        if (_modrmCached)
+            return (_modrmCacheSeg, _modrmCacheOff);
+
         int mod = (modrm >> 6) & 3;
         int rm = modrm & 7;
 
@@ -104,6 +118,9 @@ public sealed class Cpu8086
             // Direct address
             offset = FetchWord();
             segment = GetDataSegment();
+            _modrmCached = true;
+            _modrmCacheSeg = segment;
+            _modrmCacheOff = offset;
             return (segment, offset);
         }
 
@@ -131,6 +148,9 @@ public sealed class Cpu8086
         else if (mod == 2)
             offset = (ushort)(offset + FetchWord());
 
+        _modrmCached = true;
+        _modrmCacheSeg = segment;
+        _modrmCacheOff = offset;
         return (segment, offset);
     }
 

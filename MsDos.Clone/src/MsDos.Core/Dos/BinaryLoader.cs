@@ -174,6 +174,12 @@ public sealed class BinaryLoader
         // 3. Full program pathname (null-terminated)
         ushort envOffset = 0;
 
+        // Write COMSPEC=C:\COMMAND.COM environment variable (required by most DOS programs)
+        byte[] comspecVar = System.Text.Encoding.ASCII.GetBytes("COMSPEC=C:\\COMMAND.COM");
+        _mem.LoadData(envSegment, envOffset, comspecVar);
+        envOffset += (ushort)comspecVar.Length;
+        _mem.WriteByte(envSegment, envOffset++, 0); // null terminator
+
         // Write PATH=C:\ environment variable
         byte[] pathVar = System.Text.Encoding.ASCII.GetBytes("PATH=C:\\");
         _mem.LoadData(envSegment, envOffset, pathVar);

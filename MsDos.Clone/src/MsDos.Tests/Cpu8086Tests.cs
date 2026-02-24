@@ -524,4 +524,89 @@ public class Cpu8086Tests
         _cpu.Step();
         Assert.Equal((byte)1, _cpu.Regs.CL);
     }
+
+    [Fact]
+    public void Group1_CMP_MemDisp16_DoesNotConsumeExtraBytes()
+    {
+        // CMP byte [BX+1234h], 0x56
+        // Encoding: 80 BF 34 12 56  (opcode=80, modrm=BF (mod=10,reg=7,rm=7), disp16=1234, imm8=56)
+        // This tests that DecodeModRM_Address displacement is not double-consumed.
+        _cpu.Regs.BX = 0x0000;
+        // Write value at DS:1234h for comparison
+        _mem.WriteByte(_cpu.Regs.DS, 0x1234, 0x56);
+        LoadCode(0x80, 0xBF, 0x34, 0x12, 0x56, // CMP byte [BX+1234h], 56h
+                 0x90);                           // NOP (marker for correct IP)
+        ushort startIP = _cpu.Regs.IP;
+        _cpu.Step();
+        // CMP should be 5 bytes: 80 + modrm + disp16(2) + imm8 = 5
+        Assert.Equal((ushort)(startIP + 5), _cpu.Regs.IP);
+        // ZF should be set since mem value (0x56) == immediate (0x56)
+        Assert.True((_cpu.Regs.Flags & CpuFlags.Zero) != 0);
+    }
+
+    [Fact]
+    public void ADD_MemDisp16_Reg_DoesNotConsumeExtraBytes()
+    {
+        // ADD byte [BX+100h], AL
+        // Encoding: 00 87 00 01  (opcode=00, modrm=87 (mod=10,reg=0,rm=7), disp16=0100)
+        _cpu.Regs.BX = 0x0050;
+        _cpu.Regs.AL = 0x05;
+        _mem.WriteByte(_cpu.Regs.DS, 0x0150, 0x10); // [BX+100h] = DS:0150 = 0x10
+        LoadCode(0x00, 0x87, 0x00, 0x01,  // ADD byte [BX+100h], AL
+                 0x90);                     // NOP (marker)
+        ushort startIP = _cpu.Regs.IP;
+        _cpu.Step();
+        // ADD r/m8, r8 with disp16 is 4 bytes: 00 + modrm + disp16(2)
+        Assert.Equal((ushort)(startIP + 4), _cpu.Regs.IP);
+        // Memory should contain 0x10 + 0x05 = 0x15
+        Assert.Equal(0x15, _mem.ReadByte(_cpu.Regs.DS, 0x0150));
+    }
+
+    [Fact]
+    public void NOT_MemDisp8_DoesNotConsumeExtraBytes()
+    {
+        // NOT byte [BX+10h]
+        // Encoding: F6 57 10  (opcode=F6, modrm=57 (mod=01,reg=2,rm=7), disp8=10h)
+        _cpu.Regs.BX = 0x0030;
+        _mem.WriteByte(_cpu.Regs.DS, 0x0040, 0x0F); // [BX+10h] = DS:0040 = 0x0F
+        LoadCode(0xF6, 0x57, 0x10,   // NOT byte [BX+10h]
+                 0x90);                // NOP (marker)
+        ushort startIP = _cpu.Regs.IP;
+        _cpu.Step();
+        // F6 /2 with disp8 = 3 bytes: F6 + modrm + disp8
+        Assert.Equal((ushort)(startIP + 3), _cpu.Regs.IP);
+        // NOT 0x0F = 0xF0
+        Assert.Equal(0xF0, _mem.ReadByte(_cpu.Regs.DS, 0x0040));
+    }
+
+    [Fact]
+    public void INC_MemDirect_DoesNotConsumeExtraBytes()
+    {
+        // INC word [0x200]
+        // Encoding: FF 06 00 02  (opcode=FF, modrm=06 (mod=00,reg=0,rm=6=direct), disp16=0200)
+        _mem.WriteWord(_cpu.Regs.DS, 0x0200, 0x00FF);
+        LoadCode(0xFF, 0x06, 0x00, 0x02,  // INC word [0200h]
+                 0x90);                     // NOP
+        ushort startIP = _cpu.Regs.IP;
+        _cpu.Step();
+        // FF /0 with direct addressing = 4 bytes: FF + modrm + addr16(2)
+        Assert.Equal((ushort)(startIP + 4), _cpu.Regs.IP);
+        Assert.Equal((ushort)0x0100, _mem.ReadWord(_cpu.Regs.DS, 0x0200));
+    }
+
+    [Fact]
+    public void SHL_MemDisp16_DoesNotConsumeExtraBytes()
+    {
+        // SHL byte [BX+300h], 1
+        // Encoding: D0 A7 00 03  (opcode=D0, modrm=A7 (mod=10,reg=4,rm=7), disp16=0300)
+        _cpu.Regs.BX = 0x0000;
+        _mem.WriteByte(_cpu.Regs.DS, 0x0300, 0x01);
+        LoadCode(0xD0, 0xA7, 0x00, 0x03,  // SHL byte [BX+300h], 1
+                 0x90);                     // NOP
+        ushort startIP = _cpu.Regs.IP;
+        _cpu.Step();
+        // D0 /4 with disp16 = 4 bytes
+        Assert.Equal((ushort)(startIP + 4), _cpu.Regs.IP);
+        Assert.Equal(0x02, _mem.ReadByte(_cpu.Regs.DS, 0x0300)); // 1 << 1 = 2
+    }
 }
