@@ -12,6 +12,12 @@ public sealed class DiskImageLoader
     private byte[]? _imageData;
     private readonly EmulatorLog _log;
 
+    /// <summary>
+    /// Byte offset within the image where the active partition starts.
+    /// Zero for floppy / un-partitioned images.
+    /// </summary>
+    private int _partitionOffset;
+
     private const int Fat12EndOfChain = 0xFF8;
     private const int Fat12BadCluster = 0xFFF;
     private const int Fat16EndOfChain = 0xFFF8;
@@ -39,6 +45,9 @@ public sealed class DiskImageLoader
     /// <summary>The raw image data.</summary>
     public ReadOnlySpan<byte> RawData => _imageData;
 
+    /// <summary>Byte offset of the active partition (0 for un-partitioned images).</summary>
+    public int PartitionOffset => _partitionOffset;
+
     public DiskImageLoader(EmulatorLog log)
     {
         _log = log;
@@ -46,7 +55,9 @@ public sealed class DiskImageLoader
 
     /// <summary>
     /// Load a raw/IMG disk image from byte data.
-    /// Parses the BPB from the boot sector.
+    /// Parses the BPB from the boot sector.  If the image starts with an
+    /// MBR partition table, the first active (or first valid) partition is
+    /// located and the BPB is read from that partition's boot sector.
     /// </summary>
     /// <returns>True if the image was loaded and parsed successfully.</returns>
     public bool Load(byte[] data)
@@ -58,23 +69,45 @@ public sealed class DiskImageLoader
         }
 
         _imageData = data;
+        _partitionOffset = 0;
 
-        // Parse BPB from boot sector (offset 0x0B)
-        BytesPerSector = ReadUInt16(data, 0x0B);
-        SectorsPerCluster = data[0x0D];
-        ReservedSectors = ReadUInt16(data, 0x0E);
-        NumberOfFats = data[0x10];
-        RootEntryCount = ReadUInt16(data, 0x11);
-        TotalSectors = ReadUInt16(data, 0x13);
-        MediaDescriptor = data[0x15];
-        SectorsPerFat = ReadUInt16(data, 0x16);
-        SectorsPerTrack = ReadUInt16(data, 0x18);
-        NumberOfHeads = ReadUInt16(data, 0x1A);
-        HiddenSectors = ReadUInt16(data, 0x1C);
+        // Detect MBR partition table: check for 0x55AA signature and
+        // probe whether sector 0 looks like a raw BPB or an MBR.
+        if (data.Length > 512 && data[510] == 0x55 && data[511] == 0xAA)
+        {
+            int bpbBps = ReadUInt16(data, 0x0B);
+            int bpbSpc = data[0x0D];
+
+            // If offset 0 does NOT look like a valid BPB, try MBR.
+            if (bpbBps == 0 || bpbSpc == 0 || bpbBps > 4096)
+            {
+                int partOff = TryFindPartition(data);
+                if (partOff > 0)
+                {
+                    _partitionOffset = partOff;
+                    _log.Info("DiskImage", $"MBR detected — partition at byte offset {_partitionOffset}");
+                }
+            }
+        }
+
+        int bpbBase = _partitionOffset;
+
+        // Parse BPB from the (partition) boot sector
+        BytesPerSector = ReadUInt16(data, bpbBase + 0x0B);
+        SectorsPerCluster = data[bpbBase + 0x0D];
+        ReservedSectors = ReadUInt16(data, bpbBase + 0x0E);
+        NumberOfFats = data[bpbBase + 0x10];
+        RootEntryCount = ReadUInt16(data, bpbBase + 0x11);
+        TotalSectors = ReadUInt16(data, bpbBase + 0x13);
+        MediaDescriptor = data[bpbBase + 0x15];
+        SectorsPerFat = ReadUInt16(data, bpbBase + 0x16);
+        SectorsPerTrack = ReadUInt16(data, bpbBase + 0x18);
+        NumberOfHeads = ReadUInt16(data, bpbBase + 0x1A);
+        HiddenSectors = ReadUInt16(data, bpbBase + 0x1C);
 
         // If TotalSectors is 0, use the 32-bit value at offset 0x20
         if (TotalSectors == 0)
-            TotalSectors = ReadInt32(data, 0x20);
+            TotalSectors = ReadInt32(data, bpbBase + 0x20);
 
         // Validate BPB
         if (BytesPerSector == 0 || BytesPerSector > 4096 ||
@@ -98,8 +131,45 @@ public sealed class DiskImageLoader
                           totalClusters < 65525 ? FatType.Fat16 : FatType.Unknown;
 
         _log.Info("DiskImage", $"Loaded {data.Length} bytes: {DetectedFatType}, {BytesPerSector} bytes/sector, " +
-                  $"{SectorsPerCluster} sectors/cluster, {TotalSectors} total sectors");
+                  $"{SectorsPerCluster} sectors/cluster, {TotalSectors} total sectors" +
+                  (_partitionOffset > 0 ? $" (partition at offset {_partitionOffset})" : ""));
         return true;
+    }
+
+    /// <summary>
+    /// Scan MBR partition entries and return the byte offset of the first
+    /// bootable (0x80) FAT12/FAT16 partition found, or the first FAT
+    /// partition if none is bootable.  Returns -1 if nothing suitable.
+    /// </summary>
+    private static int TryFindPartition(byte[] data)
+    {
+        int fallback = -1;
+        for (int i = 0; i < 4; i++)
+        {
+            int pe = 446 + i * 16;
+            byte status = data[pe];
+            byte type   = data[pe + 4];
+            int  lba    = (int)ReadUInt32(data, pe + 8);
+            int  count  = (int)ReadUInt32(data, pe + 12);
+
+            // Recognised FAT types: 0x01 FAT12, 0x04/0x06/0x0E FAT16
+            bool isFat = type == 0x01 || type == 0x04 || type == 0x06 || type == 0x0E;
+
+            if (!isFat || lba == 0 || count == 0)
+                continue;
+
+            int byteOff = lba * 512;
+            if (byteOff + 512 > data.Length)
+                continue;
+
+            if (status == 0x80)
+                return byteOff;           // Active/bootable — use immediately
+
+            if (fallback < 0)
+                fallback = byteOff;       // Remember first suitable
+        }
+
+        return fallback;
     }
 
     /// <summary>
@@ -111,7 +181,7 @@ public sealed class DiskImageLoader
             return Array.Empty<DiskFileEntry>();
 
         var entries = new List<DiskFileEntry>();
-        int rootDirOffset = (ReservedSectors + (NumberOfFats * SectorsPerFat)) * BytesPerSector;
+        int rootDirOffset = _partitionOffset + (ReservedSectors + (NumberOfFats * SectorsPerFat)) * BytesPerSector;
 
         for (int i = 0; i < RootEntryCount; i++)
         {
@@ -161,7 +231,7 @@ public sealed class DiskImageLoader
         int rootDirSectors = ((RootEntryCount * 32) + (BytesPerSector - 1)) / BytesPerSector;
         int firstDataSector = ReservedSectors + (NumberOfFats * SectorsPerFat) + rootDirSectors;
         int clusterSize = SectorsPerCluster * BytesPerSector;
-        int fatOffset = ReservedSectors * BytesPerSector;
+        int fatOffset = _partitionOffset + ReservedSectors * BytesPerSector;
 
         var data = new byte[entry.Size];
         int written = 0;
@@ -170,7 +240,7 @@ public sealed class DiskImageLoader
         while (cluster >= 2 && written < (int)entry.Size)
         {
             int sectorOffset = firstDataSector + ((cluster - 2) * SectorsPerCluster);
-            int byteOffset = sectorOffset * BytesPerSector;
+            int byteOffset = _partitionOffset + sectorOffset * BytesPerSector;
 
             int toRead = Math.Min(clusterSize, (int)entry.Size - written);
             if (byteOffset + toRead > _imageData.Length)
@@ -191,15 +261,16 @@ public sealed class DiskImageLoader
     }
 
     /// <summary>
-    /// Read the boot sector code (first 512 bytes) for potential execution.
+    /// Read the partition boot sector (512 bytes).
+    /// For partitioned images this returns the partition's VBR, not the MBR.
     /// </summary>
     public byte[]? GetBootSector()
     {
-        if (_imageData == null || _imageData.Length < 512)
+        if (_imageData == null || _partitionOffset + 512 > _imageData.Length)
             return null;
 
         var boot = new byte[512];
-        Array.Copy(_imageData, 0, boot, 0, 512);
+        Array.Copy(_imageData, _partitionOffset, boot, 0, 512);
         return boot;
     }
 
@@ -210,7 +281,7 @@ public sealed class DiskImageLoader
     {
         if (_imageData == null) return null;
 
-        int offset = startSector * BytesPerSector;
+        int offset = _partitionOffset + startSector * BytesPerSector;
         int length = count * BytesPerSector;
 
         if (offset + length > _imageData.Length)
