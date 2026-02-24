@@ -54,16 +54,20 @@ Reads and writes byte streams. WinForms uses the local file system; Blazor uses 
 
 ## Features
 
-- **8086 CPU Emulator**: Full instruction set including arithmetic, logic, shifts, string operations, conditional jumps, CALL/RET, PUSH/POP, segment overrides, REP prefixes
+- **8086 CPU Emulator**: Full instruction set including arithmetic, logic, shifts, string operations, conditional jumps, CALL/RET, PUSH/POP, segment overrides, REP prefixes, BCD instructions (DAA, DAS, AAA, AAS, AAM, AAD), XLAT, SAHF/LAHF
 - **1MB Memory Bus**: Segmented addressing (segment:offset → 20-bit physical)
-- **DOS INT 21h Services**: Console I/O, file operations (create, open, read, write, close, seek, delete), process management, date/time, memory allocation, file search (FindFirst/FindNext with wildcard matching), disk free space, IOCTL
+- **DOS INT 21h Services**: Console I/O, file operations (create, open, read, write, close, seek, delete), process management, date/time, memory allocation, file search (FindFirst/FindNext with wildcard matching), disk free space, IOCTL, MKDIR/RMDIR/CHDIR, country info, code page
 - **BIOS Services**: INT 10h (video/text), INT 16h (keyboard), INT 1Ah (time), INT 11h/12h (equipment/memory)
 - **Binary Loader**: Loads COM files (flat binary at CS:0100h) and EXE files (MZ format with relocations)
 - **Disk Image Loader**: Loads IMG/RAW/IMA/DSK disk images with FAT12/FAT16 file system support, reads files from disk images, supports common floppy formats (160K–1.44MB)
+- **Disk Image Writer**: Creates blank FAT12 formatted disk images, exports C: drive contents as IMG files, writes files into formatted images
+- **C: Drive Import/Export**: Import C: drive from a disk image, or export current C: drive contents as a 1.44MB FAT12 IMG file
 - **Multi-Drive Support**: Mount disk images on drive letters A:–Z:, switch between drives with `A:`, `B:`, `C:` etc.
 - **PSP (Program Segment Prefix)**: Full PSP construction with command tail support
 - **CONFIG.SYS Support**: Parsed on boot — FILES=, BUFFERS=, LASTDRIVE=, DEVICE=, SHELL=, COUNTRY=
 - **AUTOEXEC.BAT Support**: Executed line by line on shell startup before showing the prompt
+- **BAT File Execution**: Execute batch files from disk images or C: drive with support for ECHO ON/OFF, GOTO, labels, REM, PAUSE, and @ prefix
+- **Binary Execution from Shell**: Load and execute COM/EXE files directly from mounted disk drives by typing their name
 - **Logging/Diagnostics**: EmulatorLog with severity levels (Trace/Debug/Info/Warning/Error), event-based output to UI, CPU instruction tracing mode
 - **Built-in Command Shell**: COMMAND.COM emulation with interactive commands:
   - `DIR [pattern]` — List directory contents with wildcard filtering
@@ -74,6 +78,9 @@ Reads and writes byte streams. WinForms uses the local file system; Blazor uses 
   - `MEM` — Show memory information
   - `ECHO [text]` — Display text
   - `CD [path]` — Change directory
+  - `COPY src dst` — Copy files (supports cross-drive copy)
+  - `DEL filename` — Delete a file
+  - `MKDIR dir` / `RMDIR dir` — Create/remove directories
   - `A:`, `B:`, `C:` — Switch drives
   - `SET` / `PATH` — Show environment variables
   - `HELP` — Show available commands
@@ -102,7 +109,9 @@ dotnet run --project src/MsDos.Blazor
 1. Launch the application
 2. **Load a binary**: File → Load Binary (COM/EXE)... or press Ctrl+O
 3. **Load a disk image**: File → Load Disk Image (IMG/RAW)... or press Ctrl+D
-4. **Start the shell**: File → Start Shell (COMMAND.COM) or press Ctrl+S
+4. **Import C: drive from IMG**: File → Import C: Drive from IMG...
+5. **Export C: drive as IMG**: File → Export C: Drive as IMG... or press Ctrl+E
+6. **Start the shell**: File → Start Shell (COMMAND.COM) or press Ctrl+S
 5. The program executes in the emulated DOS environment
 6. Switch drives with `A:`, `B:`, `C:` etc. once disk images are mounted
 
@@ -110,7 +119,9 @@ dotnet run --project src/MsDos.Blazor
 1. Open the web application in a browser
 2. **Load a binary**: Click "Load Binary" and select a DOS COM or EXE file
 3. **Load a disk image**: Click "Load Disk Image" and select an IMG/RAW/IMA/DSK file
-4. **Start the shell**: Click the "Shell" button to open an interactive DOS prompt
+4. **Import C: drive**: Click "Import C: Drive" to load a disk image as the C: drive
+5. **Export C: drive**: Click "Export C:" to download the C: drive contents as a 1.44MB IMG
+6. **Start the shell**: Click the "Shell" button to open an interactive DOS prompt
 5. Type commands (HELP, VER, DIR, CLS, etc.) in the emulated environment
 6. System messages appear in the log panel at the bottom
 
@@ -136,6 +147,20 @@ machine.MountDiskImage('A', imageData);
 // Start the shell and switch to A:
 await machine.RunShellAsync();
 // User types "A:" to switch drives, "DIR" to list files
+```
+
+### Exporting C: Drive as Disk Image
+```csharp
+// Export the current C: drive contents to a 1.44MB FAT12 disk image
+byte[] image = await DiskImageWriter.ExportDriveAsImageAsync(streams, machine.Log);
+File.WriteAllBytes("drive_c.img", image);
+
+// Or create a new disk image with specific files
+byte[] blank = DiskImageWriter.CreateBlankFloppy144();
+byte[] result = DiskImageWriter.WriteFiles(blank, new[] {
+    ("HELLO.COM", File.ReadAllBytes("hello.com")),
+    ("README.TXT", Encoding.ASCII.GetBytes("Hello World"))
+});
 ```
 
 ### CONFIG.SYS and AUTOEXEC.BAT
