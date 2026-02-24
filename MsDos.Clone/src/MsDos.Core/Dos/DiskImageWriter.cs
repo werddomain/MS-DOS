@@ -24,6 +24,23 @@ public sealed class DiskImageWriter
     }
 
     /// <summary>
+    /// Create a blank FAT12 formatted disk image of the specified size.
+    /// Supports common floppy sizes: 360K, 720K, 1.2MB, 1.44MB.
+    /// </summary>
+    /// <param name="imageSize">Total image size in bytes.</param>
+    /// <param name="volumeLabel">Volume label (max 11 chars).</param>
+    public static byte[] CreateBlankFat12Image(int imageSize, string volumeLabel = "MSDOSCLONE")
+    {
+        return imageSize switch
+        {
+            368640 => CreateBlankImage(720, 2, 2, 112, 2, 0xFD, 9, 2, volumeLabel),   // 360K
+            737280 => CreateBlankImage(1440, 2, 2, 112, 3, 0xF9, 9, 2, volumeLabel),  // 720K
+            1228800 => CreateBlankImage(2400, 1, 2, 224, 7, 0xF9, 15, 2, volumeLabel), // 1.2MB
+            _ => CreateBlankImage(2880, 1, 2, 224, 9, 0xF0, 18, 2, volumeLabel),       // 1.44MB
+        };
+    }
+
+    /// <summary>
     /// Create a blank formatted disk image with the given BPB parameters.
     /// </summary>
     public static byte[] CreateBlankImage(

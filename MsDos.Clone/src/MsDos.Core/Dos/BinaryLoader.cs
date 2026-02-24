@@ -27,9 +27,12 @@ public sealed class BinaryLoader
     /// </summary>
     /// <param name="data">Raw binary file data.</param>
     /// <param name="loadSegment">Segment to load at (default 0x1000).</param>
+    /// <param name="programPath">Full path of the program (e.g., "A:\RUNME.EXE") for the environment block.</param>
     /// <returns>True if loaded successfully.</returns>
-    public bool Load(ReadOnlySpan<byte> data, ushort loadSegment = DefaultLoadSegment)
+    public bool Load(ReadOnlySpan<byte> data, ushort loadSegment = DefaultLoadSegment, string? programPath = null)
     {
+        _programPath = programPath;
+
         if (data.Length < 1)
             return false;
 
@@ -39,6 +42,8 @@ public sealed class BinaryLoader
 
         return LoadCom(data, loadSegment);
     }
+
+    private string? _programPath;
 
     /// <summary>
     /// Load a COM file. COM files are loaded at segment:0100h and
@@ -133,6 +138,8 @@ public sealed class BinaryLoader
 
     /// <summary>
     /// Build a minimal Program Segment Prefix (PSP) at the given segment.
+    /// Sets up the environment block with environment variables and program pathname
+    /// (DOS 3.0+ format: env strings \0\0 WORD(count) pathname\0).
     /// </summary>
     private void BuildPSP(ushort segment)
     {
@@ -161,10 +168,29 @@ public sealed class BinaryLoader
         ushort envSegment = (ushort)(segment - 0x10);
         _mem.WriteWord(segment, 0x002C, envSegment);
 
-        // Set up minimal environment block
-        // PATH=C:\
-        byte[] env = System.Text.Encoding.ASCII.GetBytes("PATH=C:\\\0\0");
-        _mem.LoadData(envSegment, 0x0000, env);
+        // Build environment block:
+        // 1. Environment strings (null-terminated, ending with double-null)
+        // 2. WORD: string count (DOS 3.0+)
+        // 3. Full program pathname (null-terminated)
+        ushort envOffset = 0;
+
+        // Write PATH=C:\ environment variable
+        byte[] pathVar = System.Text.Encoding.ASCII.GetBytes("PATH=C:\\");
+        _mem.LoadData(envSegment, envOffset, pathVar);
+        envOffset += (ushort)pathVar.Length;
+        _mem.WriteByte(envSegment, envOffset++, 0); // null terminator for this string
+
+        // Double-null: end of environment strings
+        _mem.WriteByte(envSegment, envOffset++, 0);
+
+        // DOS 3.0+ program pathname: WORD count + pathname
+        string progPath = _programPath ?? "C:\\PROGRAM.EXE";
+        _mem.WriteByte(envSegment, envOffset++, 0x01); // low byte of count (1)
+        _mem.WriteByte(envSegment, envOffset++, 0x00); // high byte of count (0)
+        byte[] pathBytes = System.Text.Encoding.ASCII.GetBytes(progPath.ToUpperInvariant());
+        _mem.LoadData(envSegment, envOffset, pathBytes);
+        envOffset += (ushort)pathBytes.Length;
+        _mem.WriteByte(envSegment, envOffset, 0); // null terminator for pathname
     }
 
     /// <summary>

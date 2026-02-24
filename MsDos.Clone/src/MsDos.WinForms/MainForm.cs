@@ -36,6 +36,8 @@ public partial class MainForm : Form
     private Button _driveBEject = null!;
     private Button _driveASave = null!;
     private Button _driveBSave = null!;
+    private Button _driveABlank = null!;
+    private Button _driveBBlank = null!;
 
     // Debug / Log panel
     private SplitContainer _mainSplit = null!;
@@ -162,9 +164,9 @@ public partial class MainForm : Form
         table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
 
         _driveAPanel = BuildSingleDrivePanel('A', out _driveALabel, out _driveALed,
-            out _driveAType, out _driveAInsert, out _driveAEject, out _driveASave);
+            out _driveAType, out _driveAInsert, out _driveAEject, out _driveASave, out _driveABlank);
         _driveBPanel = BuildSingleDrivePanel('B', out _driveBLabel, out _driveBLed,
-            out _driveBType, out _driveBInsert, out _driveBEject, out _driveBSave);
+            out _driveBType, out _driveBInsert, out _driveBEject, out _driveBSave, out _driveBBlank);
 
         table.Controls.Add(_driveAPanel, 0, 0);
         table.Controls.Add(_driveBPanel, 1, 0);
@@ -172,7 +174,7 @@ public partial class MainForm : Form
     }
 
     private static Panel BuildSingleDrivePanel(char letter, out Label label, out Panel led,
-        out ComboBox typeCombo, out Button insertBtn, out Button ejectBtn, out Button saveBtn)
+        out ComboBox typeCombo, out Button insertBtn, out Button ejectBtn, out Button saveBtn, out Button blankBtn)
     {
         var panel = new Panel
         {
@@ -244,7 +246,18 @@ public partial class MainForm : Form
             Enabled = false,
         };
 
-        panel.Controls.AddRange(new Control[] { led, label, typeCombo, insertBtn, ejectBtn, saveBtn });
+        blankBtn = new Button
+        {
+            Text = "Blank",
+            Location = new System.Drawing.Point(6, 54),
+            Size = new System.Drawing.Size(56, 24),
+            Font = new System.Drawing.Font("Segoe UI", 8),
+            FlatStyle = FlatStyle.Flat,
+            ForeColor = System.Drawing.Color.White,
+            BackColor = System.Drawing.Color.FromArgb(60, 60, 80),
+        };
+
+        panel.Controls.AddRange(new Control[] { led, label, typeCombo, insertBtn, ejectBtn, saveBtn, blankBtn });
         return panel;
     }
 
@@ -423,6 +436,8 @@ public partial class MainForm : Form
         _driveBEject.Click += (_, _) => OnEjectFloppy('B');
         _driveASave.Click += (_, _) => OnSaveFloppy('A');
         _driveBSave.Click += (_, _) => OnSaveFloppy('B');
+        _driveABlank.Click += (_, _) => OnInsertBlankFloppy('A');
+        _driveBBlank.Click += (_, _) => OnInsertBlankFloppy('B');
 
         _driveAType.SelectedIndexChanged += (_, _) => OnDriveTypeChanged('A', _driveAType);
         _driveBType.SelectedIndexChanged += (_, _) => OnDriveTypeChanged('B', _driveBType);
@@ -677,6 +692,28 @@ public partial class MainForm : Form
         var data = _machine?.SaveFloppyState(drive);
         if (data != null)
             SaveFloppyToFile(drive, data);
+    }
+
+    private void OnInsertBlankFloppy(char drive)
+    {
+        if (_machine == null) return;
+
+        // Get selected disk type from the appropriate combo
+        var typeCombo = drive == 'A' ? _driveAType : _driveBType;
+        var diskType = typeCombo.SelectedIndex switch
+        {
+            1 => MsDos.Core.Dos.FloppyDiskType.Floppy720K,
+            2 => MsDos.Core.Dos.FloppyDiskType.Floppy1200K,
+            3 => MsDos.Core.Dos.FloppyDiskType.Floppy360K,
+            _ => MsDos.Core.Dos.FloppyDiskType.Floppy1440K,
+        };
+
+        bool ok = _machine.InsertBlankFloppyDisk(drive, diskType);
+        if (ok)
+            _statusLabel.Text = $"Blank {diskType} disk inserted into {drive}:";
+        else
+            MessageBox.Show($"Failed to create blank disk for {drive}:", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
     private void SaveFloppyToFile(char drive, byte[] data)

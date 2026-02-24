@@ -39,6 +39,65 @@ public sealed class DosKernel
     // Current default drive (0=A, 1=B, 2=C)
     private byte _currentDrive = 2; // C:
 
+    // Drive provider map for resolving paths on different drives
+    private readonly Dictionary<char, IStreamProvider> _driveProviders = new(StringComparer.OrdinalIgnoreCase.GetHashCode() == 0 ? null! : new CharOrdinalIgnoreCaseComparer());
+
+    /// <summary>
+    /// Register a drive letter with its stream provider so the kernel can resolve file paths.
+    /// </summary>
+    public void SetDriveProvider(char driveLetter, IStreamProvider provider)
+    {
+        _driveProviders[char.ToUpperInvariant(driveLetter)] = provider;
+    }
+
+    /// <summary>
+    /// Remove a drive letter mapping (e.g., when ejecting a floppy).
+    /// </summary>
+    public void RemoveDriveProvider(char driveLetter)
+    {
+        _driveProviders.Remove(char.ToUpperInvariant(driveLetter));
+    }
+
+    /// <summary>
+    /// Set the current default drive number (0=A, 1=B, 2=C...).
+    /// </summary>
+    public void SetCurrentDrive(byte driveNumber)
+    {
+        _currentDrive = driveNumber;
+    }
+
+    /// <summary>
+    /// Resolve a DOS file path to the correct stream provider.
+    /// If the path has a drive letter prefix (e.g., "A:\FILE.EXE"), uses that drive's provider.
+    /// Otherwise uses the current drive's provider, falling back to the default.
+    /// Returns the provider and the path with the drive prefix stripped.
+    /// </summary>
+    private (IStreamProvider provider, string resolvedPath) ResolveFilePath(string path)
+    {
+        // Check for drive letter prefix (e.g., "A:" or "A:\")
+        if (path.Length >= 2 && path[1] == ':' && char.IsLetter(path[0]))
+        {
+            char drive = char.ToUpperInvariant(path[0]);
+            string subPath = path.Length > 2 ? path[2..].TrimStart('\\', '/') : "";
+            if (_driveProviders.TryGetValue(drive, out var driveProvider))
+                return (driveProvider, subPath);
+        }
+
+        // Use current drive's provider if available
+        char currentDriveLetter = (char)('A' + _currentDrive);
+        if (_driveProviders.TryGetValue(currentDriveLetter, out var currentProvider))
+            return (currentProvider, path);
+
+        // Fall back to default stream provider
+        return (_streams, path);
+    }
+
+    private sealed class CharOrdinalIgnoreCaseComparer : IEqualityComparer<char>
+    {
+        public bool Equals(char x, char y) => char.ToUpperInvariant(x) == char.ToUpperInvariant(y);
+        public int GetHashCode(char obj) => char.ToUpperInvariant(obj).GetHashCode();
+    }
+
     // FindFirst/FindNext state
     private IReadOnlyList<string>? _findResults;
     private int _findIndex;
@@ -578,7 +637,8 @@ public sealed class DosKernel
         string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
         try
         {
-            var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            var stream = provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult();
             ushort handle = _nextHandle++;
             _fileHandles[handle] = new DosFileHandle(path, stream);
             _cpu.Regs.AX = handle;
@@ -596,22 +656,25 @@ public sealed class DosKernel
         string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
         try
         {
+            var (provider, resolvedPath) = ResolveFilePath(path);
             Stream stream;
             byte mode = (byte)(_cpu.Regs.AL & 3);
             stream = mode switch
             {
-                0 => _streams.OpenReadAsync(path).GetAwaiter().GetResult(),
-                1 => _streams.OpenWriteAsync(path).GetAwaiter().GetResult(),
-                _ => _streams.OpenReadWriteAsync(path).GetAwaiter().GetResult()
+                0 => provider.OpenReadAsync(resolvedPath).GetAwaiter().GetResult(),
+                1 => provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult(),
+                _ => provider.OpenReadWriteAsync(resolvedPath).GetAwaiter().GetResult()
             };
 
             ushort handle = _nextHandle++;
             _fileHandles[handle] = new DosFileHandle(path, stream);
             _cpu.Regs.AX = handle;
             _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            _log.Debug("DOS", $"Open file '{path}' → handle {handle}");
         }
-        catch
+        catch (Exception ex)
         {
+            _log.Debug("DOS", $"Open file '{path}' failed: {ex.Message}");
             _cpu.Regs.AX = 0x02; // File not found
             _cpu.Regs.Flags |= CpuFlags.Carry;
         }
@@ -722,7 +785,8 @@ public sealed class DosKernel
         string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
         try
         {
-            _streams.DeleteAsync(path).GetAwaiter().GetResult();
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            provider.DeleteAsync(resolvedPath).GetAwaiter().GetResult();
             _cpu.Regs.Flags &= ~CpuFlags.Carry;
         }
         catch
@@ -831,7 +895,8 @@ public sealed class DosKernel
                 filePattern = pattern[(lastSep + 1)..];
             }
 
-            var entries = _streams.ListEntriesAsync(dir).GetAwaiter().GetResult();
+            var (provider, resolvedDir) = ResolveFilePath(dir.Length > 0 ? dir : ".");
+            var entries = provider.ListEntriesAsync(resolvedDir).GetAwaiter().GetResult();
 
             // Filter by pattern (simple wildcard matching)
             _findResults = entries
@@ -1086,7 +1151,8 @@ public sealed class DosKernel
 
         try
         {
-            var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            var stream = provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult();
             ushort handle = _nextHandle++;
             _fileHandles[handle] = new DosFileHandle(path, stream);
             _cpu.Regs.AX = handle;
@@ -1112,14 +1178,15 @@ public sealed class DosKernel
         string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
         try
         {
-            bool exists = _streams.ExistsAsync(path).GetAwaiter().GetResult();
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            bool exists = provider.ExistsAsync(resolvedPath).GetAwaiter().GetResult();
             if (exists)
             {
                 _cpu.Regs.AX = 0x50; // File already exists
                 _cpu.Regs.Flags |= CpuFlags.Carry;
                 return;
             }
-            var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+            var stream = provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult();
             ushort handle = _nextHandle++;
             _fileHandles[handle] = new DosFileHandle(path, stream);
             _cpu.Regs.AX = handle;
@@ -1159,7 +1226,8 @@ public sealed class DosKernel
 
         try
         {
-            bool exists = _streams.ExistsAsync(path).GetAwaiter().GetResult();
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            bool exists = provider.ExistsAsync(resolvedPath).GetAwaiter().GetResult();
 
             if (exists)
             {
@@ -1167,9 +1235,9 @@ public sealed class DosKernel
                 {
                     Stream stream = mode switch
                     {
-                        0 => _streams.OpenReadAsync(path).GetAwaiter().GetResult(),
-                        1 => _streams.OpenWriteAsync(path).GetAwaiter().GetResult(),
-                        _ => _streams.OpenReadWriteAsync(path).GetAwaiter().GetResult()
+                        0 => provider.OpenReadAsync(resolvedPath).GetAwaiter().GetResult(),
+                        1 => provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult(),
+                        _ => provider.OpenReadWriteAsync(resolvedPath).GetAwaiter().GetResult()
                     };
                     ushort handle = _nextHandle++;
                     _fileHandles[handle] = new DosFileHandle(path, stream);
@@ -1178,7 +1246,7 @@ public sealed class DosKernel
                 }
                 else if ((action & 0x02) != 0) // Replace if exists
                 {
-                    var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+                    var stream = provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult();
                     ushort handle = _nextHandle++;
                     _fileHandles[handle] = new DosFileHandle(path, stream);
                     _cpu.Regs.AX = handle;
@@ -1195,7 +1263,7 @@ public sealed class DosKernel
             {
                 if ((action & 0x10) != 0) // Create if not exists
                 {
-                    var stream = _streams.OpenWriteAsync(path).GetAwaiter().GetResult();
+                    var stream = provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult();
                     ushort handle = _nextHandle++;
                     _fileHandles[handle] = new DosFileHandle(path, stream);
                     _cpu.Regs.AX = handle;

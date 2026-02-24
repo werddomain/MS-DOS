@@ -94,6 +94,7 @@ public sealed class DosMachine
 
         // Mount C: as the default stream provider
         _drives['C'] = streams;
+        Dos.SetDriveProvider('C', streams);
 
         // Register interrupt handlers
         Interrupts.RegisterHandler(0x10, Video.Handle);
@@ -141,6 +142,7 @@ public sealed class DosMachine
 
         var provider = new DiskImageStreamProvider(diskLoader, Log);
         _drives[driveLetter] = provider;
+        Dos.SetDriveProvider(driveLetter, provider);
 
         // Track in floppy controller for A:/B:
         var floppySlot = Floppy.GetSlot(driveLetter);
@@ -185,6 +187,7 @@ public sealed class DosMachine
 
         var data = Floppy.EjectDisk(driveLetter);
         _drives.Remove(driveLetter);
+        Dos.RemoveDriveProvider(driveLetter);
         Log.Info("Machine", $"Floppy {driveLetter}: ejected");
         return data;
     }
@@ -198,6 +201,33 @@ public sealed class DosMachine
         if (driveLetter != 'A' && driveLetter != 'B') return false;
 
         return MountDiskImage(driveLetter, imageData, label);
+    }
+
+    /// <summary>
+    /// Insert a blank formatted floppy disk into drive A: or B:.
+    /// Creates a blank FAT12 disk image of the specified type.
+    /// </summary>
+    /// <param name="driveLetter">Drive letter ('A' or 'B').</param>
+    /// <param name="diskType">The floppy disk type (determines image size).</param>
+    /// <param name="label">Optional volume label (max 11 chars).</param>
+    /// <returns>True if the blank disk was created and inserted.</returns>
+    public bool InsertBlankFloppyDisk(char driveLetter, FloppyDiskType diskType = FloppyDiskType.Floppy1440K, string? label = null)
+    {
+        driveLetter = char.ToUpperInvariant(driveLetter);
+        if (driveLetter != 'A' && driveLetter != 'B') return false;
+
+        int imageSize = diskType switch
+        {
+            FloppyDiskType.Floppy360K => 368640,
+            FloppyDiskType.Floppy720K => 737280,
+            FloppyDiskType.Floppy1200K => 1228800,
+            FloppyDiskType.Floppy1440K => 1474560,
+            _ => 1474560
+        };
+
+        byte[] blankImage = DiskImageWriter.CreateBlankFat12Image(imageSize, label ?? "BLANK DISK");
+        Log.Info("Machine", $"Created blank {diskType} floppy disk for {driveLetter}:");
+        return MountDiskImage(driveLetter, blankImage, label ?? "Blank Floppy");
     }
 
     /// <summary>
@@ -273,8 +303,9 @@ public sealed class DosMachine
     /// </summary>
     /// <param name="data">The binary file content.</param>
     /// <param name="commandLine">Optional command line arguments.</param>
+    /// <param name="programPath">Full path of the program (e.g., "A:\RUNME.EXE") for the environment block.</param>
     /// <returns>True if loaded successfully.</returns>
-    public bool LoadBinary(byte[] data, string commandLine = "")
+    public bool LoadBinary(byte[] data, string commandLine = "", string? programPath = null)
     {
         // Save drive mounts
         var savedDrives = new Dictionary<char, IStreamProvider>(_drives, CharComparer.OrdinalIgnoreCase);
@@ -283,9 +314,12 @@ public sealed class DosMachine
 
         // Restore drive mounts
         foreach (var kv in savedDrives)
+        {
             _drives[kv.Key] = kv.Value;
+            Dos.SetDriveProvider(kv.Key, kv.Value);
+        }
 
-        bool loaded = Loader.Load(data);
+        bool loaded = Loader.Load(data, programPath: programPath);
         if (!loaded)
         {
             Log.Error("Machine", "Failed to load binary (unsupported format or too large)");

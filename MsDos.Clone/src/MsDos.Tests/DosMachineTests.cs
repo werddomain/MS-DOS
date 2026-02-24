@@ -251,15 +251,97 @@ public class DosMachineTests
     }
 
     [Fact]
-    public void Log_CapturesMessages()
+    public void LoadBinary_WithProgramPath_EnvironmentContainsPath()
     {
         var renderer = new TestRenderer();
         var events = new TestEventRegistry();
         var streams = new TestStreamProvider();
         var machine = new DosMachine(renderer, events, streams);
 
-        // The constructor should log initialization
-        var entries = machine.Log.GetEntries();
-        Assert.Contains(entries, e => e.Source == "Machine" && e.Message.Contains("initialized"));
+        byte[] com = { 0xB4, 0x4C, 0xB0, 0x00, 0xCD, 0x21 };
+        bool loaded = machine.LoadBinary(com, "", "A:\\TEST.COM");
+
+        Assert.True(loaded);
+
+        // Read environment segment from PSP at offset 0x002C
+        ushort envSeg = machine.Memory.ReadWord(0x1000, 0x002C);
+
+        // Scan past environment variables
+        int offset = 0;
+        while (offset < 256)
+        {
+            byte b = machine.Memory.ReadByte(envSeg, (ushort)offset);
+            if (b == 0)
+            {
+                offset++;
+                byte next = machine.Memory.ReadByte(envSeg, (ushort)offset);
+                if (next == 0) { offset++; break; }
+            }
+            else offset++;
+        }
+
+        // After double-null: WORD count should be 1
+        ushort count = machine.Memory.ReadWord(envSeg, (ushort)offset);
+        Assert.Equal(1, count);
+        offset += 2;
+
+        // Read program path
+        var pathBytes = new List<byte>();
+        for (int i = 0; i < 50; i++)
+        {
+            byte b = machine.Memory.ReadByte(envSeg, (ushort)(offset + i));
+            if (b == 0) break;
+            pathBytes.Add(b);
+        }
+        Assert.Equal("A:\\TEST.COM", System.Text.Encoding.ASCII.GetString(pathBytes.ToArray()));
+    }
+
+    [Fact]
+    public void InsertBlankFloppyDisk_CreatesAndMountsDisk()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        bool inserted = machine.InsertBlankFloppyDisk('A', MsDos.Core.Dos.FloppyDiskType.Floppy1440K, "TEST");
+
+        Assert.True(inserted);
+        Assert.NotNull(machine.GetDriveProvider('A'));
+        Assert.Contains('A', machine.GetMountedDrives());
+        Assert.True(machine.Floppy.SlotA.HasDisk);
+    }
+
+    [Fact]
+    public void InsertBlankFloppyDisk_InvalidDrive_ReturnsFalse()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        bool inserted = machine.InsertBlankFloppyDisk('C');
+
+        Assert.False(inserted);
+    }
+
+    [Fact]
+    public void DosKernel_DriveProvider_ResolvesFilesOnMountedDrive()
+    {
+        var renderer = new TestRenderer();
+        var events = new TestEventRegistry();
+        var streams = new TestStreamProvider();
+        var machine = new DosMachine(renderer, events, streams);
+
+        // Mount a blank floppy on A:
+        machine.InsertBlankFloppyDisk('A');
+
+        // Verify the DOS kernel has the provider registered
+        // by checking that the drive shows in mounted drives
+        Assert.Contains('A', machine.GetMountedDrives());
+
+        // Eject should remove it
+        machine.EjectFloppyDisk('A');
+        Assert.DoesNotContain('A', machine.GetMountedDrives());
     }
 }

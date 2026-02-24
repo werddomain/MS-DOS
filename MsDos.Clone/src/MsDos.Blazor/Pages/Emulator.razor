@@ -52,6 +52,7 @@
                 </label>
                 <button class="btn btn-sm btn-orange" disabled="@(!hasDisk)" @onclick="() => OnEjectFloppy(drive)">Eject</button>
                 <button class="btn btn-sm btn-blue" disabled="@(!hasDisk)" @onclick="() => OnSaveFloppy(drive)">Save</button>
+                <button class="btn btn-sm" @onclick="() => OnInsertBlankFloppy(drive)">Blank</button>
             </div>
         }
     </div>
@@ -297,6 +298,27 @@
             _ => FloppyDiskType.Floppy1440K,
         };
         _machine.Floppy.SetDiskType(drive, diskType);
+    }
+
+    private void OnInsertBlankFloppy(char drive)
+    {
+        if (_machine == null) return;
+
+        // Default to 1.44MB; ideally pick from the drive type selector
+        var diskType = _machine.Floppy.GetSlot(drive)?.DiskType ?? FloppyDiskType.Floppy1440K;
+        bool ok = _machine.InsertBlankFloppyDisk(drive, diskType);
+        if (ok)
+        {
+            _statusText = $"Blank {diskType} disk inserted into {drive}:";
+            // Update floppy slot display state
+            if (drive == 'A') { _slotAHasDisk = true; _slotALabel = "Blank Floppy"; }
+            else { _slotBHasDisk = true; _slotBLabel = "Blank Floppy"; }
+        }
+        else
+        {
+            _statusText = $"Failed to create blank disk for {drive}:";
+        }
+        StateHasChanged();
     }
 
     // ── Debug controls ──

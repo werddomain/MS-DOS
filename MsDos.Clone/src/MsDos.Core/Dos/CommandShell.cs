@@ -483,8 +483,14 @@ public sealed class CommandShell
                     var savedDrive = _currentDrive;
                     var savedDir = _currentDir;
 
+                    // Build full program path for the environment block
+                    string programPath = $"{_currentDrive}:\\{path}";
+
                     PrintLine($"Loading {path}...");
-                    bool loaded = _machine.LoadBinary(data, args);
+                    bool loaded = _machine.LoadBinary(data, args, programPath);
+
+                    // Set the DosKernel's current drive to match the shell's
+                    _machine.Dos.SetCurrentDrive((byte)(_currentDrive - 'A'));
                     if (!loaded)
                     {
                         PrintLine($"Error loading {path} - unsupported format");

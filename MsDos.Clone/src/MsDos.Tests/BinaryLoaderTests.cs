@@ -100,4 +100,90 @@ public class BinaryLoaderTests
         // Single byte COM is valid
         Assert.True(result);
     }
+
+    [Fact]
+    public void BuildPSP_EnvironmentContainsProgramPath()
+    {
+        byte[] com = { 0x90 };
+        _loader.Load(com, programPath: "A:\\RUNME.EXE");
+
+        // Read environment segment from PSP at offset 0x002C
+        ushort envSeg = _mem.ReadWord(0x1000, 0x002C);
+
+        // The environment should contain "PATH=C:\" + \0 + \0 + WORD(1) + "A:\RUNME.EXE" + \0
+        // Find the double-null terminator
+        int offset = 0;
+        while (offset < 256)
+        {
+            byte b = _mem.ReadByte(envSeg, (ushort)offset);
+            if (b == 0)
+            {
+                offset++;
+                byte next = _mem.ReadByte(envSeg, (ushort)offset);
+                if (next == 0)
+                {
+                    offset++; // past double-null
+                    break;
+                }
+            }
+            else
+            {
+                offset++;
+            }
+        }
+
+        // After double-null: WORD count should be 1
+        ushort count = _mem.ReadWord(envSeg, (ushort)offset);
+        Assert.Equal(1, count);
+        offset += 2;
+
+        // Then the program path string
+        var pathBytes = new System.Collections.Generic.List<byte>();
+        for (int i = 0; i < 50; i++)
+        {
+            byte b = _mem.ReadByte(envSeg, (ushort)(offset + i));
+            if (b == 0) break;
+            pathBytes.Add(b);
+        }
+        string programPath = System.Text.Encoding.ASCII.GetString(pathBytes.ToArray());
+        Assert.Equal("A:\\RUNME.EXE", programPath);
+    }
+
+    [Fact]
+    public void BuildPSP_DefaultProgramPathWhenNoneProvided()
+    {
+        byte[] com = { 0x90 };
+        _loader.Load(com); // no programPath
+
+        ushort envSeg = _mem.ReadWord(0x1000, 0x002C);
+
+        // Scan past environment strings to find program path
+        int offset = 0;
+        while (offset < 256)
+        {
+            byte b = _mem.ReadByte(envSeg, (ushort)offset);
+            if (b == 0)
+            {
+                offset++;
+                byte next = _mem.ReadByte(envSeg, (ushort)offset);
+                if (next == 0) { offset++; break; }
+            }
+            else offset++;
+        }
+
+        // Should have default path
+        ushort count = _mem.ReadWord(envSeg, (ushort)offset);
+        Assert.Equal(1, count);
+        offset += 2;
+
+        var pathBytes = new System.Collections.Generic.List<byte>();
+        for (int i = 0; i < 50; i++)
+        {
+            byte b = _mem.ReadByte(envSeg, (ushort)(offset + i));
+            if (b == 0) break;
+            pathBytes.Add(b);
+        }
+        string path = System.Text.Encoding.ASCII.GetString(pathBytes.ToArray());
+        Assert.Equal("C:\\PROGRAM.EXE", path);
+    }
 }
