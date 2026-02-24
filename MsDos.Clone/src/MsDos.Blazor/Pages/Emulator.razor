@@ -458,7 +458,7 @@
     {
         if (_machine == null) return;
 
-        // Download from C: drive by default (first non-empty drive)
+        // Get first available drive
         var drives = _machine.GetMountedDrives();
         if (drives.Count == 0) { _statusText = "No drives mounted"; return; }
 
@@ -471,18 +471,28 @@
             return;
         }
 
-        // Download the first file as a demo — in a real UI you'd have a file picker
-        string filename = files[0];
-        byte[]? data = await _machine.DownloadFileFromDriveAsync(drive, filename);
+        // Prompt user for which file to download
+        string fileList = string.Join(", ", files);
+        string filename = await JS.InvokeAsync<string>("prompt",
+            $"Enter filename to download from {drive}: (available: {fileList}):", files[0]);
+
+        if (string.IsNullOrWhiteSpace(filename))
+        {
+            _statusText = "Download cancelled";
+            StateHasChanged();
+            return;
+        }
+
+        byte[]? data = await _machine.DownloadFileFromDriveAsync(drive, filename.Trim());
         if (data != null)
         {
             var base64 = Convert.ToBase64String(data);
-            await JS.InvokeVoidAsync("dosRenderer.downloadFile", filename, base64);
-            _statusText = $"Downloaded '{filename}' from {drive}: ({data.Length} bytes)";
+            await JS.InvokeVoidAsync("dosRenderer.downloadFile", filename.Trim(), base64);
+            _statusText = $"Downloaded '{filename.Trim()}' from {drive}: ({data.Length} bytes)";
         }
         else
         {
-            _statusText = $"Failed to download '{filename}' from {drive}:";
+            _statusText = $"File '{filename.Trim()}' not found on {drive}:";
         }
         StateHasChanged();
     }

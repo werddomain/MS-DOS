@@ -1116,7 +1116,7 @@ public partial class MainForm : Form
             if (dosName != null)
                 _statusLabel.Text = $"Uploaded '{filename}' → '{dosName}' to {drive}:";
             else
-                MessageBox.Show($"Failed to upload file to {drive}:", "Error",
+                MessageBox.Show($"Failed to upload file to drive {drive}", "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         catch (Exception ex)

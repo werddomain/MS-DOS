@@ -101,6 +101,11 @@ html, body {
     transition: color 0.15s;
 }
 
+.activity-led.led-off {
+    color: #555;
+    text-shadow: none;
+}
+
 .led-hdd-active {
     color: #ff8800;
     text-shadow: 0 0 4px #ff8800;

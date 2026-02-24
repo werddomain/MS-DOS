@@ -17,8 +17,8 @@ public static class DosFileName
     ///   "longfilename.backup"   → "LONGFILE.BAC"
     ///   "readme"                → "README"
     ///   ".hidden"               → "HIDDEN"
-    ///   "hello world.doc"       → "HELLOWOR.DOC"
-    ///   "file...name.c"         → "FILE___.C" (dots become underscores except last)
+    ///   "hello world.doc"       → "HELLO_WO.DOC"
+    ///   "file...name.c"         → "FILE...N.C" (dots kept in base, split at last dot)
     /// </summary>
     /// <param name="filename">The modern filename to convert.</param>
     /// <returns>A valid DOS 8.3 filename.</returns>
