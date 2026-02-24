@@ -11,10 +11,18 @@
     <div class="toolbar">
         <h3>MS-DOS Emulator (.NET WebAssembly)</h3>
         <div class="controls">
+            <button class="btn @(_poweredOn ? "btn-danger" : "btn-success")" @onclick="OnTogglePower">
+                @(_poweredOn ? "⏻ Power Off" : "⏻ Power On")
+            </button>
             <label class="btn btn-secondary">
                 Load Binary
                 <InputFile OnChange="OnFileSelected" accept=".com,.exe,.COM,.EXE" style="display:none" />
             </label>
+            <label class="btn btn-secondary">
+                Upload File
+                <InputFile OnChange="OnUploadFile" accept="*" style="display:none" />
+            </label>
+            <button class="btn btn-secondary" @onclick="OnDownloadFile">Download File</button>
             <label class="btn btn-secondary">
                 Import C:
                 <InputFile OnChange="OnImportCDrive" accept=".img,.raw,.ima,.dsk,.IMG,.RAW,.IMA,.DSK" style="display:none" />
@@ -63,6 +71,10 @@
     </div>
 
     <div class="status-bar">
+        <div class="activity-leds">
+            <span class="activity-led @(_hddActive ? "led-hdd-active" : "led-off")" title="HDD">● HDD</span>
+            <span class="activity-led @(_cpuActive ? "led-cpu-active" : "led-off")" title="CPU">● CPU</span>
+        </div>
         <span>@_statusText</span>
         @if (_biosWaitPending)
         {
@@ -145,6 +157,11 @@
     private bool _slotAReading, _slotAWriting, _slotAHasDisk;
     private bool _slotBReading, _slotBWriting, _slotBHasDisk;
 
+    // Activity LED state
+    private bool _hddActive;
+    private bool _cpuActive;
+    private bool _poweredOn;
+
     // Debug state
     private bool _manualClock;
     private bool _traceEnabled;
@@ -181,6 +198,7 @@
             while (await timer.WaitForNextTickAsync(token))
             {
                 _machine?.PumpBiosWaitFromHostClock();
+                _machine?.PumpActivityLeds();
 
                 bool pending = _machine?.IsBiosWaitPending == true;
                 if (pending != _biosWaitPending)
@@ -242,6 +260,14 @@
             InvokeAsync(() => { _slotAHasDisk = slot.HasDisk; _slotALabel = slot.DiskLabel ?? "Empty"; StateHasChanged(); });
         _machine.Floppy.SlotB.DiskChanged += slot =>
             InvokeAsync(() => { _slotBHasDisk = slot.HasDisk; _slotBLabel = slot.DiskLabel ?? "Empty"; StateHasChanged(); });
+
+        // Wire HDD / CPU activity LEDs
+        _machine.OnDiskActivity += active =>
+            InvokeAsync(() => { _hddActive = active; StateHasChanged(); });
+        _machine.OnCpuActivity += active =>
+            InvokeAsync(() => { _cpuActive = active; StateHasChanged(); });
+        _machine.OnPowerStateChanged += powered =>
+            InvokeAsync(() => { _poweredOn = powered; StateHasChanged(); });
 
         _machine.Reset();
     }
@@ -361,6 +387,112 @@
         else
         {
             _statusText = $"Failed to create blank disk for {drive}:";
+        }
+        StateHasChanged();
+    }
+
+    // ── Power On/Off ──
+    private async Task OnTogglePower()
+    {
+        if (_machine == null) return;
+
+        if (_machine.IsPoweredOn)
+        {
+            _cts?.Cancel();
+            _machine.PowerOff();
+            _running = false;
+            _statusText = "Power OFF — insert a floppy and press Power On";
+            StateHasChanged();
+        }
+        else
+        {
+            _cts?.Cancel();
+            _cts = new CancellationTokenSource();
+            _running = true;
+            _loaded = true;
+            _statusText = "Power ON — booting...";
+            StateHasChanged();
+
+            await _containerRef.FocusAsync();
+
+            try
+            {
+                await _machine.PowerOnAsync(_cts.Token);
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                _running = false;
+                StateHasChanged();
+            }
+        }
+    }
+
+    // ── File Upload / Download ──
+    private async Task OnUploadFile(InputFileChangeEventArgs e)
+    {
+        if (_machine == null) return;
+        var file = e.File;
+        if (file == null) return;
+
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+
+            // Upload to the current active drive (prefer A: if mounted, else C:)
+            var drives = _machine.GetMountedDrives();
+            char targetDrive = drives.Contains('A') ? 'A' : 'C';
+
+            string? dosName = await _machine.UploadFileToDriveAsync(targetDrive, file.Name, data);
+            _statusText = dosName != null
+                ? $"Uploaded '{file.Name}' → '{dosName}' to {targetDrive}:"
+                : $"Failed to upload file to {targetDrive}:";
+            StateHasChanged();
+        }
+        catch (Exception ex) { _statusText = $"Upload error: {ex.Message}"; }
+    }
+
+    private async Task OnDownloadFile()
+    {
+        if (_machine == null) return;
+
+        // Get first available drive
+        var drives = _machine.GetMountedDrives();
+        if (drives.Count == 0) { _statusText = "No drives mounted"; return; }
+
+        char drive = drives[0];
+        var files = await _machine.ListDriveFilesAsync(drive);
+        if (files == null || files.Count == 0)
+        {
+            _statusText = $"No files on {drive}:";
+            StateHasChanged();
+            return;
+        }
+
+        // Prompt user for which file to download
+        string fileList = string.Join(", ", files);
+        string filename = await JS.InvokeAsync<string>("prompt",
+            $"Enter filename to download from {drive}: (available: {fileList}):", files[0]);
+
+        if (string.IsNullOrWhiteSpace(filename))
+        {
+            _statusText = "Download cancelled";
+            StateHasChanged();
+            return;
+        }
+
+        byte[]? data = await _machine.DownloadFileFromDriveAsync(drive, filename.Trim());
+        if (data != null)
+        {
+            var base64 = Convert.ToBase64String(data);
+            await JS.InvokeVoidAsync("dosRenderer.downloadFile", filename.Trim(), base64);
+            _statusText = $"Downloaded '{filename.Trim()}' from {drive}: ({data.Length} bytes)";
+        }
+        else
+        {
+            _statusText = $"File '{filename.Trim()}' not found on {drive}:";
         }
         StateHasChanged();
     }

@@ -277,4 +277,14 @@ public sealed class DiskImageWriter
 
     private static ushort ReadUInt16(byte[] data, int offset) =>
         (ushort)(data[offset] | (data[offset + 1] << 8));
+
+    /// <summary>
+    /// Write files into an existing disk image (appends to the directory).
+    /// Does NOT reformat — preserves existing files.
+    /// Returns the modified image, or null on failure.
+    /// </summary>
+    public static byte[] WriteFilesToExistingImage(byte[] image, IReadOnlyList<(string Name, byte[] Data)> newFiles)
+    {
+        return WriteFiles(image, newFiles);
+    }
 }

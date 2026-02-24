@@ -70,6 +70,9 @@ public sealed class DosKernel
     /// <summary>Environment segment for the current process.</summary>
     public ushort EnvironmentSegment { get; set; }
 
+    /// <summary>Optional callback invoked on file I/O operations (for disk activity LED).</summary>
+    public Action? OnFileIo { get; set; }
+
     /// <summary>Attach the memory manager for INT 21h/48-4Ah.</summary>
     public void SetMemoryManager(MemoryManager manager) => _memoryManager = manager;
 
@@ -164,6 +167,11 @@ public sealed class DosKernel
     public void Handle()
     {
         byte func = _cpu.Regs.AH;
+
+        // Notify disk activity for file I/O functions
+        if (func is (>= 0x3C and <= 0x46) or 0x4E or 0x4F or 0x56 or 0x5A or 0x5B or 0x6C)
+            OnFileIo?.Invoke();
+
         switch (func)
         {
             case 0x00: // Terminate program
