@@ -21,10 +21,11 @@ public sealed class IOPortBus
     /// </summary>
     public void Register(ushort startPort, ushort endPort, PortReadHandler? reader, PortWriteHandler? writer)
     {
-        for (ushort p = startPort; p <= endPort; p++)
+        // Use int to avoid ushort overflow when endPort == 0xFFFF
+        for (int p = startPort; p <= endPort; p++)
         {
-            if (reader != null) _readers[p] = reader;
-            if (writer != null) _writers[p] = writer;
+            if (reader != null) _readers[(ushort)p] = reader;
+            if (writer != null) _writers[(ushort)p] = writer;
         }
     }
 

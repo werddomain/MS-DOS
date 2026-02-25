@@ -32,10 +32,13 @@ public sealed class InterruptController
         if (_handlers.TryGetValue(vector, out var handler))
         {
             handler();
-            // Pop the saved IP, CS, Flags that CPU pushed (handler replaces execution)
+            // Pop the saved IP, CS, Flags that CPU pushed
             _cpu.Regs.IP = Pop();
             _cpu.Regs.CS = Pop();
-            _cpu.Regs.Flags = (CpuFlags)Pop();
+            ushort savedFlags = Pop(); // Clean up stack but DON'T restore
+            // Keep the handler's flag modifications (e.g., carry flag for error indication).
+            // Only restore Interrupt flag (IF) which was cleared by the INT instruction.
+            _cpu.Regs.Flags |= (CpuFlags)(savedFlags & (ushort)CpuFlags.Interrupt);
         }
         else
         {

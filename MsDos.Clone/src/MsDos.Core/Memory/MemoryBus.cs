@@ -61,11 +61,19 @@ public sealed class MemoryBus
     public void WriteByte(ushort segment, ushort offset, byte value) =>
         WriteByte(Cpu.Registers.PhysicalAddress(segment, offset), value);
 
-    public ushort ReadWord(ushort segment, ushort offset) =>
-        ReadWord(Cpu.Registers.PhysicalAddress(segment, offset));
+    public ushort ReadWord(ushort segment, ushort offset)
+    {
+        // Offset wraps at 16 bits within the segment (real 8088 behavior)
+        return (ushort)(ReadByte(Cpu.Registers.PhysicalAddress(segment, offset))
+            | (ReadByte(Cpu.Registers.PhysicalAddress(segment, (ushort)(offset + 1))) << 8));
+    }
 
-    public void WriteWord(ushort segment, ushort offset, ushort value) =>
-        WriteWord(Cpu.Registers.PhysicalAddress(segment, offset), value);
+    public void WriteWord(ushort segment, ushort offset, ushort value)
+    {
+        // Offset wraps at 16 bits within the segment (real 8088 behavior)
+        WriteByte(Cpu.Registers.PhysicalAddress(segment, offset), (byte)value);
+        WriteByte(Cpu.Registers.PhysicalAddress(segment, (ushort)(offset + 1)), (byte)(value >> 8));
+    }
 
     public uint ReadDword(ushort segment, ushort offset) =>
         ReadDword(Cpu.Registers.PhysicalAddress(segment, offset));

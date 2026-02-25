@@ -168,6 +168,9 @@ public sealed class DosKernel
     {
         byte func = _cpu.Regs.AH;
 
+        // Default: clear carry flag (success). Individual handlers set carry on error.
+        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+
         // Notify disk activity for file I/O functions
         if (func is (>= 0x3C and <= 0x46) or 0x4E or 0x4F or 0x56 or 0x5A or 0x5B or 0x6C)
             OnFileIo?.Invoke();

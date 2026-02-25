@@ -17,6 +17,7 @@ public sealed class Cpu8086
     private bool _waitingForInput; // set by INT handlers when no key is available
     private int? _segmentOverride; // null = default, 0-3 = ES/CS/SS/DS
     private bool _operandSize32;   // 0x66 prefix active: use 32-bit operands
+    private bool _repPrefix;       // REP/REPNE preceding non-string instruction (8088 IDIV quirk)
 
     // ModR/M address cache: prevents double-decode when an instruction both reads and writes
     // the same ModR/M operand (e.g., ADD [BX+disp], reg). Without caching, the displacement
@@ -82,6 +83,7 @@ public sealed class Cpu8086
         _segmentOverride = null;
         _modrmCached = false;
         _operandSize32 = false;
+        _repPrefix = false;
 
         bool wasTrap = GetFlag(CpuFlags.Trap);
         int cycles = DecodeAndExecute();
@@ -420,7 +422,7 @@ public sealed class Cpu8086
                 }
                 else
                     SetFlag(CpuFlags.AuxCarry, false);
-                if (oldAL > 0x99 || oldCF)
+                if (oldAL >= 0xA0 || oldCF)
                 {
                     Regs.AL += 0x60;
                     SetFlag(CpuFlags.Carry, true);
@@ -434,8 +436,6 @@ public sealed class Cpu8086
             case 0x2E: _segmentOverride = 1; return DecodeAndExecute(); // CS:
             case 0x36: _segmentOverride = 2; return DecodeAndExecute(); // SS:
             case 0x3E: _segmentOverride = 3; return DecodeAndExecute(); // DS:
-            case 0x64: _segmentOverride = 4; return DecodeAndExecute(); // FS: (386+)
-            case 0x65: _segmentOverride = 5; return DecodeAndExecute(); // GS: (386+)
 
             // --- SUB ---
             case 0x28: modrm = FetchByte(); WriteModRM8(modrm, Sub8(ReadModRM8(modrm), Regs.GetReg8((modrm >> 3) & 7))); return 3;
@@ -454,12 +454,12 @@ public sealed class Cpu8086
                 if ((Regs.AL & 0x0F) > 9 || GetFlag(CpuFlags.AuxCarry))
                 {
                     Regs.AL -= 6;
-                    SetFlag(CpuFlags.Carry, oldCF || (oldAL < 6));
+                    SetFlag(CpuFlags.Carry, oldCF);
                     SetFlag(CpuFlags.AuxCarry, true);
                 }
                 else
                     SetFlag(CpuFlags.AuxCarry, false);
-                if (oldAL > 0x99 || oldCF)
+                if (oldAL >= 0xA0 || oldCF)
                 {
                     Regs.AL -= 0x60;
                     SetFlag(CpuFlags.Carry, true);
@@ -481,7 +481,9 @@ public sealed class Cpu8086
             {
                 if ((Regs.AL & 0x0F) > 9 || GetFlag(CpuFlags.AuxCarry))
                 {
-                    Regs.AX += 0x106;
+                    // Add 6 to AL and 1 to AH separately to avoid carry propagation
+                    Regs.AL = (byte)(Regs.AL + 6);
+                    Regs.AH = (byte)(Regs.AH + 1);
                     SetFlag(CpuFlags.AuxCarry, true);
                     SetFlag(CpuFlags.Carry, true);
                 }
@@ -538,6 +540,12 @@ public sealed class Cpu8086
             // --- PUSH reg16 (0x50-0x57) ---
             case >= 0x50 and <= 0x57:
                 if (_operandSize32) Push32(Regs.GetReg32(opcode - 0x50));
+                else if (opcode == 0x54)
+                {
+                    // 8086/8088 quirk: PUSH SP pushes the DECREMENTED value of SP
+                    Regs.SP -= 2;
+                    _mem.WriteWord(Regs.SS, Regs.SP, Regs.SP);
+                }
                 else Push(Regs.GetReg16(opcode - 0x50));
                 return 11;
 
@@ -642,8 +650,8 @@ public sealed class Cpu8086
             }
 
             // --- PUSHF / POPF ---
-            case 0x9C: if (_operandSize32) Push32((uint)Regs.Flags & 0xFFFF); else Push((ushort)Regs.Flags); return 10;
-            case 0x9D: if (_operandSize32) { Regs.Flags = (CpuFlags)((ushort)Pop32() | 0x0002); } else { Regs.Flags = (CpuFlags)(Pop() | 0x0002); } return 8;
+            case 0x9C: if (_operandSize32) Push32((uint)Regs.Flags & 0xFFFF); else Push((ushort)((ushort)Regs.Flags | 0xF002)); return 10; // 8086: bits 12-15 always 1
+            case 0x9D: if (_operandSize32) { Regs.Flags = (CpuFlags)((ushort)Pop32() | 0x0002); } else { Regs.Flags = (CpuFlags)((Pop() | 0xF002) & 0xFFD7); } return 8; // 8086: bits 12-15,1=1; bits 3,5=0
 
             // --- MOV AL/AX, [addr] ---
             case 0xA0: { ushort addr = FetchWord(); Regs.AL = _mem.ReadByte(GetDataSegment(), addr); } return 10;
@@ -685,12 +693,11 @@ public sealed class Cpu8086
                 else Regs.SetReg16(opcode - 0xB8, FetchWord());
                 return 4;
 
-            // --- Shift/rotate group (0xC0, 0xC1) ---
-            case 0xC0: return ExecuteShiftGroup_8(FetchByte(), FetchByte());
-            case 0xC1: { byte m = FetchByte(); byte c = FetchByte(); return _operandSize32 ? ExecuteShiftGroup_32(m, c) : ExecuteShiftGroup_16(m, c); }
-
             // --- RET near (with/without pop) ---
+            // 0xC0 and 0xC1 are 8088 aliases for 0xC2 and 0xC3 (186+ assigns them to shift/rotate with imm count)
+            case 0xC0:
             case 0xC2: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.SP += pop; } return 20;
+            case 0xC1:
             case 0xC3: Regs.IP = Pop(); return 8;
 
             // --- LES/LDS ---
@@ -698,11 +705,37 @@ public sealed class Cpu8086
             case 0xC5: modrm = FetchByte(); { var (seg, off) = DecodeModRM_Address(modrm); reg = (modrm >> 3) & 7; Regs.SetReg16(reg, _mem.ReadWord(seg, off)); Regs.DS = _mem.ReadWord(seg, (ushort)(off + 2)); } return 16;
 
             // --- MOV r/m, imm ---
-            case 0xC6: modrm = FetchByte(); WriteModRM8(modrm, FetchByte()); return 10;
-            case 0xC7: modrm = FetchByte(); if (_operandSize32) { WriteModRM32(modrm, FetchDword()); } else { WriteModRM16(modrm, FetchWord()); } return 10;
+            // Must decode ModR/M (consuming displacement) BEFORE fetching immediate
+            case 0xC6:
+            {
+                modrm = FetchByte();
+                if (((modrm >> 6) & 3) == 3)
+                    Regs.SetReg8(modrm & 7, FetchByte());
+                else
+                {
+                    var (seg, off) = DecodeModRM_Address(modrm);
+                    _mem.WriteByte(seg, off, FetchByte());
+                }
+                return 10;
+            }
+            case 0xC7:
+            {
+                modrm = FetchByte();
+                if (((modrm >> 6) & 3) == 3)
+                    Regs.SetReg16(modrm & 7, FetchWord());
+                else
+                {
+                    var (seg, off) = DecodeModRM_Address(modrm);
+                    _mem.WriteWord(seg, off, FetchWord());
+                }
+                return 10;
+            }
 
             // --- RET far (with/without pop) ---
+            // 0xC8 and 0xC9 are 8088 aliases for 0xCA and 0xCB (186+ assigns them to ENTER/LEAVE)
+            case 0xC8:
             case 0xCA: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.CS = Pop(); Regs.SP += pop; } return 25;
+            case 0xC9:
             case 0xCB: Regs.IP = Pop(); Regs.CS = Pop(); return 18;
 
             // --- INT ---
@@ -711,7 +744,7 @@ public sealed class Cpu8086
             case 0xCE: if (GetFlag(CpuFlags.Overflow)) TriggerInterrupt(4); return 4; // INTO
 
             // --- IRET ---
-            case 0xCF: Regs.IP = Pop(); Regs.CS = Pop(); Regs.Flags = (CpuFlags)Pop(); return 24;
+            case 0xCF: Regs.IP = Pop(); Regs.CS = Pop(); Regs.Flags = (CpuFlags)((Pop() | 0xF002) & 0xFFD7); return 24; // 8086: bits 12-15,1=1; bits 3,5=0
 
             // --- Shift/rotate group by 1 / CL ---
             case 0xD0: return ExecuteShiftGroup_8(FetchByte(), 1);
@@ -774,17 +807,6 @@ public sealed class Cpu8086
             // --- LOCK prefix (treat as NOP) ---
             case 0xF0: return DecodeAndExecute(); // LOCK prefix - execute next instruction without lock semantics
 
-            // --- Operand-size prefix (386+): switch to 32-bit operands ---
-            case 0x66:
-                _operandSize32 = true;
-                return DecodeAndExecute();
-
-            // --- Address-size prefix (386+): in 16-bit real mode this is mostly a no-op ---
-            case 0x67:
-                // In real mode with 16-bit default, 0x67 switches to 32-bit addressing.
-                // We treat it as transparent — most DOS programs don't use 32-bit addressing.
-                return DecodeAndExecute();
-
             // --- IN/OUT with I/O port bus ---
             case 0xE4: { byte port = FetchByte(); Regs.AL = _ports?.ReadByte(port) ?? 0xFF; } return 10; // IN AL, imm8
             case 0xE5: { byte port = FetchByte(); Regs.AX = _ports?.ReadWord(port) ?? 0xFFFF; } return 10; // IN AX, imm8
@@ -817,157 +839,25 @@ public sealed class Cpu8086
             case 0xFC: SetFlag(CpuFlags.Direction, false); return 2;
             case 0xFD: SetFlag(CpuFlags.Direction, true); return 2;
 
-            // --- PUSHA (80186+) ---
-            case 0x60:
-            {
-                if (_operandSize32)
-                {
-                    uint origESP = Regs.ESP;
-                    Push32(Regs.EAX); Push32(Regs.ECX); Push32(Regs.EDX); Push32(Regs.EBX);
-                    Push32(origESP); Push32(Regs.EBP); Push32(Regs.ESI); Push32(Regs.EDI);
-                }
-                else
-                {
-                    ushort origSP = Regs.SP;
-                    Push(Regs.AX); Push(Regs.CX); Push(Regs.DX); Push(Regs.BX);
-                    Push(origSP); Push(Regs.BP); Push(Regs.SI); Push(Regs.DI);
-                }
-                return 19;
-            }
-            // --- POPA (80186+) ---
-            case 0x61:
-            {
-                if (_operandSize32)
-                {
-                    Regs.EDI = Pop32(); Regs.ESI = Pop32(); Regs.EBP = Pop32();
-                    Pop32(); // skip ESP
-                    Regs.EBX = Pop32(); Regs.EDX = Pop32(); Regs.ECX = Pop32(); Regs.EAX = Pop32();
-                }
-                else
-                {
-                    Regs.DI = Pop(); Regs.SI = Pop(); Regs.BP = Pop();
-                    Pop(); // skip SP
-                    Regs.BX = Pop(); Regs.DX = Pop(); Regs.CX = Pop(); Regs.AX = Pop();
-                }
-                return 19;
-            }
-
-            // --- BOUND (80186+) ---
-            case 0x62:
-            {
-                modrm = FetchByte();
-                reg = (modrm >> 3) & 7;
-                short val = (short)Regs.GetReg16(reg);
-                var (bseg, boff) = DecodeModRM_Address(modrm);
-                short lower = (short)_mem.ReadWord(bseg, boff);
-                short upper = (short)_mem.ReadWord(bseg, (ushort)(boff + 2));
-                if (val < lower || val > upper)
-                    TriggerInterrupt(5);
-                return 10;
-            }
-
-            // --- PUSH imm16 (80186+) ---
-            case 0x68: if (_operandSize32) Push32(FetchDword()); else Push(FetchWord()); return 3;
-            // --- IMUL r16, r/m16, imm16 (80186+) ---
-            case 0x69:
-            {
-                modrm = FetchByte();
-                reg = (modrm >> 3) & 7;
-                if (_operandSize32)
-                {
-                    long src = (int)ReadModRM32(modrm);
-                    long imm = (int)FetchDword();
-                    long result = src * imm;
-                    Regs.SetReg32(reg, (uint)result);
-                    bool highSet = result != (int)result;
-                    SetFlag(CpuFlags.Carry, highSet);
-                    SetFlag(CpuFlags.Overflow, highSet);
-                }
-                else
-                {
-                    int src = (short)ReadModRM16(modrm);
-                    int imm = (short)FetchWord();
-                    int result = src * imm;
-                    Regs.SetReg16(reg, (ushort)result);
-                    bool highSet = result != (short)result;
-                    SetFlag(CpuFlags.Carry, highSet);
-                    SetFlag(CpuFlags.Overflow, highSet);
-                }
-                return 21;
-            }
-            // --- PUSH imm8 sign-extended (80186+) ---
-            case 0x6A: if (_operandSize32) Push32((uint)(int)(sbyte)FetchByte()); else Push((ushort)(short)(sbyte)FetchByte()); return 3;
-            // --- IMUL r16, r/m16, imm8 (80186+) ---
-            case 0x6B:
-            {
-                modrm = FetchByte();
-                reg = (modrm >> 3) & 7;
-                if (_operandSize32)
-                {
-                    long src = (int)ReadModRM32(modrm);
-                    long imm = (sbyte)FetchByte();
-                    long result = src * imm;
-                    Regs.SetReg32(reg, (uint)result);
-                    bool highSet = result != (int)result;
-                    SetFlag(CpuFlags.Carry, highSet);
-                    SetFlag(CpuFlags.Overflow, highSet);
-                }
-                else
-                {
-                    int src = (short)ReadModRM16(modrm);
-                    int imm = (sbyte)FetchByte();
-                    int result = src * imm;
-                    Regs.SetReg16(reg, (ushort)result);
-                    bool highSet = result != (short)result;
-                    SetFlag(CpuFlags.Carry, highSet);
-                    SetFlag(CpuFlags.Overflow, highSet);
-                }
-                return 21;
-            }
-
-            // --- INS/OUTS (80186+) — read from / write to I/O port DX ---
-            case 0x6C: // INSB: read byte from port DX, store at ES:DI
-                _mem.WriteByte(Regs.ES, Regs.DI, _ports?.ReadByte(Regs.DX) ?? 0xFF);
-                Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -1 : 1));
-                return 14;
-            case 0x6D: // INSW: read word from port DX, store at ES:DI
-                _mem.WriteWord(Regs.ES, Regs.DI, _ports?.ReadWord(Regs.DX) ?? 0xFFFF);
-                Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -2 : 2));
-                return 14;
-            case 0x6E: // OUTSB: write byte from DS:SI to port DX
-                _ports?.WriteByte(Regs.DX, _mem.ReadByte(GetDataSegment(), Regs.SI));
-                Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -1 : 1));
-                return 14;
-            case 0x6F: // OUTSW: write word from DS:SI to port DX
-                _ports?.WriteWord(Regs.DX, _mem.ReadWord(GetDataSegment(), Regs.SI));
-                Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -2 : 2));
-                return 14;
-
-            // --- ENTER (80186+) ---
-            case 0xC8:
-            {
-                ushort frameSize = FetchWord();
-                byte nestLevel = (byte)(FetchByte() & 0x1F);
-                Push(Regs.BP);
-                ushort framePtr = Regs.SP;
-                if (nestLevel > 0)
-                {
-                    for (int i = 1; i < nestLevel; i++)
-                    {
-                        Regs.BP -= 2;
-                        Push(_mem.ReadWord(Regs.SS, Regs.BP));
-                    }
-                    Push(framePtr);
-                }
-                Regs.BP = framePtr;
-                Regs.SP -= frameSize;
-                return 15;
-            }
-            // --- LEAVE (80186+) ---
-            case 0xC9:
-                Regs.SP = Regs.BP;
-                Regs.BP = Pop();
-                return 5;
+            // --- 8088 Jcc aliases (0x60-0x6F → same as 0x70-0x7F) ---
+            // On the 8088, these opcodes are undocumented aliases for conditional jumps.
+            // The microcode PLA ignores bit 4, so 0x6x maps to 0x7x. (186+ reassigned them.)
+            case 0x60: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JO alias
+            case 0x61: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNO alias
+            case 0x62: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JB alias
+            case 0x63: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNB alias
+            case 0x64: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JZ alias
+            case 0x65: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNZ alias
+            case 0x66: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Carry) || GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JBE alias
+            case 0x67: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Carry) && !GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JA alias
+            case 0x68: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JS alias
+            case 0x69: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNS alias
+            case 0x6A: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JP alias
+            case 0x6B: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNP alias
+            case 0x6C: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JL alias
+            case 0x6D: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JGE alias
+            case 0x6E: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Zero) || (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JLE alias
+            case 0x6F: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Zero) && (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JG alias
 
             // --- Two-byte opcodes (0x0F prefix) ---
             case 0x0F: return DecodeAndExecute0F();
@@ -986,13 +876,20 @@ public sealed class Cpu8086
     private void TriggerInterrupt(byte vector)
     {
         // Push flags, CS, IP (same as hardware interrupt)
-        Push((ushort)Regs.Flags);
+        // 8086: bits 12-15 always 1, bit 1 always 1 (same mask as PUSHF)
+        Push((ushort)((ushort)Regs.Flags | 0xF002));
         Push(Regs.CS);
         Push(Regs.IP);
         SetFlag(CpuFlags.Interrupt, false);
         SetFlag(CpuFlags.Trap, false);
 
+        // Load new CS:IP from Interrupt Vector Table (real 8088 behavior)
+        uint ivtAddr = (uint)(vector * 4);
+        Regs.IP = _mem.ReadWord(ivtAddr);
+        Regs.CS = _mem.ReadWord(ivtAddr + 2);
+
         // Notify registered handlers (DOS kernel, BIOS, etc.)
+        // Handlers can override CS:IP if they intercept the interrupt.
         InterruptTriggered?.Invoke(vector);
     }
 
@@ -1085,6 +982,17 @@ public sealed class Cpu8086
     private int ExecuteRep(bool isRepz)
     {
         byte nextOp = FetchByte();
+
+        // On the 8088, REP prefix only applies to string operations.
+        // For non-string opcodes, REP is ignored and the instruction executes normally.
+        bool isStringOp = nextOp is 0xA4 or 0xA5 or 0xA6 or 0xA7 or 0xAA or 0xAB or 0xAC or 0xAD or 0xAE or 0xAF;
+        if (!isStringOp)
+        {
+            _repPrefix = true; // 8088 quirk: affects IDIV sign correction
+            Regs.IP--; // un-read the byte
+            return DecodeAndExecute(); // execute normally, REP ignored
+        }
+
         int cycles = 0;
         bool isCompare = nextOp is 0xA6 or 0xA7 or 0xAE or 0xAF;
 
@@ -1093,12 +1001,7 @@ public sealed class Cpu8086
             Regs.CX--;
             switch (nextOp)
             {
-                // INS/OUTS
-                case 0x6C: _mem.WriteByte(Regs.ES, Regs.DI, _ports?.ReadByte(Regs.DX) ?? 0xFF); Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); break;
-                case 0x6D: _mem.WriteWord(Regs.ES, Regs.DI, _ports?.ReadWord(Regs.DX) ?? 0xFFFF); Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); break;
-                case 0x6E: _ports?.WriteByte(Regs.DX, _mem.ReadByte(GetDataSegment(), Regs.SI)); Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); break;
-                case 0x6F: _ports?.WriteWord(Regs.DX, _mem.ReadWord(GetDataSegment(), Regs.SI)); Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); break;
-                // String ops
+                // String ops (INS/OUTS 0x6C-0x6F don't exist on 8088 — those opcodes are Jcc aliases)
                 case 0xA4: ExecuteMovs(false); break;
                 case 0xA5: ExecuteMovs(true); break;
                 case 0xA6: ExecuteCmps(false); break;
@@ -1211,11 +1114,56 @@ public sealed class Cpu8086
             }
             case 6: // DIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { ushort dividend = Regs.AX; ushort q = (ushort)(dividend / val); if (q > 0xFF) { TriggerInterrupt(0); break; } Regs.AL = (byte)q; Regs.AH = (byte)(dividend % val); }
+                {
+                    ushort dividend = Regs.AX;
+                    ushort q = (ushort)(dividend / val);
+                    if (q > 0xFF)
+                    {
+                        // 8088: flags from internal overflow comparison (AH - divisor)
+                        Sub8(Regs.AH, val);
+                        TriggerInterrupt(0);
+                        break;
+                    }
+                    Regs.AL = (byte)q;
+                    Regs.AH = (byte)(dividend % val);
+                }
                 break;
             case 7: // IDIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { short dividend = (short)Regs.AX; short q = (short)(dividend / (sbyte)val); if (q > 127 || q < -128) { TriggerInterrupt(0); break; } Regs.AL = (byte)(sbyte)q; Regs.AH = (byte)(sbyte)(dividend % (sbyte)val); }
+                {
+                    int dividend = (short)Regs.AX;
+                    int divisor = (sbyte)val;
+                    int q = dividend / divisor;
+                    // 8088 quirk: REP/REPNE prefix negates the quotient sign
+                    if (_repPrefix) q = -q;
+                    if (q > 127 || q < -128)
+                    {
+                        // Compute flags from the 8088's internal division state
+                        ushort absDvd = (ushort)Math.Abs(dividend);
+                        byte absDvs = (byte)Math.Abs(divisor);
+                        byte absHigh = (byte)(absDvd >> 8);
+                        if (absHigh >= absDvs)
+                        {
+                            // Unsigned overflow: flags from initial comparison
+                            Sub8(absHigh, absDvs);
+                        }
+                        else
+                        {
+                            // Signed-only overflow: flags from last division step
+                            ushort unsignedQ = (ushort)(absDvd / absDvs);
+                            byte unsignedR = (byte)(absDvd % absDvs);
+                            if ((unsignedQ & 1) != 0)
+                                Sub8((byte)(unsignedR + absDvs), absDvs);
+                            else
+                                Sub8(unsignedR, absDvs);
+                            SetFlag(CpuFlags.Carry, false);
+                        }
+                        TriggerInterrupt(0);
+                        break;
+                    }
+                    Regs.AL = (byte)q;
+                    Regs.AH = (byte)(sbyte)(dividend % divisor);
+                }
                 break;
         }
         return 4;
@@ -1262,11 +1210,56 @@ public sealed class Cpu8086
             }
             case 6: // DIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { uint dividend = (uint)(Regs.DX << 16 | Regs.AX); uint q = dividend / val; if (q > 0xFFFF) { TriggerInterrupt(0); break; } Regs.AX = (ushort)q; Regs.DX = (ushort)(dividend % val); }
+                {
+                    uint dividend = (uint)((Regs.DX << 16) | Regs.AX);
+                    uint q = dividend / val;
+                    if (q > 0xFFFF)
+                    {
+                        // 8088: flags from internal overflow comparison (DX - divisor)
+                        Sub16(Regs.DX, val);
+                        TriggerInterrupt(0);
+                        break;
+                    }
+                    Regs.AX = (ushort)q;
+                    Regs.DX = (ushort)(dividend % val);
+                }
                 break;
             case 7: // IDIV
                 if (val == 0) { TriggerInterrupt(0); break; }
-                { int dividend = (Regs.DX << 16) | Regs.AX; int q = dividend / (short)val; if (q > 32767 || q < -32768) { TriggerInterrupt(0); break; } Regs.AX = (ushort)(short)q; Regs.DX = (ushort)(short)(dividend % (short)val); }
+                {
+                    long dividend = (int)((Regs.DX << 16) | Regs.AX);
+                    long divisor = (short)val;
+                    long q = dividend / divisor;
+                    // 8088 quirk: REP/REPNE prefix negates the quotient sign
+                    if (_repPrefix) q = -q;
+                    if (q > 32767 || q < -32768)
+                    {
+                        // Compute flags from the 8088's internal division state
+                        uint absDvd = (uint)Math.Abs(dividend);
+                        ushort absDvs = (ushort)Math.Abs(divisor);
+                        ushort absHigh = (ushort)(absDvd >> 16);
+                        if (absHigh >= absDvs)
+                        {
+                            // Unsigned overflow: flags from initial comparison
+                            Sub16(absHigh, absDvs);
+                        }
+                        else
+                        {
+                            // Signed-only overflow: flags from last division step
+                            uint unsignedQ = absDvd / absDvs;
+                            ushort unsignedR = (ushort)(absDvd % absDvs);
+                            if ((unsignedQ & 1) != 0)
+                                Sub16((ushort)(unsignedR + absDvs), absDvs);
+                            else
+                                Sub16(unsignedR, absDvs);
+                            SetFlag(CpuFlags.Carry, false);
+                        }
+                        TriggerInterrupt(0);
+                        break;
+                    }
+                    Regs.AX = (ushort)q;
+                    Regs.DX = (ushort)(short)(dividend % divisor);
+                }
                 break;
         }
         return 4;
@@ -1340,8 +1333,22 @@ public sealed class Cpu8086
                 return 18;
             }
             case 6: // PUSH r/m16
-                Push(ReadModRM16(modrm));
+            case 7: // Undocumented 8088 alias for PUSH r/m16
+            {
+                // 8086/8088 quirk: PUSH SP pushes the DECREMENTED value
+                int rm = modrm & 7;
+                int mod = (modrm >> 6) & 3;
+                if (mod == 3 && rm == 4) // register-direct SP
+                {
+                    Regs.SP -= 2;
+                    _mem.WriteWord(Regs.SS, Regs.SP, Regs.SP);
+                }
+                else
+                {
+                    Push(ReadModRM16(modrm));
+                }
                 return 16;
+            }
         }
         return 1;
     }
@@ -1350,7 +1357,7 @@ public sealed class Cpu8086
     {
         int op = (modrm >> 3) & 7;
         byte val = ReadModRM8(modrm);
-        count &= 0x1F;
+        // Note: 8088 does NOT mask count by 0x1F (that was added in 80186).
 
         for (int i = 0; i < count; i++)
         {
@@ -1361,6 +1368,8 @@ public sealed class Cpu8086
                     bool msb = (val & 0x80) != 0;
                     val = (byte)((val << 1) | (msb ? 1 : 0));
                     SetFlag(CpuFlags.Carry, msb);
+                    // OF = MSB(result) XOR CF
+                    SetFlag(CpuFlags.Overflow, ((val >> 7) ^ (val & 1)) != 0);
                     break;
                 }
                 case 1: // ROR
@@ -1368,6 +1377,8 @@ public sealed class Cpu8086
                     bool lsb = (val & 1) != 0;
                     val = (byte)((val >> 1) | (lsb ? 0x80 : 0));
                     SetFlag(CpuFlags.Carry, lsb);
+                    // OF = bit7 XOR bit6 of result
+                    SetFlag(CpuFlags.Overflow, (((val >> 7) ^ (val >> 6)) & 1) != 0);
                     break;
                 }
                 case 2: // RCL
@@ -1375,6 +1386,8 @@ public sealed class Cpu8086
                     bool cf = GetFlag(CpuFlags.Carry);
                     SetFlag(CpuFlags.Carry, (val & 0x80) != 0);
                     val = (byte)((val << 1) | (cf ? 1 : 0));
+                    // OF = MSB(result) XOR CF
+                    SetFlag(CpuFlags.Overflow, (((val >> 7) & 1) != 0) != GetFlag(CpuFlags.Carry));
                     break;
                 }
                 case 3: // RCR
@@ -1382,24 +1395,39 @@ public sealed class Cpu8086
                     bool cf = GetFlag(CpuFlags.Carry);
                     SetFlag(CpuFlags.Carry, (val & 1) != 0);
                     val = (byte)((val >> 1) | (cf ? 0x80 : 0));
+                    // OF = bit7 XOR bit6 of result
+                    SetFlag(CpuFlags.Overflow, (((val >> 7) ^ (val >> 6)) & 1) != 0);
                     break;
                 }
                 case 4: // SHL
-                case 6:
                     SetFlag(CpuFlags.Carry, (val & 0x80) != 0);
                     val <<= 1;
+                    // OF = MSB(result) XOR CF
+                    SetFlag(CpuFlags.Overflow, (((val >> 7) & 1) != 0) != GetFlag(CpuFlags.Carry));
+                    break;
+                case 6: // SETMO (undocumented 8088: set to all 1s)
+                    SetFlag(CpuFlags.Carry, (val & 0x80) != 0);
+                    val = 0xFF;
+                    SetFlag(CpuFlags.Overflow, (((val >> 7) & 1) != 0) != GetFlag(CpuFlags.Carry));
                     break;
                 case 5: // SHR
+                {
+                    bool oldMsb = (val & 0x80) != 0;
                     SetFlag(CpuFlags.Carry, (val & 1) != 0);
                     val >>= 1;
+                    // OF = MSB of original value (before shift)
+                    SetFlag(CpuFlags.Overflow, oldMsb);
                     break;
+                }
                 case 7: // SAR
                     SetFlag(CpuFlags.Carry, (val & 1) != 0);
                     val = (byte)((sbyte)val >> 1);
+                    // OF = 0 for SAR
+                    SetFlag(CpuFlags.Overflow, false);
                     break;
             }
         }
-        if (count > 0) UpdateFlags8(val);
+        if (count > 0 && op >= 4) UpdateFlags8(val); // SZP flags only for shifts, not rotates
         WriteModRM8(modrm, val);
         return 2 + count * 4;
     }
@@ -1408,7 +1436,7 @@ public sealed class Cpu8086
     {
         int op = (modrm >> 3) & 7;
         ushort val = ReadModRM16(modrm);
-        count &= 0x1F;
+        // Note: 8088 does NOT mask count by 0x1F (that was added in 80186).
 
         for (int i = 0; i < count; i++)
         {
@@ -1419,6 +1447,8 @@ public sealed class Cpu8086
                     bool msb = (val & 0x8000) != 0;
                     val = (ushort)((val << 1) | (msb ? 1 : 0));
                     SetFlag(CpuFlags.Carry, msb);
+                    // OF = MSB(result) XOR CF
+                    SetFlag(CpuFlags.Overflow, ((val >> 15) ^ (val & 1)) != 0);
                     break;
                 }
                 case 1: // ROR
@@ -1426,6 +1456,8 @@ public sealed class Cpu8086
                     bool lsb = (val & 1) != 0;
                     val = (ushort)((val >> 1) | (lsb ? 0x8000 : 0));
                     SetFlag(CpuFlags.Carry, lsb);
+                    // OF = bit15 XOR bit14 of result
+                    SetFlag(CpuFlags.Overflow, (((val >> 15) ^ (val >> 14)) & 1) != 0);
                     break;
                 }
                 case 2: // RCL
@@ -1433,6 +1465,8 @@ public sealed class Cpu8086
                     bool cf = GetFlag(CpuFlags.Carry);
                     SetFlag(CpuFlags.Carry, (val & 0x8000) != 0);
                     val = (ushort)((val << 1) | (cf ? 1 : 0));
+                    // OF = MSB(result) XOR CF
+                    SetFlag(CpuFlags.Overflow, (((val >> 15) & 1) != 0) != GetFlag(CpuFlags.Carry));
                     break;
                 }
                 case 3: // RCR
@@ -1440,24 +1474,39 @@ public sealed class Cpu8086
                     bool cf = GetFlag(CpuFlags.Carry);
                     SetFlag(CpuFlags.Carry, (val & 1) != 0);
                     val = (ushort)((val >> 1) | (cf ? 0x8000 : 0));
+                    // OF = bit15 XOR bit14 of result
+                    SetFlag(CpuFlags.Overflow, (((val >> 15) ^ (val >> 14)) & 1) != 0);
                     break;
                 }
-                case 4:
-                case 6: // SHL
+                case 4: // SHL
                     SetFlag(CpuFlags.Carry, (val & 0x8000) != 0);
                     val <<= 1;
+                    // OF = MSB(result) XOR CF
+                    SetFlag(CpuFlags.Overflow, (((val >> 15) & 1) != 0) != GetFlag(CpuFlags.Carry));
+                    break;
+                case 6: // SETMO (undocumented 8088: set to all 1s)
+                    SetFlag(CpuFlags.Carry, (val & 0x8000) != 0);
+                    val = 0xFFFF;
+                    SetFlag(CpuFlags.Overflow, (((val >> 15) & 1) != 0) != GetFlag(CpuFlags.Carry));
                     break;
                 case 5: // SHR
+                {
+                    bool oldMsb = (val & 0x8000) != 0;
                     SetFlag(CpuFlags.Carry, (val & 1) != 0);
                     val >>= 1;
+                    // OF = MSB of original value (before shift)
+                    SetFlag(CpuFlags.Overflow, oldMsb);
                     break;
+                }
                 case 7: // SAR
                     SetFlag(CpuFlags.Carry, (val & 1) != 0);
                     val = (ushort)((short)val >> 1);
+                    // OF = 0 for SAR
+                    SetFlag(CpuFlags.Overflow, false);
                     break;
             }
         }
-        if (count > 0) UpdateFlags16(val);
+        if (count > 0 && op >= 4) UpdateFlags16(val); // SZP flags only for shifts, not rotates
         WriteModRM16(modrm, val);
         return 2 + count * 4;
     }
