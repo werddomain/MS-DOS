@@ -14,6 +14,13 @@ public sealed class InterruptController
     private readonly MemoryBus _mem;
     private readonly Dictionary<byte, Action> _handlers = new();
 
+    /// <summary>
+    /// When true, only BIOS-level handlers (INT 08h-1Ah, 33h) are active.
+    /// DOS-level handlers (INT 20h-24h) are bypassed so the real DOS loaded
+    /// from disk can service those interrupts via the IVT.
+    /// </summary>
+    public bool NativeBootMode { get; set; }
+
     public InterruptController(Cpu8086 cpu, MemoryBus mem)
     {
         _cpu = cpu;
@@ -27,11 +34,23 @@ public sealed class InterruptController
         _handlers[vector] = handler;
     }
 
+    /// <summary>Unregister a managed handler for the given interrupt vector.</summary>
+    public void UnregisterHandler(byte vector)
+    {
+        _handlers.Remove(vector);
+    }
+
     private void OnInterrupt(byte vector)
     {
-        if (_handlers.TryGetValue(vector, out var handler))
+        // In native boot mode, skip managed DOS handlers (0x20-0x24, 0x25-0x28)
+        // so the real DOS loaded from disk can handle them via the IVT.
+        bool useManaged = _handlers.ContainsKey(vector);
+        if (useManaged && NativeBootMode && vector >= 0x20 && vector <= 0x28)
+            useManaged = false;
+
+        if (useManaged)
         {
-            handler();
+            _handlers[vector]();
             // Pop the saved IP, CS, Flags that CPU pushed
             _cpu.Regs.IP = Pop();
             _cpu.Regs.CS = Pop();

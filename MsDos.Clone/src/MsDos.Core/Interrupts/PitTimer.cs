@@ -29,6 +29,9 @@ public sealed class PitTimer
     /// <summary>Raised when Channel 0 counts to zero (IRQ 0 tick).</summary>
     public event Action? TimerTick;
 
+    /// <summary>Raised when Channel 2 reload value changes (for PC speaker).</summary>
+    public event Action<ushort>? Channel2OutputChanged;
+
     /// <summary>Whether Channel 2 output is high (speaker gate).</summary>
     public bool Channel2Output { get; private set; }
 
@@ -167,10 +170,12 @@ public sealed class PitTimer
             case 1: // Lo byte only
                 _reloadValue[channel] = (ushort)((_reloadValue[channel] & 0xFF00) | value);
                 _counter[channel] = _reloadValue[channel];
+                if (channel == 2) Channel2OutputChanged?.Invoke(_reloadValue[2]);
                 break;
             case 2: // Hi byte only
                 _reloadValue[channel] = (ushort)((_reloadValue[channel] & 0x00FF) | (value << 8));
                 _counter[channel] = _reloadValue[channel];
+                if (channel == 2) Channel2OutputChanged?.Invoke(_reloadValue[2]);
                 break;
             case 3: // Lo/Hi
                 if (!_writeHi[channel])
@@ -183,6 +188,7 @@ public sealed class PitTimer
                     _reloadValue[channel] = (ushort)((_reloadValue[channel] & 0x00FF) | (value << 8));
                     _counter[channel] = _reloadValue[channel];
                     _writeHi[channel] = false;
+                    if (channel == 2) Channel2OutputChanged?.Invoke(_reloadValue[2]);
                 }
                 break;
         }

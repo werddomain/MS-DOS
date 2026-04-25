@@ -377,3 +377,83 @@ html, body {
     .loading-progress-text:after {
         content: var(--blazor-load-percentage-text, "Loading");
     }
+
+/* ═══════════════════════════════════════════════════════════════
+   Virtual Keyboard
+   ═══════════════════════════════════════════════════════════════ */
+.vkb-container {
+    padding: 6px;
+    background: #1a1a2e;
+    border-top: 1px solid #333;
+}
+.vkb-combos {
+    display: flex;
+    gap: 4px;
+    padding: 4px 0 6px 0;
+    flex-wrap: wrap;
+}
+.vkb-combo-btn {
+    padding: 3px 8px;
+    font-size: 11px;
+    background: #2a4a6a;
+    color: #8cf;
+    border: 1px solid #3a5a8a;
+    border-radius: 3px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.vkb-combo-btn:hover { background: #3a6a9a; }
+.vkb-combo-btn:active { background: #4a8aba; }
+
+.vkb-keyboard {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.vkb-row {
+    display: flex;
+    gap: 3px;
+    justify-content: center;
+}
+.vkb-key {
+    min-width: 32px;
+    height: 30px;
+    padding: 2px 4px;
+    font-size: 11px;
+    font-family: Consolas, monospace;
+    background: #333;
+    color: #ddd;
+    border: 1px solid #555;
+    border-radius: 3px;
+    cursor: pointer;
+    box-sizing: border-box;
+    text-align: center;
+    line-height: 1.2;
+}
+.vkb-key:hover { background: #444; border-color: #777; }
+.vkb-key:active { background: #555; }
+
+.vkb-modifier { background: #2a2a4a; color: #aaf; border-color: #44a; }
+.vkb-modifier:hover { background: #3a3a6a; }
+.vkb-active { background: #4a4a9a !important; border-color: #88f !important; color: #fff !important; }
+
+/* Width multiplier classes */
+.vkb-w125 { min-width: 40px; }
+.vkb-w150 { min-width: 48px; }
+.vkb-w175 { min-width: 56px; }
+.vkb-w200 { min-width: 64px; }
+.vkb-w225 { min-width: 72px; }
+.vkb-w275 { min-width: 88px; }
+.vkb-w600 { min-width: 192px; flex-grow: 1; }
+
+.vkb-toggle-bar {
+    display: flex;
+    gap: 6px;
+    padding: 4px 8px;
+    background: #1a1a2e;
+    border-top: 1px solid #333;
+}
+.vkb-toggle-bar .btn-active {
+    background: #3a5a8a !important;
+    border-color: #5a8aba !important;
+}

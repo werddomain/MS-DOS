@@ -3,20 +3,34 @@ using MsDos.Core.Platform;
 
 namespace MsDos.Core.Cpu;
 
+/// <summary>CPU model selector for instruction set compatibility.</summary>
+public enum CpuModel
+{
+    /// <summary>Intel 8088/8086 — opcodes 0x60-0x6F are Jcc aliases; C0/C1 alias RET near; C8/C9 alias RET far.</summary>
+    Intel8088,
+    /// <summary>Intel 80186+ — 0x60-0x6F are PUSHA/POPA/BOUND/etc; C0/C1 shift by imm8; C8/C9 ENTER/LEAVE.</summary>
+    Intel80186,
+    /// <summary>Intel 80386 — adds 32-bit operand/address size prefixes (0x66/0x67).</summary>
+    Intel80386
+}
+
 /// <summary>
 /// Intel 8086 CPU emulator. Implements fetch-decode-execute cycle with
 /// support for the core instruction set needed to run DOS COM/EXE binaries.
 /// </summary>
 public sealed class Cpu8086
 {
+    /// <summary>CPU model — controls how ambiguous opcodes (0x60-0x6F, C0/C1, C8/C9) behave.</summary>
+    public CpuModel Model { get; set; } = CpuModel.Intel80386;
     public Registers Regs { get; } = new();
     private readonly MemoryBus _mem;
     private IOPortBus? _ports;
     private EmulatorLog? _log;
     private bool _halted;
     private bool _waitingForInput; // set by INT handlers when no key is available
-    private int? _segmentOverride; // null = default, 0-3 = ES/CS/SS/DS
+    private int? _segmentOverride; // null = default, 0-3 = ES/CS/SS/DS, 4=FS, 5=GS
     private bool _operandSize32;   // 0x66 prefix active: use 32-bit operands
+    private bool _addressSize32;   // 0x67 prefix active: use 32-bit addressing
     private bool _repPrefix;       // REP/REPNE preceding non-string instruction (8088 IDIV quirk)
 
     // ModR/M address cache: prevents double-decode when an instruction both reads and writes
@@ -25,6 +39,8 @@ public sealed class Cpu8086
     private bool _modrmCached;
     private ushort _modrmCacheSeg;
     private ushort _modrmCacheOff;
+
+    private Fpu8087? _fpu;
 
     /// <summary>Raised when an INT instruction is executed.</summary>
     public event Action<byte>? InterruptTriggered;
@@ -61,6 +77,9 @@ public sealed class Cpu8086
     /// <summary>Attach the I/O port bus for IN/OUT instructions.</summary>
     public void SetIOPortBus(IOPortBus ports) => _ports = ports;
 
+    /// <summary>Attach the x87 FPU coprocessor.</summary>
+    public void SetFpu(Fpu8087 fpu) => _fpu = fpu;
+
     public void SetLog(EmulatorLog log) => _log = log;
 
     public void Reset()
@@ -83,6 +102,7 @@ public sealed class Cpu8086
         _segmentOverride = null;
         _modrmCached = false;
         _operandSize32 = false;
+        _addressSize32 = false;
         _repPrefix = false;
 
         bool wasTrap = GetFlag(CpuFlags.Trap);
@@ -269,13 +289,13 @@ public sealed class Cpu8086
         return (bits & 1) == 0; // even parity
     }
 
-    private void SetFlag(CpuFlags flag, bool set)
+    public void SetFlag(CpuFlags flag, bool set)
     {
         if (set) Regs.Flags |= flag;
         else Regs.Flags &= ~flag;
     }
 
-    private bool GetFlag(CpuFlags flag) => (Regs.Flags & flag) != 0;
+    public bool GetFlag(CpuFlags flag) => (Regs.Flags & flag) != 0;
 
     private void UpdateFlags8(byte result)
     {
@@ -694,10 +714,14 @@ public sealed class Cpu8086
                 return 4;
 
             // --- RET near (with/without pop) ---
-            // 0xC0 and 0xC1 are 8088 aliases for 0xC2 and 0xC3 (186+ assigns them to shift/rotate with imm count)
+            // On 8088: C0=alias C2, C1=alias C3. On 186+: C0=shift/rotate rm8,imm8; C1=shift/rotate rm16,imm8.
             case 0xC0:
-            case 0xC2: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.SP += pop; } return 20;
+                if (Model == CpuModel.Intel8088) { ushort popC0 = FetchWord(); Regs.IP = Pop(); Regs.SP += popC0; return 20; }
+                { byte mC0 = FetchByte(); byte cntC0 = FetchByte(); return ExecuteShiftGroup_8(mC0, cntC0); } // shift/rotate r/m8, imm8 (186+)
             case 0xC1:
+                if (Model == CpuModel.Intel8088) { Regs.IP = Pop(); return 8; }
+                { byte mC1 = FetchByte(); byte cntC1 = FetchByte(); return _operandSize32 ? ExecuteShiftGroup_32(mC1, cntC1) : ExecuteShiftGroup_16(mC1, cntC1); } // shift/rotate r/m16, imm8 (186+)
+            case 0xC2: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.SP += pop; } return 20;
             case 0xC3: Regs.IP = Pop(); return 8;
 
             // --- LES/LDS ---
@@ -721,21 +745,59 @@ public sealed class Cpu8086
             case 0xC7:
             {
                 modrm = FetchByte();
-                if (((modrm >> 6) & 3) == 3)
-                    Regs.SetReg16(modrm & 7, FetchWord());
+                if (_operandSize32)
+                {
+                    if (((modrm >> 6) & 3) == 3)
+                        Regs.SetReg32(modrm & 7, FetchDword());
+                    else
+                    {
+                        var (seg, off) = DecodeModRM_Address(modrm);
+                        _mem.WriteDword(seg, off, FetchDword());
+                    }
+                }
                 else
                 {
-                    var (seg, off) = DecodeModRM_Address(modrm);
-                    _mem.WriteWord(seg, off, FetchWord());
+                    if (((modrm >> 6) & 3) == 3)
+                        Regs.SetReg16(modrm & 7, FetchWord());
+                    else
+                    {
+                        var (seg, off) = DecodeModRM_Address(modrm);
+                        _mem.WriteWord(seg, off, FetchWord());
+                    }
                 }
                 return 10;
             }
 
-            // --- RET far (with/without pop) ---
-            // 0xC8 and 0xC9 are 8088 aliases for 0xCA and 0xCB (186+ assigns them to ENTER/LEAVE)
+            // --- RET far / ENTER / LEAVE ---
+            // On 8088: C8=alias CA (RETF+pop), C9=alias CB (RETF). On 186+: C8=ENTER, C9=LEAVE.
             case 0xC8:
-            case 0xCA: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.CS = Pop(); Regs.SP += pop; } return 25;
+                if (Model == CpuModel.Intel8088) { ushort popC8 = FetchWord(); Regs.IP = Pop(); Regs.CS = Pop(); Regs.SP += popC8; return 25; }
+            {
+                // ENTER imm16, imm8 (186+)
+                ushort allocSize = FetchWord();
+                byte nestingLevel = (byte)(FetchByte() & 0x1F);
+                Push(Regs.BP);
+                ushort framePtr = Regs.SP;
+                if (nestingLevel > 0)
+                {
+                    for (int i = 1; i < nestingLevel; i++)
+                    {
+                        Regs.BP -= 2;
+                        Push(_mem.ReadWord(Regs.SS, Regs.BP));
+                    }
+                    Push(framePtr);
+                }
+                Regs.BP = framePtr;
+                Regs.SP -= allocSize;
+                return 15;
+            }
             case 0xC9:
+                if (Model == CpuModel.Intel8088) { Regs.IP = Pop(); Regs.CS = Pop(); return 18; }
+                // LEAVE (186+)
+                Regs.SP = Regs.BP;
+                Regs.BP = Pop();
+                return 4;
+            case 0xCA: { ushort pop = FetchWord(); Regs.IP = Pop(); Regs.CS = Pop(); Regs.SP += pop; } return 25;
             case 0xCB: Regs.IP = Pop(); Regs.CS = Pop(); return 18;
 
             // --- INT ---
@@ -781,12 +843,20 @@ public sealed class Cpu8086
                 return 11;
 
             // --- ESC (x87 FPU coprocessor escape) ---
-            // No FPU present: consume the ModR/M byte (and any displacement/operand it
-            // implies) so IP advances correctly, then treat as NOP.
             case 0xD8: case 0xD9: case 0xDA: case 0xDB:
             case 0xDC: case 0xDD: case 0xDE: case 0xDF:
-                SkipModRM();
+            {
+                byte fpOpcode = opcode;
+                modrm = FetchByte();
+                int fpMod = (modrm >> 6) & 3;
+                ushort fpSeg = 0, fpOff = 0;
+                if (fpMod != 3)
+                {
+                    (fpSeg, fpOff) = DecodeModRM_Address(modrm);
+                }
+                _fpu?.Execute(fpOpcode, modrm, fpSeg, fpOff);
                 return 2;
+            }
 
             // --- LOOP / LOOPcc ---
             case 0xE0: { sbyte off = (sbyte)FetchByte(); Regs.CX--; if (Regs.CX != 0 && !GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); } return 5; // LOOPNZ
@@ -839,25 +909,83 @@ public sealed class Cpu8086
             case 0xFC: SetFlag(CpuFlags.Direction, false); return 2;
             case 0xFD: SetFlag(CpuFlags.Direction, true); return 2;
 
-            // --- 8088 Jcc aliases (0x60-0x6F → same as 0x70-0x7F) ---
-            // On the 8088, these opcodes are undocumented aliases for conditional jumps.
-            // The microcode PLA ignores bit 4, so 0x6x maps to 0x7x. (186+ reassigned them.)
-            case 0x60: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JO alias
-            case 0x61: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNO alias
-            case 0x62: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JB alias
-            case 0x63: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNB alias
-            case 0x64: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JZ alias
-            case 0x65: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNZ alias
-            case 0x66: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Carry) || GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JBE alias
-            case 0x67: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Carry) && !GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JA alias
-            case 0x68: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JS alias
-            case 0x69: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNS alias
-            case 0x6A: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JP alias
-            case 0x6B: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JNP alias
-            case 0x6C: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JL alias
-            case 0x6D: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JGE alias
-            case 0x6E: { sbyte off = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Zero) || (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JLE alias
-            case 0x6F: { sbyte off = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Zero) && (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off); return 4; } // JG alias
+            // --- 0x60-0x6F: On 8088 these are Jcc aliases; on 186+ they are new instructions ---
+            case 0x60:
+                if (Model == CpuModel.Intel8088) { sbyte off60 = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off60); return 4; } // JO alias
+                if (_operandSize32) { Push32(Regs.EAX); Push32(Regs.ECX); Push32(Regs.EDX); Push32(Regs.EBX); uint tmpESP = Regs.ESP; Push32(tmpESP); Push32(Regs.EBP); Push32(Regs.ESI); Push32(Regs.EDI); } // PUSHAD
+                else { Push(Regs.AX); Push(Regs.CX); Push(Regs.DX); Push(Regs.BX); ushort tmpSP60 = Regs.SP; Push(tmpSP60); Push(Regs.BP); Push(Regs.SI); Push(Regs.DI); } // PUSHA
+                return 19;
+            case 0x61:
+                if (Model == CpuModel.Intel8088) { sbyte off61 = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off61); return 4; } // JNO alias
+                if (_operandSize32) { Regs.EDI = Pop32(); Regs.ESI = Pop32(); Regs.EBP = Pop32(); Pop32(); Regs.EBX = Pop32(); Regs.EDX = Pop32(); Regs.ECX = Pop32(); Regs.EAX = Pop32(); } // POPAD
+                else { Regs.DI = Pop(); Regs.SI = Pop(); Regs.BP = Pop(); Pop(); Regs.BX = Pop(); Regs.DX = Pop(); Regs.CX = Pop(); Regs.AX = Pop(); } // POPA
+                return 19;
+            case 0x62:
+                if (Model == CpuModel.Intel8088) { sbyte off62 = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off62); return 4; } // JB alias
+                SkipModRM(); return 10; // BOUND (186+)
+            case 0x63:
+                if (Model == CpuModel.Intel8088) { sbyte off63 = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Carry)) Regs.IP = (ushort)(Regs.IP + off63); return 4; } // JNB alias
+                modrm = FetchByte(); return 10; // ARPL (286+)
+            case 0x64:
+                if (Model == CpuModel.Intel8088) { sbyte off64 = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off64); return 4; } // JZ alias
+                _segmentOverride = 4; return DecodeAndExecute(); // FS: (386+)
+            case 0x65:
+                if (Model == CpuModel.Intel8088) { sbyte off65 = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off65); return 4; } // JNZ alias
+                _segmentOverride = 5; return DecodeAndExecute(); // GS: (386+)
+            case 0x66:
+                if (Model == CpuModel.Intel8088) { sbyte off66 = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Carry) || GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off66); return 4; } // JBE alias
+                _operandSize32 = !_operandSize32; return DecodeAndExecute(); // Operand-size (386+)
+            case 0x67:
+                if (Model == CpuModel.Intel8088) { sbyte off67 = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Carry) && !GetFlag(CpuFlags.Zero)) Regs.IP = (ushort)(Regs.IP + off67); return 4; } // JNBE alias
+                _addressSize32 = !_addressSize32; return DecodeAndExecute(); // Address-size (386+)
+            case 0x68:
+                if (Model == CpuModel.Intel8088) { sbyte off68 = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off68); return 4; } // JS alias
+                if (_operandSize32) Push32(FetchDword()); else Push(FetchWord()); return 3; // PUSH imm (186+)
+            case 0x69: // IMUL r16/32, r/m16/32, imm16/32 (186+)
+                if (Model == CpuModel.Intel8088) { sbyte off69 = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Sign)) Regs.IP = (ushort)(Regs.IP + off69); return 4; } // JNS alias
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                int val69 = (short)ReadModRM16(modrm);
+                int imm69 = (short)FetchWord();
+                int result69 = val69 * imm69;
+                Regs.SetReg16(reg, (ushort)(result69 & 0xFFFF));
+                SetFlag(CpuFlags.Carry, result69 != (short)result69);
+                SetFlag(CpuFlags.Overflow, result69 != (short)result69);
+                return 21;
+            }
+            case 0x6A:
+                if (Model == CpuModel.Intel8088) { sbyte off6a = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off6a); return 4; } // JP alias
+                Push((ushort)(short)(sbyte)FetchByte()); return 3; // PUSH imm8 (186+)
+            case 0x6B: // IMUL r16, r/m16, imm8 (186+)
+                if (Model == CpuModel.Intel8088) { sbyte off6b = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Parity)) Regs.IP = (ushort)(Regs.IP + off6b); return 4; } // JNP alias
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                int val6b = (short)ReadModRM16(modrm);
+                int imm6b = (sbyte)FetchByte();
+                int result6b = val6b * imm6b;
+                Regs.SetReg16(reg, (ushort)(result6b & 0xFFFF));
+                SetFlag(CpuFlags.Carry, result6b != (short)result6b);
+                SetFlag(CpuFlags.Overflow, result6b != (short)result6b);
+                return 21;
+            }
+            case 0x6C:
+                if (Model == CpuModel.Intel8088) { sbyte off6c = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off6c); return 4; } // JL alias
+                if (_ports != null) _mem.WriteByte(Regs.ES, Regs.DI, _ports.ReadByte(Regs.DX));
+                Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); return 14; // INSB (186+)
+            case 0x6D:
+                if (Model == CpuModel.Intel8088) { sbyte off6d = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow)) Regs.IP = (ushort)(Regs.IP + off6d); return 4; } // JNL alias
+                if (_ports != null) { ushort pw = _ports.ReadWord(Regs.DX); _mem.WriteWord(Regs.ES, Regs.DI, pw); }
+                Regs.DI = (ushort)(Regs.DI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); return 14; // INSW (186+)
+            case 0x6E:
+                if (Model == CpuModel.Intel8088) { sbyte off6e = (sbyte)FetchByte(); if (GetFlag(CpuFlags.Zero) || (GetFlag(CpuFlags.Sign) != GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off6e); return 4; } // JLE alias
+                _ports?.WriteByte(Regs.DX, _mem.ReadByte(GetDataSegment(), Regs.SI));
+                Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -1 : 1)); return 14; // OUTSB (186+)
+            case 0x6F:
+                if (Model == CpuModel.Intel8088) { sbyte off6f = (sbyte)FetchByte(); if (!GetFlag(CpuFlags.Zero) && (GetFlag(CpuFlags.Sign) == GetFlag(CpuFlags.Overflow))) Regs.IP = (ushort)(Regs.IP + off6f); return 4; } // JNLE alias
+                _ports?.WriteWord(Regs.DX, _mem.ReadWord(GetDataSegment(), Regs.SI));
+                Regs.SI = (ushort)(Regs.SI + (GetFlag(CpuFlags.Direction) ? -2 : 2)); return 14; // OUTSW (186+)
 
             // --- Two-byte opcodes (0x0F prefix) ---
             case 0x0F: return DecodeAndExecute0F();
@@ -2122,6 +2250,99 @@ public sealed class Cpu8086
                 Regs.SetReg16(reg, a16);
                 WriteModRM16(modrm, Add16(a16, b16));
                 return 3;
+            }
+
+            // --- 0x0F 0x01: SGDT/SIDT/LGDT/LIDT/SMSW/LMSW (Group 7) ---
+            case 0x01:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7;
+                switch (reg)
+                {
+                    case 0: // SGDT m — store GDTR (6 bytes: limit then base)
+                    {
+                        var (sg, of) = DecodeModRM_Address(modrm);
+                        _mem.WriteWord(sg, of, Regs.GdtLimit);
+                        _mem.WriteWord(sg, (ushort)(of + 2), (ushort)(Regs.GdtBase & 0xFFFF));
+                        _mem.WriteByte(sg, (ushort)(of + 4), (byte)((Regs.GdtBase >> 16) & 0xFF));
+                        _mem.WriteByte(sg, (ushort)(of + 5), (byte)((Regs.GdtBase >> 24) & 0xFF));
+                        break;
+                    }
+                    case 1: // SIDT m — store IDTR (6 bytes)
+                    {
+                        var (sg, of) = DecodeModRM_Address(modrm);
+                        _mem.WriteWord(sg, of, Regs.IdtLimit);
+                        _mem.WriteWord(sg, (ushort)(of + 2), (ushort)(Regs.IdtBase & 0xFFFF));
+                        _mem.WriteByte(sg, (ushort)(of + 4), (byte)((Regs.IdtBase >> 16) & 0xFF));
+                        _mem.WriteByte(sg, (ushort)(of + 5), (byte)((Regs.IdtBase >> 24) & 0xFF));
+                        break;
+                    }
+                    case 2: // LGDT m — load GDTR from memory (6 bytes)
+                    {
+                        var (sg, of) = DecodeModRM_Address(modrm);
+                        Regs.GdtLimit = _mem.ReadWord(sg, of);
+                        Regs.GdtBase = (uint)(_mem.ReadWord(sg, (ushort)(of + 2))
+                            | (_mem.ReadByte(sg, (ushort)(of + 4)) << 16)
+                            | (_mem.ReadByte(sg, (ushort)(of + 5)) << 24));
+                        break;
+                    }
+                    case 3: // LIDT m — load IDTR from memory (6 bytes)
+                    {
+                        var (sg, of) = DecodeModRM_Address(modrm);
+                        Regs.IdtLimit = _mem.ReadWord(sg, of);
+                        Regs.IdtBase = (uint)(_mem.ReadWord(sg, (ushort)(of + 2))
+                            | (_mem.ReadByte(sg, (ushort)(of + 4)) << 16)
+                            | (_mem.ReadByte(sg, (ushort)(of + 5)) << 24));
+                        break;
+                    }
+                    case 4: // SMSW r/m16 — store machine status word (low 16 of CR0)
+                        WriteModRM16(modrm, (ushort)(Regs.CR0 & 0xFFFF));
+                        break;
+                    case 6: // LMSW r/m16 — load machine status word (sets low 16 of CR0, cannot clear PE)
+                    {
+                        ushort val = ReadModRM16(modrm);
+                        // LMSW can set PE but cannot clear it
+                        Regs.CR0 = (Regs.CR0 & 0xFFFF0001u) | val;
+                        break;
+                    }
+                    default:
+                        _log?.Warn("CPU", $"Unknown 0F 01 /r={reg}");
+                        break;
+                }
+                return 11;
+            }
+
+            // --- MOV r32, CRn (0x0F 0x20) ---
+            case 0x20:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7; // CRn
+                int rm = modrm & 7;
+                uint crVal = reg switch
+                {
+                    0 => Regs.CR0,
+                    2 => Regs.CR2,
+                    3 => Regs.CR3,
+                    _ => 0
+                };
+                Regs.SetReg32(rm, crVal);
+                return 6;
+            }
+
+            // --- MOV CRn, r32 (0x0F 0x22) ---
+            case 0x22:
+            {
+                modrm = FetchByte();
+                reg = (modrm >> 3) & 7; // CRn
+                int rm = modrm & 7;
+                uint val = Regs.GetReg32(rm);
+                switch (reg)
+                {
+                    case 0: Regs.CR0 = val; break;
+                    case 2: Regs.CR2 = val; break;
+                    case 3: Regs.CR3 = val; break;
+                }
+                return 10;
             }
 
             default:

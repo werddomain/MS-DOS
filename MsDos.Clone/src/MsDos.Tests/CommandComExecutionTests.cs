@@ -74,6 +74,8 @@ public class CommandComExecutionTests
             _sem.Release();
             KeyDown?.Invoke(key);
         }
+        public void RaiseKeyDown(DosKeyEventArgs args) => KeyDown?.Invoke(args);
+        public void RaiseKeyUp(DosKeyEventArgs args) => KeyUp?.Invoke(args);
     }
 
     private sealed class TestStreamProvider : IStreamProvider

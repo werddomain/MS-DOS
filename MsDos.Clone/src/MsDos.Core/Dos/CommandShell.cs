@@ -180,6 +180,154 @@ public sealed class CommandShell
         // Expand environment variables (%VAR%)
         commandLine = ExpandEnvironmentVars(commandLine);
 
+        // ── Handle pipes: split on | and chain output→input ──
+        if (commandLine.Contains('|'))
+        {
+            await ExecutePipeline(commandLine, ct);
+            return;
+        }
+
+        // ── Parse I/O redirections: >, >>, <, 2> ──
+        string? inputRedirect = null;
+        string? outputRedirect = null;
+        bool appendOutput = false;
+        string? stderrRedirect = null;
+
+        commandLine = ParseRedirections(commandLine, ref inputRedirect, ref outputRedirect, ref appendOutput, ref stderrRedirect);
+
+        // Capture output if redirected
+        Action<char>? originalConsoleOutput = null;
+        StreamWriter? outputWriter = null;
+        Stream? inputStream = null;
+        try
+        {
+            if (outputRedirect != null)
+            {
+                var (provider, resolved) = ResolveShellPath(outputRedirect);
+                var stream = provider.OpenWriteAsync(resolved).GetAwaiter().GetResult();
+                if (appendOutput)
+                    stream.Seek(0, SeekOrigin.End);
+                outputWriter = new StreamWriter(stream) { AutoFlush = true };
+
+                // Temporarily redirect Print output to the file
+                _redirectWriter = outputWriter;
+            }
+
+            await ExecuteCommandCore(commandLine, ct);
+        }
+        finally
+        {
+            _redirectWriter = null;
+            outputWriter?.Dispose();
+            inputStream?.Dispose();
+        }
+    }
+
+    /// <summary>Writer used when output is redirected to a file.</summary>
+    private StreamWriter? _redirectWriter;
+
+    /// <summary>Parse >, >>, <, 2> from a command line, returning the cleaned command.</summary>
+    private static string ParseRedirections(string cmd, ref string? input, ref string? output,
+        ref bool append, ref string? stderr)
+    {
+        // Process from right to left to handle multiple redirections
+        var result = new System.Text.StringBuilder();
+        int i = 0;
+        while (i < cmd.Length)
+        {
+            if (cmd[i] == '<')
+            {
+                i++;
+                while (i < cmd.Length && cmd[i] == ' ') i++;
+                int start = i;
+                while (i < cmd.Length && cmd[i] != ' ' && cmd[i] != '>' && cmd[i] != '<' && cmd[i] != '|') i++;
+                input = cmd[start..i].Trim();
+            }
+            else if (i + 1 < cmd.Length && cmd[i] == '2' && cmd[i + 1] == '>')
+            {
+                i += 2;
+                while (i < cmd.Length && cmd[i] == ' ') i++;
+                int start = i;
+                while (i < cmd.Length && cmd[i] != ' ' && cmd[i] != '>' && cmd[i] != '<' && cmd[i] != '|') i++;
+                stderr = cmd[start..i].Trim();
+            }
+            else if (cmd[i] == '>')
+            {
+                i++;
+                if (i < cmd.Length && cmd[i] == '>')
+                {
+                    append = true;
+                    i++;
+                }
+                while (i < cmd.Length && cmd[i] == ' ') i++;
+                int start = i;
+                while (i < cmd.Length && cmd[i] != ' ' && cmd[i] != '>' && cmd[i] != '<' && cmd[i] != '|') i++;
+                output = cmd[start..i].Trim();
+            }
+            else
+            {
+                result.Append(cmd[i]);
+                i++;
+            }
+        }
+        return result.ToString().Trim();
+    }
+
+    /// <summary>Execute a pipe chain: cmd1 | cmd2 | cmd3</summary>
+    private async Task ExecutePipeline(string commandLine, CancellationToken ct)
+    {
+        string[] segments = commandLine.Split('|');
+        string? previousOutput = null;
+
+        for (int i = 0; i < segments.Length; i++)
+        {
+            string segment = segments[i].Trim();
+            if (string.IsNullOrEmpty(segment)) continue;
+
+            bool isLast = i == segments.Length - 1;
+
+            if (!isLast)
+            {
+                // Capture output to a string
+                var captured = new System.Text.StringBuilder();
+                _redirectWriter = null;
+                _captureBuilder = captured;
+
+                await ExecuteCommandCore(segment, ct);
+
+                _captureBuilder = null;
+                previousOutput = captured.ToString();
+            }
+            else
+            {
+                // For the last segment, if we have piped input, create a temp input
+                // and execute normally (output goes to screen)
+                if (previousOutput != null)
+                {
+                    _pipedInput = previousOutput;
+                }
+                await ExecuteCommandCore(segment, ct);
+                _pipedInput = null;
+            }
+        }
+    }
+
+    /// <summary>Captured output builder for pipe implementation.</summary>
+    private System.Text.StringBuilder? _captureBuilder;
+
+    /// <summary>Piped input string for pipe implementation.</summary>
+    private string? _pipedInput;
+
+    private (IStreamProvider provider, string resolved) ResolveShellPath(string path)
+    {
+        // Prefix with current drive if no drive letter
+        if (path.Length < 2 || path[1] != ':')
+            path = $"{_currentDrive}:{path}";
+        return _dos.ResolveFilePathPublic(path);
+    }
+
+    private async Task ExecuteCommandCore(string commandLine, CancellationToken ct)
+    {
         // Split command and arguments
         string command;
         string args;
@@ -421,9 +569,55 @@ public sealed class CommandShell
         PrintLine("");
         PrintLine("Memory Type        Total    =    Used    +    Free");
         PrintLine("----------------  --------    --------    --------");
-        PrintLine("Conventional         640K         64K        576K");
+
+        var mm = _machine.MemoryManager;
+        ushort seg = mm.FirstMcb;
+        long totalParas = 0;
+        long usedParas = 0;
+        long freeParas = 0;
+
+        // Walk the MCB chain
+        while (true)
+        {
+            byte type = mm.ReadMcbType(seg);
+            ushort owner = mm.ReadMcbOwner(seg);
+            ushort size = mm.ReadMcbSize(seg);
+
+            totalParas += size;
+            if (owner == 0)
+                freeParas += size;
+            else
+                usedParas += size;
+
+            if (type == (byte)'Z') break;
+            seg = (ushort)(seg + size + 1);
+        }
+
+        long totalKb = totalParas * 16 / 1024;
+        long usedKb = usedParas * 16 / 1024;
+        long freeKb = freeParas * 16 / 1024;
+
+        PrintLine($"Conventional     {totalKb,5}K     {usedKb,5}K     {freeKb,5}K");
         PrintLine("");
-        PrintLine("Total memory         640K         64K        576K");
+
+        // Print MCB chain details
+        PrintLine("  Segment    Size     Owner");
+        PrintLine("  -------  -------  --------");
+        seg = mm.FirstMcb;
+        while (true)
+        {
+            byte type = mm.ReadMcbType(seg);
+            ushort owner = mm.ReadMcbOwner(seg);
+            ushort size = mm.ReadMcbSize(seg);
+            string name = mm.ReadMcbName(seg);
+            string ownerStr = owner == 0 ? "Free" :
+                              owner == 0x0008 ? "SYSTEM" :
+                              string.IsNullOrEmpty(name) ? $"PSP {owner:X4}" : name;
+            PrintLine($"  {seg:X4}     {size * 16 / 1024,5}K   {ownerStr}");
+
+            if (type == (byte)'Z') break;
+            seg = (ushort)(seg + size + 1);
+        }
         PrintLine("");
     }
 
@@ -1066,12 +1260,32 @@ public sealed class CommandShell
 
     private void Print(string text)
     {
+        if (_captureBuilder != null)
+        {
+            _captureBuilder.Append(text);
+            return;
+        }
+        if (_redirectWriter != null)
+        {
+            _redirectWriter.Write(text);
+            return;
+        }
         foreach (char ch in text)
             _video.TtyOutput(ch);
     }
 
     private void PrintLine(string text)
     {
+        if (_captureBuilder != null)
+        {
+            _captureBuilder.AppendLine(text);
+            return;
+        }
+        if (_redirectWriter != null)
+        {
+            _redirectWriter.WriteLine(text);
+            return;
+        }
         Print(text);
         _video.TtyOutput('\r');
         _video.TtyOutput('\n');

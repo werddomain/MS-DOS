@@ -54,6 +54,8 @@ public class CommandShellTests
             _keys.Enqueue(key);
             _sem.Release();
         }
+        public void RaiseKeyDown(DosKeyEventArgs args) => KeyDown?.Invoke(args);
+        public void RaiseKeyUp(DosKeyEventArgs args) => KeyUp?.Invoke(args);
     }
 
     private sealed class RecordingWriteStream : MemoryStream

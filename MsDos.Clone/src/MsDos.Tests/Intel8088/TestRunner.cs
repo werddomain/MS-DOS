@@ -28,6 +28,7 @@ public sealed class TestRunner
     {
         _mem = new MemoryBus();
         _cpu = new Cpu8086(_mem);
+        _cpu.Model = CpuModel.Intel8088; // Test suite is based on real 8088 hardware
         _ports = new IOPortBus();
         _cpu.SetIOPortBus(_ports);
 

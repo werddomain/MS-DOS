@@ -12,6 +12,12 @@ public interface IEventRegistry
     /// <summary>Fired when a key is released.</summary>
     event Action<DosKeyEventArgs>? KeyUp;
 
+    /// <summary>Inject a key-down event programmatically (e.g., from virtual keyboard).</summary>
+    void RaiseKeyDown(DosKeyEventArgs args);
+
+    /// <summary>Inject a key-up event programmatically (e.g., from virtual keyboard).</summary>
+    void RaiseKeyUp(DosKeyEventArgs args);
+
     /// <summary>Fired when the mouse moves (graphics modes).</summary>
     event Action<DosMouseEventArgs>? MouseMove;
 

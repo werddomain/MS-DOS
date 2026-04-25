@@ -5,15 +5,16 @@ namespace MsDos.Core.Interrupts;
 /// 256 characters × 8 bytes each = 2048 bytes.
 /// Each byte represents one row of pixels; MSB is the leftmost pixel.
 /// Used for INT 10h character rendering in graphics modes (4, 5, 6)
-/// and placed at ROM segment F000:F000 for IVT vector 0x1F (INT 43h) compatibility.
+/// and placed at ROM segment E000:0100 to stay safe from custom BIOS ROM overlays.
+/// IVT vectors 0x1F and 0x43 point here for character generator access.
 /// </summary>
 public static class CgaFont8x8
 {
-    /// <summary>Offset within segment 0xF000 where the font is stored.</summary>
-    public const ushort RomOffset = 0xF000;
+    /// <summary>Offset within segment where the font is stored.</summary>
+    public const ushort RomOffset = 0x0100;
 
-    /// <summary>Segment where the font ROM resides.</summary>
-    public const ushort RomSegment = 0xF000;
+    /// <summary>Segment where the font ROM resides (E000 = safe from F000 ROM overlay).</summary>
+    public const ushort RomSegment = 0xE000;
 
     /// <summary>
     /// The standard IBM PC 8×8 character set (CP437), 256 glyphs.

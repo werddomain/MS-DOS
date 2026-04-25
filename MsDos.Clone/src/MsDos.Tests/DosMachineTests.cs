@@ -62,6 +62,8 @@ public class DosMachineTests
             _keys.Enqueue(key);
             _sem.Release();
         }
+        public void RaiseKeyDown(DosKeyEventArgs args) => KeyDown?.Invoke(args);
+        public void RaiseKeyUp(DosKeyEventArgs args) => KeyUp?.Invoke(args);
     }
 
     /// <summary>Simple in-memory stream provider.</summary>

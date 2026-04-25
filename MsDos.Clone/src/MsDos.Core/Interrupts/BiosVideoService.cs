@@ -29,6 +29,22 @@ namespace MsDos.Core.Interrupts;
         // VGA DAC palette (256 entries × 3 bytes RGB)
         private readonly byte[] _dacPalette = new byte[256 * 3];
 
+        // EGA/VGA planar video memory (4 planes × 64K each, stored interleaved)
+        // For 16-color planar modes: each plane contributes 1 bit per pixel.
+        private readonly byte[] _planarVram = new byte[4 * 0x10000];
+
+        // EGA/VGA Graphics Controller registers (for port 3CE/3CF)
+        private byte _gcSetReset;      // GC register 0: Set/Reset
+        private byte _gcEnableSetReset; // GC register 1: Enable Set/Reset
+        private byte _gcColorCompare;  // GC register 2: Color Compare
+        private byte _gcDataRotate;    // GC register 3: Data Rotate/Function Select
+        private byte _gcReadMapSelect; // GC register 4: Read Map Select
+        private byte _gcModeRegister;  // GC register 5: Mode Register
+        private byte _gcBitMask = 0xFF; // GC register 8: Bit Mask
+
+        // EGA/VGA Sequencer registers (for port 3C4/3C5)
+        private byte _seqMapMask = 0x0F; // Sequencer register 2: Map Mask (which planes to write)
+
         /// <summary>Whether the current mode is a graphics mode.</summary>
         public bool IsGraphicsMode => _currentMode >= 0x04 && _currentMode != 0x07;
 
@@ -181,10 +197,16 @@ namespace MsDos.Core.Interrupts;
                 _renderer.SetMode(VideoMode.Graphics640x200_2);
                 break;
             case 0x0D: // 320x200 16-color EGA
+                _renderer.SetMode(VideoMode.Graphics320x200_16);
+                break;
             case 0x0E: // 640x200 16-color EGA
+                _renderer.SetMode(VideoMode.Graphics640x200_16);
+                break;
             case 0x10: // 640x350 16-color EGA
+                _renderer.SetMode(VideoMode.Graphics640x350_16);
+                break;
             case 0x12: // 640x480 16-color VGA
-                _renderer.SetMode(VideoMode.Graphics320x200_256); // Best available approximation
+                _renderer.SetMode(VideoMode.Graphics640x480_16);
                 break;
             case 0x13: // 320x200 256-color VGA
                 _renderer.SetMode(VideoMode.Graphics320x200_256);
@@ -624,7 +646,6 @@ namespace MsDos.Core.Interrupts;
         else if (_currentMode == 0x04 || _currentMode == 0x05)
         {
             // CGA 320x200 4-color: interlaced at B800:0000
-            // Even rows at offset 0, odd rows at offset 0x2000
             uint baseAddr = (uint)((y & 1) != 0 ? 0xBA000 : 0xB8000);
             int rowOffset = (y / 2) * 80;
             int byteOffset = rowOffset + (x / 4);
@@ -647,6 +668,28 @@ namespace MsDos.Core.Interrupts;
             b &= (byte)~(1 << bitShift);
             b |= (byte)((color & 1) << bitShift);
             _mem.WriteByte(addr, b);
+        }
+        else if (_currentMode == 0x0D || _currentMode == 0x0E || _currentMode == 0x10 || _currentMode == 0x12)
+        {
+            // EGA/VGA 16-color planar modes
+            int width = GraphicsWidth;
+            int byteOffset = y * (width / 8) + (x / 8);
+            int bitPosition = 7 - (x % 8);
+            byte mask = (byte)(1 << bitPosition);
+
+            for (int plane = 0; plane < 4; plane++)
+            {
+                int planeOffset = plane * 0x10000 + byteOffset;
+                byte bit = (byte)((color >> plane) & 1);
+                byte existing = _planarVram[planeOffset];
+                existing &= (byte)~mask;
+                existing |= (byte)(bit << bitPosition);
+                _planarVram[planeOffset] = existing;
+            }
+
+            // Also write to main memory at A000:0000 for programs that read back
+            uint a000 = Registers.PhysicalAddress(0xA000, (ushort)byteOffset);
+            _mem.WriteByte(a000, color);
         }
         _renderer.DrawPixel(x, y, color);
     }
@@ -676,6 +719,22 @@ namespace MsDos.Core.Interrupts;
             int bitShift = 7 - (x % 8);
             uint addr = baseAddr + (uint)byteOffset;
             return (byte)((_mem.ReadByte(addr) >> bitShift) & 0x01);
+        }
+        else if (_currentMode == 0x0D || _currentMode == 0x0E || _currentMode == 0x10 || _currentMode == 0x12)
+        {
+            // EGA/VGA 16-color planar: reconstruct pixel from 4 planes
+            int width = GraphicsWidth;
+            int byteOffset = y * (width / 8) + (x / 8);
+            int bitPosition = 7 - (x % 8);
+
+            byte color = 0;
+            for (int plane = 0; plane < 4; plane++)
+            {
+                int planeOffset = plane * 0x10000 + byteOffset;
+                byte bit = (byte)((_planarVram[planeOffset] >> bitPosition) & 1);
+                color |= (byte)(bit << plane);
+            }
+            return color;
         }
         return 0;
     }

@@ -63,6 +63,18 @@ public sealed class BlazorEventRegistry : IEventRegistry
         });
     }
 
+    public void RaiseKeyDown(DosKeyEventArgs args)
+    {
+        _keyChannel.Writer.TryWrite(args);
+        Interlocked.Increment(ref _pendingKeyCount);
+        KeyDown?.Invoke(args);
+    }
+
+    public void RaiseKeyUp(DosKeyEventArgs args)
+    {
+        KeyUp?.Invoke(args);
+    }
+
     private static byte MapAscii(string key)
     {
         if (key.Length == 1) return (byte)key[0];

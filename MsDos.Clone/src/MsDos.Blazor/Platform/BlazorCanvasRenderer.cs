@@ -46,11 +46,19 @@ public sealed class BlazorCanvasRenderer : IGraphicsRenderer
                 Width = 640; Height = 400;
                 break;
             case VideoMode.Graphics320x200_4:
+            case VideoMode.Graphics320x200_16:
             case VideoMode.Graphics320x200_256:
                 Width = 320; Height = 200;
                 break;
             case VideoMode.Graphics640x200_2:
+            case VideoMode.Graphics640x200_16:
                 Width = 640; Height = 200;
+                break;
+            case VideoMode.Graphics640x350_16:
+                Width = 640; Height = 350;
+                break;
+            case VideoMode.Graphics640x480_16:
+                Width = 640; Height = 480;
                 break;
         }
         _charBuffer = new char[_textCols, _textRows];

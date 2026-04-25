@@ -44,6 +44,8 @@ public class FloppyDriveTests
             _keys.TryDequeue(out var key);
             return key ?? new DosKeyEventArgs();
         }
+        public void RaiseKeyDown(DosKeyEventArgs args) => KeyDown?.Invoke(args);
+        public void RaiseKeyUp(DosKeyEventArgs args) => KeyUp?.Invoke(args);
     }
 
     private sealed class TestStreamProvider : IStreamProvider

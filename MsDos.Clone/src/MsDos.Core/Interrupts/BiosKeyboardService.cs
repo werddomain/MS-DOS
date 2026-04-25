@@ -61,15 +61,15 @@ public sealed class BiosKeyboardService
         if (bufStart == 0) bufStart = 0x001E;
         if (bufEnd == 0) bufEnd = 0x003E;
 
-        // Read the key word at tail: low byte = ASCII, high byte = scancode
-        asciiChar = _mem.ReadByte(0x0040, tail);
-        scanCode = _mem.ReadByte(0x0040, (ushort)(tail + 1));
+        // Read the key word at head: low byte = ASCII, high byte = scancode
+        asciiChar = _mem.ReadByte(0x0040, head);
+        scanCode = _mem.ReadByte(0x0040, (ushort)(head + 1));
 
-        // Advance tail pointer
-        ushort nextTail = (ushort)(tail + 2);
-        if (nextTail >= bufEnd)
-            nextTail = bufStart;
-        _mem.WriteWord(0x0040, 0x001C, nextTail);
+        // Advance head pointer
+        ushort nextHead = (ushort)(head + 2);
+        if (nextHead >= bufEnd)
+            nextHead = bufStart;
+        _mem.WriteWord(0x0040, 0x001A, nextHead);
 
         return true;
     }
@@ -90,9 +90,9 @@ public sealed class BiosKeyboardService
         if (head == tail)
             return false; // Buffer empty
 
-        // Read but don't advance tail
-        asciiChar = _mem.ReadByte(0x0040, tail);
-        scanCode = _mem.ReadByte(0x0040, (ushort)(tail + 1));
+        // Read from head but don't advance
+        asciiChar = _mem.ReadByte(0x0040, head);
+        scanCode = _mem.ReadByte(0x0040, (ushort)(head + 1));
         return true;
     }
 
@@ -112,7 +112,7 @@ public sealed class BiosKeyboardService
             case 0x00: // Wait for keypress (standard)
             case 0x10: // Wait for keypress (enhanced)
             {
-                // Try BDA buffer first
+                // Try BDA buffer first (populated by BiosKeyboardIrqHandler / INT 09h)
                 if (TryDequeueFromBda(out byte sc, out byte ac))
                 {
                     _cpu.Regs.AH = sc;
@@ -120,7 +120,16 @@ public sealed class BiosKeyboardService
                     return;
                 }
 
-                // Fall back to IEventRegistry (for backward compat with direct event model)
+                // When BDA is available it is the sole keyboard source;
+                // falling back to IEventRegistry would cause duplicate delivery
+                // because the platform already enqueues keys into both queues.
+                if (_mem != null)
+                {
+                    ReexecuteCurrentInterrupt();
+                    return;
+                }
+
+                // No BDA — fall back to IEventRegistry (legacy / unit-test path)
                 if (!_events.IsKeyAvailable)
                 {
                     ReexecuteCurrentInterrupt();
@@ -152,23 +161,24 @@ public sealed class BiosKeyboardService
                     return;
                 }
 
-                // Fall back to IEventRegistry
+                // When BDA is available it is the sole keyboard source.
+                if (_mem != null)
+                {
+                    _cpu.Regs.Flags |= CpuFlags.Zero; // No key available
+                    break;
+                }
+
+                // No BDA — fall back to IEventRegistry (legacy / unit-test path)
                 if (_events.IsKeyAvailable)
                 {
                     var readTask = _events.ReadKeyAsync();
                     if (!readTask.IsCompletedSuccessfully)
                     {
-                        _cpu.Regs.Flags |= CpuFlags.Zero; // treat as not available this cycle
+                        _cpu.Regs.Flags |= CpuFlags.Zero;
                         break;
                     }
 
                     var evt = readTask.GetAwaiter().GetResult();
-                    // Push into BDA buffer so next AH=00 can consume it
-                    if (_mem != null)
-                    {
-                        // Enqueue into BDA buffer for consistency
-                        EnqueueToBda(evt.ScanCode, evt.AsciiChar);
-                    }
                     _cpu.Regs.AH = evt.ScanCode;
                     _cpu.Regs.AL = evt.AsciiChar;
                     _cpu.Regs.Flags &= ~CpuFlags.Zero; // Key available
@@ -211,24 +221,24 @@ public sealed class BiosKeyboardService
         }
     }
 
-    /// <summary>Enqueue a key into the BDA buffer (used by fallback path and AH=05h).</summary>
+    /// <summary>Enqueue a key into the BDA buffer (used by AH=05h Store Key).</summary>
     private void EnqueueToBda(byte scanCode, byte asciiChar)
     {
         if (_mem == null) return;
 
-        ushort head = _mem.ReadWord(0x0040, 0x001A);
         ushort tail = _mem.ReadWord(0x0040, 0x001C);
+        ushort head = _mem.ReadWord(0x0040, 0x001A);
         ushort bufStart = _mem.ReadWord(0x0040, 0x0080);
         ushort bufEnd = _mem.ReadWord(0x0040, 0x0082);
         if (bufStart == 0) bufStart = 0x001E;
         if (bufEnd == 0) bufEnd = 0x003E;
 
-        ushort nextHead = (ushort)(head + 2);
-        if (nextHead >= bufEnd) nextHead = bufStart;
-        if (nextHead == tail) return; // Full
+        ushort nextTail = (ushort)(tail + 2);
+        if (nextTail >= bufEnd) nextTail = bufStart;
+        if (nextTail == head) return; // Full
 
-        _mem.WriteByte(0x0040, head, asciiChar);
-        _mem.WriteByte(0x0040, (ushort)(head + 1), scanCode);
-        _mem.WriteWord(0x0040, 0x001A, nextHead);
+        _mem.WriteByte(0x0040, tail, asciiChar);
+        _mem.WriteByte(0x0040, (ushort)(tail + 1), scanCode);
+        _mem.WriteWord(0x0040, 0x001C, nextTail);
     }
 }

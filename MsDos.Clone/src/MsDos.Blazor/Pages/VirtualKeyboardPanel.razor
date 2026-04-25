@@ -1,0 +1,74 @@
+@using MsDos.Core.Platform
+
+@if (Keyboard != null)
+{
+    <div class="vkb-container">
+        @* ── Quick Combo Bar ── *@
+        <div class="vkb-combos">
+            @foreach (var combo in VirtualKeyboard.GetCombinations())
+            {
+                <button class="vkb-combo-btn" title="@combo.Tooltip"
+                        @onclick="() => Keyboard.SendCombination(combo)"
+                        @onclick:preventDefault @onclick:stopPropagation>
+                    @combo.DisplayName
+                </button>
+            }
+        </div>
+
+        @* ── Keyboard Layout Rows ── *@
+        <div class="vkb-keyboard">
+            @foreach (var row in VirtualKeyboard.GetLayout())
+            {
+                <div class="vkb-row">
+                    @foreach (var key in row)
+                    {
+                        string cls = "vkb-key";
+                        if (key.WidthMultiplier > 1.0)
+                            cls += $" vkb-w{(int)(key.WidthMultiplier * 100)}";
+                        if (key.IsModifier)
+                        {
+                            cls += " vkb-modifier";
+                            if ((key.ScanCode == 0x2A || key.ScanCode == 0x36) && Keyboard.IsShiftActive)
+                                cls += " vkb-active";
+                            if (key.ScanCode == 0x1D && Keyboard.IsCtrlActive)
+                                cls += " vkb-active";
+                            if (key.ScanCode == 0x38 && Keyboard.IsAltActive)
+                                cls += " vkb-active";
+                            if (key.ScanCode == 0x3A && Keyboard.IsCapsLock)
+                                cls += " vkb-active";
+                            if (key.ScanCode == 0x45 && Keyboard.IsNumLock)
+                                cls += " vkb-active";
+                        }
+
+                        string label = Keyboard.IsShiftActive && !string.IsNullOrEmpty(key.ShiftLabel)
+                            ? key.ShiftLabel : key.Label;
+
+                        <button class="@cls"
+                                @onclick="() => OnKeyClick(key)"
+                                @onclick:preventDefault @onclick:stopPropagation>
+                            @label
+                        </button>
+                    }
+                </div>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public VirtualKeyboard? Keyboard { get; set; }
+
+    protected override void OnParametersSet()
+    {
+        if (Keyboard != null)
+        {
+            Keyboard.ModifierStateChanged += () => InvokeAsync(StateHasChanged);
+            Keyboard.KeySent += _ => InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void OnKeyClick(VirtualKey key)
+    {
+        Keyboard?.PressKey(key);
+    }
+}

@@ -36,39 +36,66 @@
 
     @* ── Floppy Drive Panel ── *@
     <div class="floppy-panel">
-        @foreach (var slot in new[] { ('A', _slotALabel, _slotAReading, _slotAWriting, _slotAHasDisk),
-                                       ('B', _slotBLabel, _slotBReading, _slotBWriting, _slotBHasDisk) })
-        {
-            var drive = slot.Item1;
-            var label = slot.Item2;
-            var reading = slot.Item3;
-            var writing = slot.Item4;
-            var hasDisk = slot.Item5;
-
-            <div class="floppy-slot">
-                <div class="floppy-led @(writing ? "led-write" : reading ? "led-read" : hasDisk ? "led-idle" : "led-off")"></div>
-                <span class="floppy-label">@drive: [@label]</span>
-                <select class="floppy-type" @onchange="(e) => OnDriveTypeChanged(drive, e)">
-                    <option selected>1.44 MB</option>
-                    <option>720 KB</option>
-                    <option>1.2 MB</option>
-                    <option>360 KB</option>
-                </select>
-                <label class="btn btn-sm btn-green">
-                    Insert
-                    <InputFile OnChange="(e) => OnInsertFloppy(drive, e)" accept=".img,.raw,.ima,.dsk" style="display:none" />
-                </label>
-                <button class="btn btn-sm btn-orange" disabled="@(!hasDisk)" @onclick="() => OnEjectFloppy(drive)">Eject</button>
-                <button class="btn btn-sm btn-blue" disabled="@(!hasDisk)" @onclick="() => OnSaveFloppy(drive)">Save</button>
-                <button class="btn btn-sm" @onclick="() => OnInsertBlankFloppy(drive)">Blank</button>
-            </div>
-        }
+        @* Drive A: (explicit — no foreach to avoid InputFile closure issues) *@
+        <div class="floppy-slot">
+            <div class="floppy-led @(_slotAWriting ? "led-write" : _slotAReading ? "led-read" : _slotAHasDisk ? "led-idle" : "led-off")"></div>
+            <span class="floppy-label">A: [@_slotALabel]</span>
+            <select class="floppy-type" @onchange="(e) => OnDriveTypeChanged('A', e)">
+                <option selected>1.44 MB</option>
+                <option>720 KB</option>
+                <option>1.2 MB</option>
+                <option>360 KB</option>
+            </select>
+            <label class="btn btn-sm btn-green">
+                Insert
+                <InputFile OnChange="OnInsertFloppyA" accept=".img,.raw,.ima,.dsk" style="display:none" />
+            </label>
+            <button class="btn btn-sm btn-orange" disabled="@(!_slotAHasDisk)" @onclick="() => OnEjectFloppy('A')">Eject</button>
+            <button class="btn btn-sm btn-blue" disabled="@(!_slotAHasDisk)" @onclick="() => OnSaveFloppy('A')">Save</button>
+            <button class="btn btn-sm" @onclick="() => OnInsertBlankFloppy('A')">Blank</button>
+        </div>
+        @* Drive B: *@
+        <div class="floppy-slot">
+            <div class="floppy-led @(_slotBWriting ? "led-write" : _slotBReading ? "led-read" : _slotBHasDisk ? "led-idle" : "led-off")"></div>
+            <span class="floppy-label">B: [@_slotBLabel]</span>
+            <select class="floppy-type" @onchange="(e) => OnDriveTypeChanged('B', e)">
+                <option selected>1.44 MB</option>
+                <option>720 KB</option>
+                <option>1.2 MB</option>
+                <option>360 KB</option>
+            </select>
+            <label class="btn btn-sm btn-green">
+                Insert
+                <InputFile OnChange="OnInsertFloppyB" accept=".img,.raw,.ima,.dsk" style="display:none" />
+            </label>
+            <button class="btn btn-sm btn-orange" disabled="@(!_slotBHasDisk)" @onclick="() => OnEjectFloppy('B')">Eject</button>
+            <button class="btn btn-sm btn-blue" disabled="@(!_slotBHasDisk)" @onclick="() => OnSaveFloppy('B')">Save</button>
+            <button class="btn btn-sm" @onclick="() => OnInsertBlankFloppy('B')">Blank</button>
+        </div>
     </div>
 
     <div class="screen-container" @onkeydown="OnKeyDown" @onkeyup="OnKeyUp"
          @onkeydown:preventDefault @onkeyup:preventDefault tabindex="0" @ref="_containerRef">
         <canvas id="dosCanvas" width="640" height="400"></canvas>
     </div>
+
+    @* ── Virtual Keyboard Toggle + Panel ── *@
+    <div class="vkb-toggle-bar">
+        <button class="btn btn-sm @(_showVirtualKeyboard ? "btn-active" : "")" @onclick="() => _showVirtualKeyboard = !_showVirtualKeyboard">
+            ⌨ Virtual Keyboard
+        </button>
+        <button class="btn btn-sm" @onclick="OnEnterBiosSetup" disabled="@(!_poweredOn)">
+            ⚙ BIOS Setup
+        </button>
+        <label class="btn btn-sm btn-secondary">
+            Load BIOS ROM
+            <InputFile OnChange="OnLoadBiosRom" accept=".bin,.rom,.BIN,.ROM" style="display:none" />
+        </label>
+    </div>
+    @if (_showVirtualKeyboard && _machine != null)
+    {
+        <VirtualKeyboardPanel Keyboard="_machine.VirtualKbd" />
+    }
 
     <div class="status-bar">
         <div class="activity-leds">
@@ -169,6 +196,9 @@
     private string _registerText = "Registers: (load a program to see register state)";
     private string? _memoryDiffHtml;
     private bool _biosWaitPending;
+
+    // Virtual keyboard / BIOS state
+    private bool _showVirtualKeyboard;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -323,6 +353,10 @@
     }
 
     // ── Floppy drive operations ──
+    // Dedicated handlers for A: and B: to avoid InputFile closure issues in loops
+    private Task OnInsertFloppyA(InputFileChangeEventArgs e) => OnInsertFloppy('A', e);
+    private Task OnInsertFloppyB(InputFileChangeEventArgs e) => OnInsertFloppy('B', e);
+
     private async Task OnInsertFloppy(char drive, InputFileChangeEventArgs e)
     {
         var file = e.File;
@@ -334,6 +368,12 @@
             byte[] data = ms.ToArray();
             bool ok = _machine!.InsertFloppyDisk(drive, data, file.Name);
             _statusText = ok ? $"Disk inserted into {drive}: ({file.Name})" : $"Failed to load disk image into {drive}";
+            // Explicitly update slot display state (don't rely only on async DiskChanged event)
+            if (ok)
+            {
+                if (drive == 'A') { _slotAHasDisk = true; _slotALabel = file.Name; }
+                else { _slotBHasDisk = true; _slotBLabel = file.Name; }
+            }
             StateHasChanged();
         }
         catch (Exception ex) { _statusText = $"Error: {ex.Message}"; }
@@ -343,6 +383,9 @@
     {
         var data = _machine?.EjectFloppyDisk(drive);
         _statusText = $"Disk ejected from {drive}";
+        // Explicitly clear slot display state
+        if (drive == 'A') { _slotAHasDisk = false; _slotALabel = "Empty"; }
+        else { _slotBHasDisk = false; _slotBLabel = "Empty"; }
         StateHasChanged();
     }
 
@@ -692,6 +735,27 @@
     {
         _logEntries.Clear();
         _machine?.Log.Clear();
+    }
+
+    private void OnEnterBiosSetup()
+    {
+        _machine?.EnterBiosSetup();
+    }
+
+    private async Task OnLoadBiosRom(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 256 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            _machine?.LoadBiosRom(data);
+            _statusText = $"BIOS ROM loaded: {file.Name} ({data.Length} bytes) — active on next boot";
+            StateHasChanged();
+        }
+        catch (Exception ex) { _statusText = $"Error loading BIOS ROM: {ex.Message}"; }
     }
 
     private void OnKeyDown(KeyboardEventArgs e)

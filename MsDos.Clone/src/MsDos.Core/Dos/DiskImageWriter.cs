@@ -8,6 +8,31 @@ namespace MsDos.Core.Dos;
 public sealed class DiskImageWriter
 {
     /// <summary>
+    /// Create a blank (unformatted) hard disk image with a valid MBR.
+    /// The disk has an empty partition table — FDISK can then partition it.
+    /// </summary>
+    /// <param name="sizeMB">Size in megabytes (default 32, which DOS 4.0 supports).</param>
+    /// <returns>Raw disk image bytes with MBR signature.</returns>
+    public static byte[] CreateBlankHardDiskImage(int sizeMB = 32)
+    {
+        // CHS geometry for the hard disk
+        byte heads = 16;
+        byte sectorsPerTrack = 63;
+        int rawSectors = sizeMB * 1024 * 1024 / 512;
+        ushort cylinders = (ushort)(rawSectors / (heads * sectorsPerTrack));
+        if (cylinders < 1) cylinders = 1;
+
+        int totalSectors = cylinders * heads * sectorsPerTrack;
+        byte[] image = new byte[totalSectors * 512];
+
+        // MBR boot signature
+        image[510] = 0x55;
+        image[511] = 0xAA;
+
+        return image;
+    }
+
+    /// <summary>
     /// Create a blank FAT12 formatted floppy disk image (1.44MB).
     /// </summary>
     public static byte[] CreateBlankFloppy144()

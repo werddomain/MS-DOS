@@ -23,6 +23,19 @@ public sealed class Registers
     public ushort FS { get; set; } // 386+
     public ushort GS { get; set; } // 386+
 
+    // --- Control registers (286+/386+) ---
+    public uint CR0 { get; set; }  // Machine Status Word (bit 0 = PE - Protection Enable)
+    public uint CR2 { get; set; }  // Page Fault Linear Address
+    public uint CR3 { get; set; }  // Page Directory Base Register
+
+    // --- Descriptor table registers ---
+    public uint GdtBase { get; set; }   // GDTR base (32-bit linear address)
+    public ushort GdtLimit { get; set; } // GDTR limit (16-bit)
+    public uint IdtBase { get; set; }   // IDTR base (32-bit linear address)
+    public ushort IdtLimit { get; set; } // IDTR limit (16-bit)
+    public ushort Ldtr { get; set; }    // LDT selector
+    public ushort Tr { get; set; }      // Task Register selector
+
     // --- 32-bit register accessors (386+) ---
     public uint EAX { get => _eax; set => _eax = value; }
     public uint EBX { get => _ebx; set => _ebx = value; }
@@ -163,5 +176,9 @@ public sealed class Registers
         IP = 0;
         CS = DS = ES = SS = FS = GS = 0;
         Flags = CpuFlags.None;
+        CR0 = CR2 = CR3 = 0;
+        GdtBase = IdtBase = 0;
+        GdtLimit = IdtLimit = 0;
+        Ldtr = Tr = 0;
     }
 }

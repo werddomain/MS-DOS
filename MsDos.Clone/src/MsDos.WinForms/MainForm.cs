@@ -48,6 +48,11 @@ public partial class MainForm : Form
     private RichTextBox _memoryView = null!;
     private Label _registersLabel = null!;
 
+    // Virtual keyboard panel
+    private Panel _vkbPanel = null!;
+    private FlowLayoutPanel _vkbKeysPanel = null!;
+    private bool _vkbVisible;
+
     // Debug toolbar
     private Panel _debugToolbar = null!;
     private CheckBox _manualClockCheck = null!;
@@ -90,6 +95,9 @@ public partial class MainForm : Form
             MakeMenuItem("&Export C: Drive as IMG...", Keys.Control | Keys.E, OnExportCDrive),
             MakeMenuItem("&Import C: Drive from IMG...", Keys.Control | Keys.I, OnImportCDrive),
             new ToolStripSeparator(),
+            MakeMenuItem("Load &BIOS ROM...", Keys.None, OnLoadBiosRom),
+            MakeMenuItem("BIOS &Setup", Keys.None, (_, _) => _machine?.EnterBiosSetup()),
+            new ToolStripSeparator(),
             MakeMenuItem("Start &Shell (COMMAND.COM)", Keys.Control | Keys.S, OnStartShell),
             MakeMenuItem("&Reset Machine", Keys.Control | Keys.R, OnReset),
             new ToolStripSeparator(),
@@ -120,7 +128,7 @@ public partial class MainForm : Form
         _mainSplit.BringToFront();
         _mainSplit.SizeChanged += (_, _) => AdjustMainSplitterDistance();
 
-        // ── Left side: screen + floppy drive panel ──
+        // ── Left side: screen + virtual keyboard + floppy drive panel ──
         _screen = new PictureBox
         {
             Dock = DockStyle.Fill,
@@ -128,6 +136,10 @@ public partial class MainForm : Form
             SizeMode = PictureBoxSizeMode.Zoom,
         };
         _mainSplit.Panel1.Controls.Add(_screen);
+
+        // Virtual keyboard toggle + panel (below screen, above floppy panel)
+        BuildVirtualKeyboardPanel();
+        _mainSplit.Panel1.Controls.Add(_vkbPanel);
 
         // Floppy drive panel (below screen)
         BuildFloppyDrivePanel();
@@ -242,6 +254,203 @@ public partial class MainForm : Form
         var item = new ToolStripMenuItem(text, null, handler);
         item.ShortcutKeys = shortcut;
         return item;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  VIRTUAL KEYBOARD PANEL
+    // ═══════════════════════════════════════════════════════════════════
+    private void BuildVirtualKeyboardPanel()
+    {
+        _vkbPanel = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 0, // Hidden initially
+            BackColor = System.Drawing.Color.FromArgb(26, 26, 46),
+            Padding = new Padding(4),
+            Visible = false,
+        };
+
+        // Toggle button bar
+        var toggleBar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            Height = 28,
+            FlowDirection = FlowDirection.LeftToRight,
+            BackColor = System.Drawing.Color.FromArgb(26, 26, 46),
+            Padding = new Padding(2),
+        };
+
+        var toggleBtn = new Button
+        {
+            Text = "⌨ Virtual Keyboard",
+            FlatStyle = FlatStyle.Flat,
+            ForeColor = System.Drawing.Color.LightGray,
+            BackColor = System.Drawing.Color.FromArgb(40, 50, 70),
+            Size = new System.Drawing.Size(140, 24),
+            Font = new System.Drawing.Font("Segoe UI", 8),
+        };
+        toggleBtn.Click += (_, _) => ToggleVirtualKeyboard();
+
+        var biosSetupBtn = new Button
+        {
+            Text = "⚙ BIOS Setup",
+            FlatStyle = FlatStyle.Flat,
+            ForeColor = System.Drawing.Color.LightGray,
+            BackColor = System.Drawing.Color.FromArgb(40, 50, 70),
+            Size = new System.Drawing.Size(100, 24),
+            Font = new System.Drawing.Font("Segoe UI", 8),
+        };
+        biosSetupBtn.Click += (_, _) => _machine?.EnterBiosSetup();
+
+        var loadRomBtn = new Button
+        {
+            Text = "Load BIOS ROM",
+            FlatStyle = FlatStyle.Flat,
+            ForeColor = System.Drawing.Color.LightGray,
+            BackColor = System.Drawing.Color.FromArgb(40, 50, 70),
+            Size = new System.Drawing.Size(110, 24),
+            Font = new System.Drawing.Font("Segoe UI", 8),
+        };
+        loadRomBtn.Click += (_, _) => OnLoadBiosRom(null, EventArgs.Empty);
+
+        toggleBar.Controls.AddRange(new Control[] { toggleBtn, biosSetupBtn, loadRomBtn });
+
+        // This toggle bar goes ABOVE the hidden key panel; we reorganize:
+        // The _vkbPanel contains the toggle+keys and is managed by visibility of keys sub-panel
+        _vkbKeysPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            AutoScroll = true,
+            BackColor = System.Drawing.Color.FromArgb(26, 26, 46),
+            Visible = false,
+        };
+
+        _vkbPanel.Controls.Add(_vkbKeysPanel);
+        _vkbPanel.Controls.Add(toggleBar);
+        _vkbPanel.Height = 28;
+        _vkbPanel.Visible = true;
+    }
+
+    private void PopulateVirtualKeyboard()
+    {
+        if (_machine == null) return;
+
+        _vkbKeysPanel.Controls.Clear();
+
+        // Combo bar
+        var comboPanel = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.LeftToRight,
+            AutoSize = true,
+            WrapContents = true,
+            Padding = new Padding(2),
+        };
+
+        foreach (var combo in VirtualKeyboard.GetCombinations())
+        {
+            var btn = new Button
+            {
+                Text = combo.DisplayName,
+                FlatStyle = FlatStyle.Flat,
+                Size = new System.Drawing.Size(80, 22),
+                Font = new System.Drawing.Font("Consolas", 7.5f),
+                ForeColor = System.Drawing.Color.FromArgb(136, 204, 255),
+                BackColor = System.Drawing.Color.FromArgb(42, 74, 106),
+                Margin = new Padding(2),
+            };
+            var c = combo; // capture
+            btn.Click += (_, _) => _machine?.VirtualKbd.SendCombination(c);
+            comboPanel.Controls.Add(btn);
+        }
+        _vkbKeysPanel.Controls.Add(comboPanel);
+
+        // Key rows
+        foreach (var row in VirtualKeyboard.GetLayout())
+        {
+            var rowPanel = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.LeftToRight,
+                AutoSize = true,
+                WrapContents = false,
+                Padding = new Padding(1),
+            };
+
+            foreach (var key in row)
+            {
+                int width = (int)(32 * key.WidthMultiplier);
+                var btn = new Button
+                {
+                    Text = key.Label,
+                    FlatStyle = FlatStyle.Flat,
+                    Size = new System.Drawing.Size(width, 26),
+                    Font = new System.Drawing.Font("Consolas", 7.5f),
+                    ForeColor = key.IsModifier ? System.Drawing.Color.FromArgb(170, 170, 255) : System.Drawing.Color.LightGray,
+                    BackColor = key.IsModifier ? System.Drawing.Color.FromArgb(42, 42, 74) : System.Drawing.Color.FromArgb(51, 51, 51),
+                    Margin = new Padding(1),
+                    TabStop = false,
+                };
+
+                var k = key; // capture
+                btn.Click += (_, _) =>
+                {
+                    _machine?.VirtualKbd.PressKey(k);
+                    _screen.Focus(); // Return focus to screen
+                };
+
+                // Prevent button from stealing focus (so keys still go to emulator)
+                btn.GotFocus += (_, _) => _screen.Focus();
+
+                rowPanel.Controls.Add(btn);
+            }
+
+            _vkbKeysPanel.Controls.Add(rowPanel);
+        }
+    }
+
+    private void ToggleVirtualKeyboard()
+    {
+        _vkbVisible = !_vkbVisible;
+        _vkbKeysPanel.Visible = _vkbVisible;
+
+        if (_vkbVisible)
+        {
+            if (_vkbKeysPanel.Controls.Count <= 1) // only combo bar or empty
+                PopulateVirtualKeyboard();
+            _vkbPanel.Height = 220;
+        }
+        else
+        {
+            _vkbPanel.Height = 28;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  BIOS ROM LOADING
+    // ═══════════════════════════════════════════════════════════════════
+    private async void OnLoadBiosRom(object? sender, EventArgs e)
+    {
+        using var dlg = new OpenFileDialog
+        {
+            Title = "Load BIOS ROM Image",
+            Filter = "ROM Files|*.bin;*.rom|All Files|*.*",
+            DefaultExt = "bin"
+        };
+
+        if (dlg.ShowDialog() != DialogResult.OK) return;
+
+        try
+        {
+            byte[] data = await File.ReadAllBytesAsync(dlg.FileName);
+            _machine?.LoadBiosRom(data);
+            _statusLabel.Text = $"BIOS ROM loaded: {Path.GetFileName(dlg.FileName)} ({data.Length} bytes) — active on next boot";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Error loading BIOS ROM: {ex.Message}", "Error",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -938,8 +1147,10 @@ public partial class MainForm : Form
             string fileName = Path.GetFileName(dlg.FileName);
 
             char drive = 'A';
+
+            // If A: already has a disk, eject it first so the new image replaces it
             if (_machine!.GetDriveProvider('A') != null)
-                drive = 'B';
+                _machine.EjectFloppyDisk('A');
 
             bool mounted = _machine.LoadDiskImage(data, drive);
             if (!mounted)

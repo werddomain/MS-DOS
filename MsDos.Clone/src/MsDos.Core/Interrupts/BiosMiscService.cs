@@ -106,24 +106,82 @@ public sealed class BiosMiscService
         }
     }
 
-    /// <summary>INT 14h — Serial port services.</summary>
+    // --- Serial port state (COM1-COM4 loopback) ---
+    private const int MaxPorts = 4;
+    private readonly Queue<byte>[] _serialBuf = { new(), new(), new(), new() };
+    private readonly ushort[] _serialBaud = new ushort[MaxPorts];  // divisor
+    private readonly byte[] _serialLcr = new byte[MaxPorts];       // line control register
+
+    /// <summary>INT 14h — Serial port services. DX = port number (0-3).</summary>
     public void HandleInt14()
     {
+        int port = _cpu.Regs.DX;
+        if (port >= MaxPorts) { _cpu.Regs.AH = 0x80; return; } // timeout / invalid
+
         switch (_cpu.Regs.AH)
         {
-            case 0x00: // Initialize serial port
-                _cpu.Regs.AX = 0x6000; // DSR + CTS set, THRE + TEMT
+            case 0x00: // Initialize serial port — AL = parameters
+            {
+                byte param = _cpu.Regs.AL;
+                // Bits 7-5: baud rate, 4-3: parity, 2: stop bits, 1-0: data length
+                _serialLcr[port] = param;
+                _serialBaud[port] = (ushort)((param >> 5) & 7); // store baud index
+                _serialBuf[port].Clear();
+                // Return line status (AH) + modem status (AL)
+                // AH: bit6=THRE, bit5=TEMT (transmitter empty), rest clear
+                // AL: bit5=DSR, bit4=CTS
+                _cpu.Regs.AH = 0x60; // THRE + TEMT
+                _cpu.Regs.AL = 0x30; // DSR + CTS
                 break;
-            case 0x01: // Write character
-                _cpu.Regs.AH = 0x60; // success (bit 7 clear)
+            }
+            case 0x01: // Send character — AL = char
+            {
+                // Loopback: queue the byte for reading back
+                if (_serialBuf[port].Count < 4096)
+                    _serialBuf[port].Enqueue(_cpu.Regs.AL);
+                // AH bit 7 clear = success, bits 6-0 = line status
+                _cpu.Regs.AH = 0x60; // THRE + TEMT, no error
                 break;
+            }
             case 0x02: // Read character
-                _cpu.Regs.AH = 0x80; // timeout (bit 7 set)
-                _cpu.Regs.AL = 0x00;
+            {
+                if (_serialBuf[port].Count > 0)
+                {
+                    _cpu.Regs.AL = _serialBuf[port].Dequeue();
+                    _cpu.Regs.AH = 0x60; // bit 7 clear = success
+                }
+                else
+                {
+                    _cpu.Regs.AH = 0x80; // bit 7 set = timeout
+                    _cpu.Regs.AL = 0x00;
+                }
                 break;
+            }
             case 0x03: // Get port status
-                _cpu.Regs.AX = 0x6000; // DSR + CTS, THRE + TEMT
+            {
+                // AH = line status: bit6 THRE, bit5 TEMT, bit0 = data ready
+                byte lsr = 0x60; // THRE + TEMT always set
+                if (_serialBuf[port].Count > 0) lsr |= 0x01; // data ready
+                _cpu.Regs.AH = lsr;
+                _cpu.Regs.AL = 0x30; // modem status: DSR + CTS
                 break;
+            }
+            case 0x04: // Extended init (PS/2+) — BX = baud, CL = data/stop/parity
+            {
+                _serialBuf[port].Clear();
+                _cpu.Regs.AH = 0x60;
+                _cpu.Regs.AL = 0x30;
+                break;
+            }
+            case 0x05: // Extended port control (PS/2+)
+            {
+                if (_cpu.Regs.AL == 0x00) // Read modem control register
+                    _cpu.Regs.BL = 0x0B; // DTR + RTS + OUT2
+                // AL=0x01: Write modem control register — silently accept
+                _cpu.Regs.AH = 0x60;
+                _cpu.Regs.AL = 0x30;
+                break;
+            }
         }
     }
 

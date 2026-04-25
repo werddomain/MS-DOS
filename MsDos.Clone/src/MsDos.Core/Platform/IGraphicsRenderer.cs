@@ -57,6 +57,18 @@ public enum VideoMode : byte
     /// <summary>CGA Graphics 640x200, 2 colors (mode 0x06).</summary>
     Graphics640x200_2 = 0x06,
 
+    /// <summary>EGA Graphics 320x200, 16 colors (mode 0x0D).</summary>
+    Graphics320x200_16 = 0x0D,
+
+    /// <summary>EGA Graphics 640x200, 16 colors (mode 0x0E).</summary>
+    Graphics640x200_16 = 0x0E,
+
+    /// <summary>EGA Graphics 640x350, 16 colors (mode 0x10).</summary>
+    Graphics640x350_16 = 0x10,
+
+    /// <summary>VGA Graphics 640x480, 16 colors (mode 0x12).</summary>
+    Graphics640x480_16 = 0x12,
+
     /// <summary>VGA Graphics 320x200, 256 colors (mode 0x13).</summary>
     Graphics320x200_256 = 0x13,
 }

@@ -279,16 +279,16 @@ public sealed class MemoryManager
         }
     }
 
-    // --- MCB field accessors ---
+    // --- MCB field accessors (internal for shell MEM command) ---
 
-    private byte ReadMcbType(ushort seg) => _mem.ReadByte(seg, 0);
-    private ushort ReadMcbOwner(ushort seg) => _mem.ReadWord(seg, 1);
-    private ushort ReadMcbSize(ushort seg) => _mem.ReadWord(seg, 3);
+    internal byte ReadMcbType(ushort seg) => _mem.ReadByte(seg, 0);
+    internal ushort ReadMcbOwner(ushort seg) => _mem.ReadWord(seg, 1);
+    internal ushort ReadMcbSize(ushort seg) => _mem.ReadWord(seg, 3);
 
     private void WriteMcbOwner(ushort seg, ushort owner) => _mem.WriteWord(seg, 1, owner);
     private void WriteMcbSize(ushort seg, ushort size) => _mem.WriteWord(seg, 3, size);
 
-    private string ReadMcbName(ushort seg)
+    internal string ReadMcbName(ushort seg)
     {
         char[] name = new char[8];
         for (int i = 0; i < 8; i++)

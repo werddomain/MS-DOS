@@ -157,7 +157,7 @@ public class BiosMiscServiceTests
     {
         _cpu.Regs.AH = 0x00;
         _svc.HandleInt14();
-        Assert.Equal((ushort)0x6000, _cpu.Regs.AX);
+        Assert.Equal((ushort)0x6030, _cpu.Regs.AX); // AH=60h (THRE+TEMT), AL=30h (DSR+CTS)
     }
 
     [Fact]
@@ -182,7 +182,7 @@ public class BiosMiscServiceTests
     {
         _cpu.Regs.AH = 0x03;
         _svc.HandleInt14();
-        Assert.Equal((ushort)0x6000, _cpu.Regs.AX);
+        Assert.Equal((ushort)0x6030, _cpu.Regs.AX); // AH=60h (THRE+TEMT), AL=30h (DSR+CTS)
     }
 
     // ─── INT 17h — Printer services ─────────────────────────────────

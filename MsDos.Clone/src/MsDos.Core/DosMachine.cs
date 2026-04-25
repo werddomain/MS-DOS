@@ -1,5 +1,7 @@
+using MsDos.Core.Bios;
 using MsDos.Core.Cpu;
 using MsDos.Core.Dos;
+using MsDos.Core.Hardware;
 using MsDos.Core.Interrupts;
 using MsDos.Core.Memory;
 using MsDos.Core.Platform;
@@ -53,6 +55,30 @@ public sealed class DosMachine
 
     /// <summary>DOS memory control block chain manager.</summary>
     public MemoryManager MemoryManager { get; }
+
+    /// <summary>Intel 8237A DMA controller — 4 channels for floppy, memory refresh, etc.</summary>
+    public DmaController Dma { get; }
+
+    /// <summary>MC146818 CMOS/RTC — real-time clock and configuration storage.</summary>
+    public CmosRtc Cmos { get; }
+
+    /// <summary>NEC µPD765 floppy disk controller — sector-level I/O via DMA.</summary>
+    public Fdc765Controller Fdc { get; }
+
+    /// <summary>PC speaker — tone generation via PIT channel 2 + port 0x61.</summary>
+    public PcSpeaker Speaker { get; }
+
+    /// <summary>Video memory mapper — translates writes to B800/B000/A000 into screen updates.</summary>
+    public VideoMemoryMapper VideoMapper { get; }
+
+    /// <summary>IBM PC boot sequence — POST, IVT, BDA, boot sector loading.</summary>
+    public BootSequence BootSeq { get; }
+
+    /// <summary>BIOS Setup utility — text-based setup menu for CMOS configuration.</summary>
+    public BiosSetup BiosSetupScreen { get; }
+
+    /// <summary>Platform-agnostic virtual keyboard for on-screen key input.</summary>
+    public VirtualKeyboard VirtualKbd { get; }
 
     /// <summary>Drive letter → stream provider mapping. Populated by mounting disk images or directories.</summary>
     private readonly Dictionary<char, IStreamProvider> _drives = new(CharComparer.OrdinalIgnoreCase);
@@ -148,6 +174,10 @@ public sealed class DosMachine
         Cpu = new Cpu8086(Memory);
         Cpu.SetLog(Log);
 
+        // x87 FPU coprocessor
+        var fpu = new MsDos.Core.Cpu.Fpu8087(Cpu, Memory);
+        Cpu.SetFpu(fpu);
+
         // I/O port subsystem and hardware controllers
         Ports = new IOPortBus();
         Cpu.SetIOPortBus(Ports);
@@ -172,6 +202,28 @@ public sealed class DosMachine
         // Memory manager (MCB chain)
         MemoryManager = new MemoryManager(Memory);
 
+        // Hardware controllers
+        Dma = new DmaController();
+        Dma.RegisterPorts(Ports);
+
+        Cmos = new CmosRtc();
+        Cmos.RegisterPorts(Ports);
+
+        Speaker = new PcSpeaker(Ports);
+        Speaker.RegisterPorts();
+
+        Fdc = new Fdc765Controller(Dma, Memory, Pic, Log);
+        Fdc.RegisterPorts(Ports);
+
+        VideoMapper = new VideoMemoryMapper(Memory, Renderer, Log);
+        BootSeq = new BootSequence(Cpu, Memory, Log);
+        BootSeq.SetPorts(Ports); // Allow POST to program the PIC
+        BiosSetupScreen = new BiosSetup(Cmos, Renderer, Events, Log);
+        VirtualKbd = new VirtualKeyboard(Events);
+
+        // Wire PIT channel 2 output to speaker
+        Pit.Channel2OutputChanged += reload => Speaker.UpdatePitChannel2(reload);
+
         // CGA/VGA register state tracker (must be created before RegisterHardwarePorts)
         CgaRegisters = new CgaRegisterState();
 
@@ -183,7 +235,7 @@ public sealed class DosMachine
         Keyboard = new BiosKeyboardService(Cpu, events, Memory);
         BiosMisc = new BiosMiscService(Cpu, Memory);
         Disk = new BiosDiskService(Cpu, Memory, Log);
-        Mouse = new BiosMouseService(Cpu, events);
+        Mouse = new BiosMouseService(Cpu, Memory, events);
         Timer = new BiosTimerService(Cpu, Memory, Pic);
         KeyboardIrq = new BiosKeyboardIrqHandler(Memory, Pic);
         Dos = new DosKernel(Cpu, Memory, streams, events, renderer, Video, Log);
@@ -196,6 +248,12 @@ public sealed class DosMachine
         // Mount C: as the default stream provider
         _drives['C'] = streams;
         Dos.SetDriveProvider('C', streams);
+
+        // Create a blank hard disk image for C: so INT 13h / FDISK can detect drive 0x80
+        byte[] hdImage = DiskImageWriter.CreateBlankHardDiskImage(32);
+        _rawDiskImages['C'] = hdImage;
+        Disk.RegisterDiskAuto(0x80, hdImage);
+        BootSeq.RegisterDisk(0x80, hdImage);
 
         // Register interrupt handlers
         Interrupts.RegisterHandler(0x08, Timer.HandleInt08);   // System timer tick (IRQ 0)
@@ -216,7 +274,19 @@ public sealed class DosMachine
         Interrupts.RegisterHandler(0x33, Mouse.Handle);
 
         // Wire keyboard events to the BDA keyboard buffer (INT 09h path)
-        Events.KeyDown += e => KeyboardIrq.OnKeyEvent(e);
+        // BIOS Setup intercepts keys when active
+        Events.KeyDown += e =>
+        {
+            if (BiosSetupScreen.IsActive)
+            {
+                BiosSetupScreen.HandleKey(e);
+                return;
+            }
+            KeyboardIrq.OnKeyEvent(e);
+        };
+
+        // Wire Ctrl+Alt+Del to machine reset
+        KeyboardIrq.OnRebootRequested += () => { Reset(); Log.Info("Machine", "Ctrl+Alt+Del — reboot"); };
 
         // Handle process termination
         Dos.ProcessTerminated += code =>
@@ -269,6 +339,13 @@ public sealed class DosMachine
         };
         Disk.RegisterDiskAuto(biosDrive, imageData);
 
+        // Register with boot sequence for raw booting
+        BootSeq.RegisterDisk(biosDrive, imageData);
+
+        // Register with FDC for sector-level floppy I/O
+        if (biosDrive <= 0x01)
+            Fdc.LoadDisk(biosDrive, imageData);
+
         // Track raw image data for re-registration after reset
         _rawDiskImages[driveLetter] = imageData;
 
@@ -301,6 +378,13 @@ public sealed class DosMachine
         _drives.Remove(driveLetter);
         _rawDiskImages.Remove(driveLetter);
         Dos.RemoveDriveProvider(driveLetter);
+
+        // Unregister from INT 13h, boot sequence, and FDC so reads stop working
+        byte biosDrive = driveLetter == 'A' ? (byte)0x00 : (byte)0x01;
+        Disk.UnregisterDisk(biosDrive);
+        BootSeq.UnregisterDisk(biosDrive);
+        Fdc.EjectDisk(biosDrive);
+
         Log.Info("Machine", $"Floppy {driveLetter}: ejected");
         return data;
     }
@@ -434,18 +518,22 @@ public sealed class DosMachine
             Dos.SetDriveProvider(kv.Key, kv.Value);
         }
 
-        // Re-register floppy images with INT 13h
+        // Re-register floppy images with INT 13h, BootSeq, and FDC
         if (Floppy.SlotA.HasDisk && Floppy.SlotA.ImageData != null)
         {
             Disk.RegisterDiskAuto(0x00, Floppy.SlotA.ImageData);
+            BootSeq.RegisterDisk(0x00, Floppy.SlotA.ImageData);
+            Fdc.LoadDisk(0x00, Floppy.SlotA.ImageData);
         }
 
         if (Floppy.SlotB.HasDisk && Floppy.SlotB.ImageData != null)
         {
             Disk.RegisterDiskAuto(0x01, Floppy.SlotB.ImageData);
+            BootSeq.RegisterDisk(0x01, Floppy.SlotB.ImageData);
+            Fdc.LoadDisk(0x01, Floppy.SlotB.ImageData);
         }
 
-        // Re-register hard drive images with INT 13h (C: and beyond)
+        // Re-register hard drive images with INT 13h and BootSeq (C: and beyond)
         foreach (var kv in _rawDiskImages)
         {
             char dl = char.ToUpperInvariant(kv.Key);
@@ -453,6 +541,7 @@ public sealed class DosMachine
             {
                 byte biosDrive = (byte)(0x80 + (dl - 'C'));
                 Disk.RegisterDiskAuto(biosDrive, kv.Value);
+                BootSeq.RegisterDisk(biosDrive, kv.Value);
             }
         }
 
@@ -906,8 +995,13 @@ public sealed class DosMachine
     // ═══════════════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Power on the machine. Performs reset, checks boot sequence (A: → B: → C:),
-    /// and starts the shell on the appropriate drive.
+    /// Power on the machine. Performs a real PC-style boot:
+    ///   1. POST — initialise hardware, IVT, BDA
+    ///   2. Optionally enter BIOS Setup if DEL was pressed
+    ///   3. Try boot order from BIOS Setup (CMOS) or default A: → C: → B:
+    ///   4. If a bootable disk is found, load boot sector → native CPU loop
+    ///   5. If no bootable disk, fall back to the managed DOS shell
+    /// Set <see cref="BootMode"/> before calling to control boot behaviour.
     /// </summary>
     public async Task PowerOnAsync(CancellationToken cancellationToken = default)
     {
@@ -916,8 +1010,213 @@ public sealed class DosMachine
         OnPowerStateChanged?.Invoke(true);
         Log.Info("Machine", "Power ON");
 
+        Reset();
         SetCpuActive(true);
-        await RunShellAsync(cancellationToken);
+
+        // Determine boot order from BIOS Setup / CMOS
+        byte[] bootOrder = BiosSetupScreen.GetBootOrder();
+
+        // Attempt real boot — try each device in order
+        bool booted = false;
+        foreach (byte drive in bootOrder)
+        {
+            if (drive == 0xFF) continue; // Disabled
+
+            if (BootSeq.HasDisk(drive) || BootSeq.HasCustomBiosRom)
+            {
+                Log.Info("Machine", $"Trying boot from drive 0x{drive:X2}...");
+
+                if (BootSeq.BootFromDrive(drive))
+                {
+                    // CPU is set to 0000:7C00 — run native boot loop
+                    Interrupts.NativeBootMode = true;
+                    _running = true;
+                    _terminated = false;
+                    _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+                    try
+                    {
+                        await NativeBootLoopAsync(_cts.Token);
+                    }
+                    catch (OperationCanceledException) { }
+                    finally
+                    {
+                        SetCpuActive(false);
+                    }
+
+                    booted = true;
+                    break;
+                }
+            }
+        }
+
+        if (!booted)
+        {
+            // No bootable disk found — fall back to managed DOS shell
+            Interrupts.NativeBootMode = false;
+            Log.Info("Machine", "No bootable disk — starting managed DOS shell");
+            await RunShellAsync(cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Load a custom BIOS ROM image. On next boot, this ROM replaces
+    /// the emulated BIOS stubs. The ROM is loaded at F000:0000 (up to 64 KB).
+    /// </summary>
+    /// <param name="romData">Raw BIOS ROM bytes.</param>
+    public void LoadBiosRom(byte[] romData)
+    {
+        BootSeq.LoadBiosRom(romData);
+        Log.Info("Machine", $"Custom BIOS ROM loaded ({romData.Length} bytes) — will be active on next boot");
+    }
+
+    /// <summary>Remove the custom BIOS ROM so the emulated BIOS stubs are used.</summary>
+    public void UnloadBiosRom()
+    {
+        BootSeq.UnloadBiosRom();
+    }
+
+    /// <summary>
+    /// Enter BIOS Setup. Can be called during POST (before boot) or at any time
+    /// the machine is powered on. Setup is modal — it takes over the screen and
+    /// keyboard until the user exits.
+    /// </summary>
+    public void EnterBiosSetup()
+    {
+        BiosSetupScreen.Enter();
+    }
+
+    /// <summary>
+    /// Boot from a raw disk image. Performs a real IBM PC boot sequence:
+    /// POST → IVT setup → BDA → load boot sector → execute at 0000:7C00.
+    /// The CPU runs native x86 code from that point (no managed DOS layer).
+    /// Use this to boot actual MS-DOS from a bootable floppy or hard disk image.
+    /// </summary>
+    /// <param name="bootDrive">BIOS drive number (0x00=A:, 0x01=B:, 0x80=C:).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task BootFromDiskImageAsync(byte bootDrive = 0x00, CancellationToken cancellationToken = default)
+    {
+        if (_poweredOn) return;
+        _poweredOn = true;
+        OnPowerStateChanged?.Invoke(true);
+        Log.Info("Machine", $"Raw boot from drive {bootDrive:X2}h");
+
+        Reset();
+        SetCpuActive(true);
+
+        // Run IBM PC boot sequence: POST, IVT, BDA, boot sector
+        if (!BootSeq.BootFromDrive(bootDrive))
+        {
+            Log.Error("Machine", "Boot failed — no bootable disk found");
+            PowerOff();
+            return;
+        }
+
+        // CPU is now set to execute at 0000:7C00 with DL = boot drive
+        // Run CPU loop executing native instructions
+        Interrupts.NativeBootMode = true;
+        _running = true;
+        _terminated = false;
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        try
+        {
+            await NativeBootLoopAsync(_cts.Token);
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            SetCpuActive(false);
+        }
+    }
+
+    /// <summary>
+    /// Main CPU execution loop for native (raw) boot.
+    /// Executes instructions until HLT, triple fault, or cancellation.
+    /// Yields periodically to allow UI rendering.
+    /// </summary>
+    private async Task NativeBootLoopAsync(CancellationToken ct)
+    {
+        int instructionCount = 0;
+        Log.Info("CPU", $"Native boot: starting execution at {Cpu.Regs.CS:X4}:{Cpu.Regs.IP:X4}  DL={Cpu.Regs.DL:X2}h");
+
+        // Flush an initial frame so the user sees POST/boot activity
+        await Renderer.FlushAsync();
+
+        while (_running && !ct.IsCancellationRequested)
+        {
+            try
+            {
+                // If BIOS setup is active, route keys through it instead of CPU
+                if (BiosSetupScreen.IsActive)
+                {
+                    await Renderer.FlushAsync();
+                    await Task.Delay(FrameIntervalMs, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                // Handle CPU halted — wait for interrupt
+                if (Cpu.IsHalted)
+                {
+                    // Service pending interrupts which may unhalt
+                    Pic.ServicePendingInterrupts();
+                    if (Cpu.IsHalted)
+                    {
+                        await Renderer.FlushAsync();
+                        await Task.Delay(1, ct).ConfigureAwait(false);
+                        continue;
+                    }
+                }
+
+                Cpu.Step();
+                instructionCount++;
+                OnStep?.Invoke();
+
+                // Fire pending hardware interrupts
+                if (instructionCount % 100 == 0)
+                {
+                    // Advance PIT
+                    int ticks = Pit.AdvanceTicks(100);
+                    for (int t = 0; t < ticks; t++)
+                        Pic.RaiseIRQ(0);
+
+                    // Service any pending keyboard/timer IRQs
+                    Pic.ServicePendingInterrupts();
+
+                    // Check disk activity timeout
+                    if (_diskActive && DateTime.UtcNow > _diskActivityUntilUtc)
+                        SetDiskActive(false);
+                }
+
+                // Yield periodically for rendering
+                if (instructionCount % InstructionsPerFrame == 0)
+                {
+                    await Renderer.FlushAsync();
+                    await Task.Delay(1, ct).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                Log.Error("CPU", $"Exception at {Cpu.Regs.CS:X4}:{Cpu.Regs.IP:X4}: {ex.Message}");
+                Log.Error("CPU", $"  AX={Cpu.Regs.AX:X4} BX={Cpu.Regs.BX:X4} CX={Cpu.Regs.CX:X4} DX={Cpu.Regs.DX:X4}");
+                Log.Error("CPU", $"  SI={Cpu.Regs.SI:X4} DI={Cpu.Regs.DI:X4} SP={Cpu.Regs.SP:X4} BP={Cpu.Regs.BP:X4}");
+                Log.Error("CPU", $"  DS={Cpu.Regs.DS:X4} ES={Cpu.Regs.ES:X4} SS={Cpu.Regs.SS:X4} Flags={Cpu.Regs.Flags}");
+
+                // Write error to video memory so user sees it
+                string errMsg = $"CPU FAULT @ {Cpu.Regs.CS:X4}:{Cpu.Regs.IP:X4}: {ex.Message}";
+                for (int i = 0; i < errMsg.Length && i < 78; i++)
+                {
+                    Memory.WriteByte(0xB800, (ushort)(24 * 160 + i * 2), (byte)errMsg[i]);
+                    Memory.WriteByte(0xB800, (ushort)(24 * 160 + i * 2 + 1), 0x4F); // White on Red
+                }
+                await Renderer.FlushAsync();
+
+                _running = false;
+            }
+        }
+
+        Log.Info("CPU", $"Native boot loop ended after {instructionCount} instructions");
     }
 
     /// <summary>
@@ -1151,59 +1450,15 @@ public sealed class DosMachine
     /// </summary>
     private void RegisterHardwarePorts()
     {
-        // DMA controller (8237A) — channels 0-3 (ports 0x00-0x0F, 0xC0-0xDF)
-        // Many programs probe these; return 0 for reads, ignore writes
-        Ports.Register(0x00, 0x0F, port => 0, (port, val) => { });
-        Ports.Register(0x80, 0x8F, port => 0, (port, val) => { }); // DMA page registers
-        Ports.Register(0xC0, 0xDF, port => 0, (port, val) => { }); // DMA 16-bit (AT)
+        // DMA controller (8237A) — already registered by Dma.RegisterPorts()
+        // DMA 16-bit (AT) — secondary controller stubs
+        Ports.Register(0xC0, 0xDF, port => 0, (port, val) => { });
 
-        // CMOS/RTC (ports 0x70-0x71)
-        byte _cmosIndex = 0;
-        Ports.Register(0x70, null, (port, val) => { _cmosIndex = (byte)(val & 0x7F); });
-        Ports.Register(0x71, port =>
-        {
-            var now = DateTime.Now;
-            return _cmosIndex switch
-            {
-                0x00 => ToBcd(now.Second),
-                0x02 => ToBcd(now.Minute),
-                0x04 => ToBcd(now.Hour),
-                0x06 => ToBcd((int)now.DayOfWeek + 1),
-                0x07 => ToBcd(now.Day),
-                0x08 => ToBcd(now.Month),
-                0x09 => ToBcd(now.Year % 100),
-                0x0A => 0x26, // Status A: update not in progress
-                0x0B => 0x02, // Status B: 24hr, BCD
-                0x0C => 0x00, // Status C: no pending interrupt
-                0x0D => 0x80, // Status D: battery OK
-                0x32 => ToBcd(now.Year / 100), // Century
-                0x10 => 0x44, // Floppy drive types: both 1.44M
-                0x14 => 0x0D, // Equipment byte
-                0x15 => 0x80, // Base memory low (640K)
-                0x16 => 0x02, // Base memory high
-                _ => 0
-            };
-        }, (port, val) => { });
+        // CMOS/RTC — already registered by Cmos.RegisterPorts()
 
-        // Keyboard controller (8042) — ports 0x60, 0x61, 0x64
-        Ports.Register(0x60, port => KeyboardIrq.ReadPort60(), (port, val) => { }); // Keyboard data (scancode)
-
-        // Port 0x61 — System Control Port B
-        //   Bit 0: PIT Channel 2 gate enable
-        //   Bit 1: Speaker data enable
-        //   Bit 4: Toggles with each refresh cycle (read)
-        //   Bit 5: Channel 2 output (from PIT)
-        byte _port61 = 0;
-        bool _refreshToggle = false;
-        Ports.Register(0x61, port =>
-        {
-            _refreshToggle = !_refreshToggle;
-            byte val = _port61;
-            if (_refreshToggle) val |= 0x10; // Bit 4 — refresh toggle
-            if (Pit.Channel2Output) val |= 0x20; // Bit 5 — PIT ch2 output
-            return val;
-        }, (port, val) => { _port61 = val; });
-
+        // Keyboard controller (8042) — ports 0x60, 0x64
+        Ports.Register(0x60, port => KeyboardIrq.ReadPort60(), (port, val) => { });
+        // Port 0x61 — already registered by Speaker.RegisterPorts()
         Ports.Register(0x64, port => 0x14, (port, val) => { }); // Status: input buffer empty, system flag set
 
         // Serial ports COM1-COM4 (stubs)
@@ -1218,6 +1473,8 @@ public sealed class DosMachine
 
         // Game port (joystick) — port 0x201
         Ports.Register(0x201, port => 0xFF, (port, val) => { }); // All buttons released
+
+        // FDC — already registered by Fdc.RegisterPorts()
     }
 
     /// <summary>
@@ -1227,7 +1484,13 @@ public sealed class DosMachine
     private void PopulateBiosDataArea()
     {
         // Equipment word at 0040:0010
-        Memory.WriteWord(0x0040, 0x0010, 0x0021); // Color 80x25, 1 floppy
+        // Bits 7-6: number of floppy drives minus 1 (00=1, 01=2)
+        // Bits 5-4: initial video mode (10=80x25 color)
+        // Bit 0: boot from floppy
+        // Always report 2 floppy drives (standard PC has A: and B: bays)
+        // to prevent DOS phantom B: aliasing where B: mirrors A:
+        ushort equipmentWord = 0x0061; // 80x25 color, 2 floppies
+        Memory.WriteWord(0x0040, 0x0010, equipmentWord);
 
         // Base memory size in KB at 0040:0013
         Memory.WriteWord(0x0040, 0x0013, 640);

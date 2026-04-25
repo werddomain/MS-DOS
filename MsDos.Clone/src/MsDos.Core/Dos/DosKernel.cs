@@ -32,6 +32,10 @@ public sealed class DosKernel
     // PSP segment of current process
     public ushort CurrentPSP { get; set; }
 
+    // EXEC process stack — tracks parent state for nested EXEC calls
+    private readonly Stack<ExecState> _execStack = new();
+
+
     // DTA (Disk Transfer Area) address
     public ushort DtaSegment { get; set; }
     public ushort DtaOffset { get; set; } = 0x0080;
@@ -53,6 +57,14 @@ public sealed class DosKernel
     private byte _lastErrorClass;
     private byte _lastErrorAction;
     private byte _lastErrorLocus;
+
+    // FCB file handle tracking — maps FCB address (seg:off) to a handle index
+    private readonly Dictionary<uint, ushort> _fcbHandles = new();
+
+    // FCB FindFirst/FindNext state
+    private IReadOnlyList<string>? _fcbFindResults;
+    private int _fcbFindIndex;
+    private string _fcbFindPattern = "*.*";
 
     // Ctrl-C check flag
     private byte _ctrlCFlag;
@@ -101,6 +113,11 @@ public sealed class DosKernel
     }
 
     /// <summary>
+    /// Resolve a DOS file path to the correct stream provider (internal API for shell redirection).
+    /// </summary>
+    internal (IStreamProvider provider, string resolvedPath) ResolveFilePathPublic(string path) => ResolveFilePath(path);
+
+    /// <summary>
     /// Resolve a DOS file path to the correct stream provider.
     /// If the path has a drive letter prefix (e.g., "A:\FILE.EXE"), uses that drive's provider.
     /// Otherwise uses the current drive's provider, falling back to the default.
@@ -138,7 +155,7 @@ public sealed class DosKernel
     private string _findPattern = "*.*";
 
     /// <summary>Trigger process termination from external callers (e.g., INT 20h).</summary>
-    public void Terminate(byte code) => ProcessTerminated?.Invoke(code);
+    public void Terminate(byte code) => TerminateChildProcess(code);
 
     /// <summary>Fired when a process terminates (INT 21h AH=4Ch).</summary>
     public event Action<byte>? ProcessTerminated;
@@ -178,7 +195,7 @@ public sealed class DosKernel
         switch (func)
         {
             case 0x00: // Terminate program
-                ProcessTerminated?.Invoke(0);
+                TerminateChildProcess(0);
                 break;
 
             case 0x01: // Read character with echo
@@ -318,8 +335,7 @@ public sealed class DosKernel
                 break;
 
             case 0x4C: // Terminate with return code
-                _lastReturnCode = _cpu.Regs.AL;
-                ProcessTerminated?.Invoke(_cpu.Regs.AL);
+                TerminateChildProcess(_cpu.Regs.AL);
                 break;
 
             case 0x4D: // Get return code
@@ -565,24 +581,64 @@ public sealed class DosKernel
             case 0x05: // Printer output
                 break;
 
-            case 0x10: // Close FCB file
-            case 0x11: // Find first FCB
-            case 0x12: // Find next FCB
-            case 0x13: // Delete FCB
-            case 0x14: // Sequential read FCB
-            case 0x15: // Sequential write FCB
-            case 0x16: // Create FCB
-            case 0x17: // Rename FCB
-            case 0x21: // Random read FCB
-            case 0x22: // Random write FCB
-            case 0x23: // Get file size FCB
-            case 0x24: // Set random record FCB
-            case 0x27: // Random block read FCB
-            case 0x28: // Random block write FCB
             case 0x0F: // Open file using FCB
-                // FCB operations — return success but don't actually do anything
-                _cpu.Regs.AL = 0xFF; // FCB not found / error
-                _log.Debug("DOS", $"FCB operation AH={func:X2}h (stub)");
+                HandleFcbOpen();
+                break;
+
+            case 0x10: // Close FCB file
+                HandleFcbClose();
+                break;
+
+            case 0x11: // Find first FCB
+                HandleFcbFindFirst();
+                break;
+
+            case 0x12: // Find next FCB
+                HandleFcbFindNext();
+                break;
+
+            case 0x13: // Delete FCB
+                HandleFcbDelete();
+                break;
+
+            case 0x14: // Sequential read FCB
+                HandleFcbSequentialRead();
+                break;
+
+            case 0x15: // Sequential write FCB
+                HandleFcbSequentialWrite();
+                break;
+
+            case 0x16: // Create FCB
+                HandleFcbCreate();
+                break;
+
+            case 0x17: // Rename FCB
+                HandleFcbRename();
+                break;
+
+            case 0x21: // Random read FCB
+                HandleFcbRandomRead();
+                break;
+
+            case 0x22: // Random write FCB
+                HandleFcbRandomWrite();
+                break;
+
+            case 0x23: // Get file size FCB
+                HandleFcbGetFileSize();
+                break;
+
+            case 0x24: // Set random record FCB
+                HandleFcbSetRandomRecord();
+                break;
+
+            case 0x27: // Random block read FCB
+                HandleFcbRandomBlockRead();
+                break;
+
+            case 0x28: // Random block write FCB
+                HandleFcbRandomBlockWrite();
                 break;
 
             case 0x52: // Get DOS internal variables (List of Lists)
@@ -1179,8 +1235,9 @@ public sealed class DosKernel
 
     private void HandleExec()
     {
+        byte subFunction = _cpu.Regs.AL;
         string path = ReadDosString(_cpu.Regs.DS, _cpu.Regs.DX);
-        _log.Info("DOS", $"EXEC: {path}");
+        _log.Info("DOS", $"EXEC (AL={subFunction:X2}h): {path}");
 
         // Read the parameter block at ES:BX
         ushort paramSeg = _cpu.Regs.ES;
@@ -1189,12 +1246,19 @@ public sealed class DosKernel
         ushort cmdLineSeg = _mem.ReadWord(paramSeg, (ushort)(paramOff + 2));
         ushort cmdLineOff = _mem.ReadWord(paramSeg, (ushort)(paramOff + 4));
 
+        // For subfunction 01h (Load overlay), also read CS:IP from param block
+        ushort overlaySegment = 0;
+        if (subFunction == 0x01 || subFunction == 0x03)
+        {
+            overlaySegment = _mem.ReadWord(paramSeg, (ushort)(paramOff + 6));
+        }
+
         // Read command line from the parameter block
         string cmdLine = "";
         if (cmdLineSeg != 0 || cmdLineOff != 0)
         {
             byte len = _mem.ReadByte(cmdLineSeg, cmdLineOff);
-            for (int i = 0; i < len; i++)
+            for (int i = 0; i < len && i < 127; i++)
                 cmdLine += (char)_mem.ReadByte(cmdLineSeg, (ushort)(cmdLineOff + 1 + i));
         }
 
@@ -1209,7 +1273,7 @@ public sealed class DosKernel
                 return;
             }
 
-            // Load the child program
+            // Load the program binary
             using var stream = provider.OpenReadAsync(resolvedPath).GetAwaiter().GetResult();
             using var ms = new MemoryStream();
             stream.CopyTo(ms);
@@ -1217,9 +1281,22 @@ public sealed class DosKernel
 
             _log.Info("DOS", $"EXEC loading {path} ({programData.Length} bytes), cmdline='{cmdLine}'");
 
-            // For now, just report success - full EXEC requires saving/restoring parent state
-            // which needs proper memory management. The shell handles this at a higher level.
-            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            switch (subFunction)
+            {
+                case 0x00: // Load and Execute
+                    ExecLoadAndExecute(programData, path, cmdLine, envSeg);
+                    break;
+                case 0x01: // Load (don't execute) — used for overlays
+                    ExecLoadOverlay(programData, overlaySegment);
+                    break;
+                case 0x03: // Load overlay (no PSP)
+                    ExecLoadOverlay(programData, overlaySegment);
+                    break;
+                default:
+                    _cpu.Regs.AX = 0x01; // Invalid function
+                    _cpu.Regs.Flags |= CpuFlags.Carry;
+                    break;
+            }
         }
         catch (Exception ex)
         {
@@ -1228,6 +1305,287 @@ public sealed class DosKernel
             _cpu.Regs.Flags |= CpuFlags.Carry;
             SetExtendedError(0x05, 3, 1, 1);
         }
+    }
+
+    /// <summary>
+    /// EXEC subfunction 00h: Load and execute a child process.
+    /// Saves parent state, loads child, and redirects CPU execution.
+    /// When child calls INT 21h/4Ch (terminate), parent is restored.
+    /// </summary>
+    private void ExecLoadAndExecute(byte[] data, string path, string cmdLine, ushort envSeg)
+    {
+        // Allocate memory for child process
+        ushort childParas = (ushort)((data.Length + 512) / 16 + 0x20); // program + PSP + slack
+        if (_memoryManager == null)
+        {
+            _cpu.Regs.AX = 0x08; // Insufficient memory
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+            return;
+        }
+
+        ushort childSeg = _memoryManager.Allocate(childParas, CurrentPSP, out ushort maxAvail);
+        if (childSeg == 0)
+        {
+            _log.Warn("DOS", $"EXEC: not enough memory ({childParas} paras requested, {maxAvail} available)");
+            _cpu.Regs.AX = 0x08;
+            _cpu.Regs.BX = maxAvail;
+            _cpu.Regs.Flags |= CpuFlags.Carry;
+            return;
+        }
+
+        // Save parent process state
+        var parentState = new ExecState
+        {
+            ParentPSP = CurrentPSP,
+            ParentSS = _cpu.Regs.SS,
+            ParentSP = _cpu.Regs.SP,
+            ParentCS = _cpu.Regs.CS,
+            ParentIP = _cpu.Regs.IP,
+            ParentAX = _cpu.Regs.AX,
+            ParentBX = _cpu.Regs.BX,
+            ParentCX = _cpu.Regs.CX,
+            ParentDX = _cpu.Regs.DX,
+            ParentSI = _cpu.Regs.SI,
+            ParentDI = _cpu.Regs.DI,
+            ParentBP = _cpu.Regs.BP,
+            ParentDS = _cpu.Regs.DS,
+            ParentES = _cpu.Regs.ES,
+            ParentFlags = _cpu.Regs.Flags,
+            ChildMemorySegment = childSeg,
+            ProgramPath = path
+        };
+        _execStack.Push(parentState);
+
+        // Build PSP for child at childSeg
+        BuildChildPSP(childSeg, CurrentPSP, cmdLine, path);
+
+        // Determine if COM or EXE
+        bool isExe = data.Length >= 2 && data[0] == 0x4D && data[1] == 0x5A;
+
+        if (isExe)
+        {
+            LoadExeForExec(data, childSeg);
+        }
+        else
+        {
+            // COM file: load at childSeg:0100
+            int loadSize = Math.Min(data.Length, 0xFF00);
+            _mem.LoadData(childSeg, 0x0100, data.AsSpan(0, loadSize));
+
+            _cpu.Regs.CS = childSeg;
+            _cpu.Regs.DS = childSeg;
+            _cpu.Regs.ES = childSeg;
+            _cpu.Regs.SS = childSeg;
+            _cpu.Regs.SP = 0xFFFE;
+            _cpu.Regs.IP = 0x0100;
+
+            // Push 0x0000 onto stack for INT 20h return
+            _cpu.Regs.SP -= 2;
+            _mem.WriteWord(childSeg, _cpu.Regs.SP, 0x0000);
+        }
+
+        // Update current PSP to child
+        CurrentPSP = childSeg;
+        DtaSegment = childSeg;
+        DtaOffset = 0x0080;
+
+        // Success — CPU will now execute the child
+        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        _log.Info("DOS", $"EXEC: child loaded at {childSeg:X4}:0100, parent saved");
+    }
+
+    /// <summary>
+    /// Load an EXE file for EXEC (with relocations, setting up CS:IP and SS:SP).
+    /// </summary>
+    private void LoadExeForExec(byte[] data, ushort pspSegment)
+    {
+        // Parse MZ header
+        ushort lastPageSize = (ushort)(data[2] | (data[3] << 8));
+        ushort totalPages = (ushort)(data[4] | (data[5] << 8));
+        ushort relocCount = (ushort)(data[6] | (data[7] << 8));
+        ushort headerParagraphs = (ushort)(data[8] | (data[9] << 8));
+        ushort initSS = (ushort)(data[14] | (data[15] << 8));
+        ushort initSP = (ushort)(data[16] | (data[17] << 8));
+        ushort initIP = (ushort)(data[20] | (data[21] << 8));
+        ushort initCS = (ushort)(data[22] | (data[23] << 8));
+        ushort relocOffset = (ushort)(data[24] | (data[25] << 8));
+
+        int headerSize = headerParagraphs * 16;
+        int imageSize = totalPages * 512;
+        if (lastPageSize > 0) imageSize -= (512 - lastPageSize);
+        imageSize -= headerSize;
+
+        ushort codeSeg = (ushort)(pspSegment + 0x10); // After PSP
+
+        // Load program image
+        int loadSize = Math.Min(imageSize, data.Length - headerSize);
+        if (loadSize > 0)
+            _mem.LoadData(codeSeg, 0x0000, data.AsSpan(headerSize, loadSize));
+
+        // Apply relocations
+        for (int i = 0; i < relocCount; i++)
+        {
+            int relocAddr = relocOffset + i * 4;
+            if (relocAddr + 4 > data.Length) break;
+
+            ushort relOff = (ushort)(data[relocAddr] | (data[relocAddr + 1] << 8));
+            ushort relSeg = (ushort)(data[relocAddr + 2] | (data[relocAddr + 3] << 8));
+
+            uint physAddr = Registers.PhysicalAddress((ushort)(codeSeg + relSeg), relOff);
+            ushort origVal = _mem.ReadWord(physAddr);
+            _mem.WriteWord(physAddr, (ushort)(origVal + codeSeg));
+        }
+
+        _cpu.Regs.CS = (ushort)(codeSeg + initCS);
+        _cpu.Regs.IP = initIP;
+        _cpu.Regs.SS = (ushort)(codeSeg + initSS);
+        _cpu.Regs.SP = initSP;
+        _cpu.Regs.DS = pspSegment;
+        _cpu.Regs.ES = pspSegment;
+    }
+
+    /// <summary>
+    /// Build a PSP for a child process, copying parent's file handles.
+    /// </summary>
+    private void BuildChildPSP(ushort childSeg, ushort parentSeg, string cmdLine, string progPath)
+    {
+        // Clear PSP area
+        for (int i = 0; i < 256; i++)
+            _mem.WriteByte(childSeg, (ushort)i, 0);
+
+        // INT 20h at PSP:0000
+        _mem.WriteByte(childSeg, 0x0000, 0xCD);
+        _mem.WriteByte(childSeg, 0x0001, 0x20);
+
+        // Memory size (top of segment)
+        _mem.WriteWord(childSeg, 0x0002, 0xA000);
+
+        // Far call to DOS at PSP:0005
+        _mem.WriteByte(childSeg, 0x0005, 0xCD);
+        _mem.WriteByte(childSeg, 0x0006, 0x21);
+        _mem.WriteByte(childSeg, 0x0007, 0xCB);
+
+        // Parent PSP segment at PSP:0016
+        _mem.WriteWord(childSeg, 0x0016, parentSeg);
+
+        // Copy file handle table from parent (PSP:0018, 20 bytes)
+        for (int i = 0; i < 20; i++)
+            _mem.WriteByte(childSeg, (ushort)(0x0018 + i), _mem.ReadByte(parentSeg, (ushort)(0x0018 + i)));
+
+        // Environment segment at PSP:002C — inherit from parent
+        ushort parentEnv = _mem.ReadWord(parentSeg, 0x002C);
+        _mem.WriteWord(childSeg, 0x002C, parentEnv);
+
+        // Command tail at PSP:0080
+        byte[] cmdBytes = System.Text.Encoding.ASCII.GetBytes(cmdLine);
+        int tailLen = Math.Min(cmdBytes.Length, 126);
+        _mem.WriteByte(childSeg, 0x0080, (byte)tailLen);
+        for (int i = 0; i < tailLen; i++)
+            _mem.WriteByte(childSeg, (ushort)(0x0081 + i), cmdBytes[i]);
+        _mem.WriteByte(childSeg, (ushort)(0x0081 + tailLen), 0x0D);
+    }
+
+    /// <summary>
+    /// EXEC subfunction 01h/03h: Load overlay (no PSP, no execute).
+    /// </summary>
+    private void ExecLoadOverlay(byte[] data, ushort loadSegment)
+    {
+        if (loadSegment == 0) loadSegment = CurrentPSP;
+
+        bool isExe = data.Length >= 2 && data[0] == 0x4D && data[1] == 0x5A;
+
+        if (isExe)
+        {
+            // Load EXE as overlay — relocate but don't set up PSP
+            ushort headerParagraphs = (ushort)(data[8] | (data[9] << 8));
+            ushort relocCount = (ushort)(data[6] | (data[7] << 8));
+            ushort relocOffset = (ushort)(data[24] | (data[25] << 8));
+            int headerSize = headerParagraphs * 16;
+            int imageSize = Math.Min(data.Length - headerSize, data.Length);
+            if (imageSize > 0)
+                _mem.LoadData(loadSegment, 0x0000, data.AsSpan(headerSize, imageSize));
+
+            for (int i = 0; i < relocCount; i++)
+            {
+                int addr = relocOffset + i * 4;
+                if (addr + 4 > data.Length) break;
+                ushort relOff = (ushort)(data[addr] | (data[addr + 1] << 8));
+                ushort relSeg = (ushort)(data[addr + 2] | (data[addr + 3] << 8));
+                uint physAddr = Registers.PhysicalAddress((ushort)(loadSegment + relSeg), relOff);
+                ushort origVal = _mem.ReadWord(physAddr);
+                _mem.WriteWord(physAddr, (ushort)(origVal + loadSegment));
+            }
+        }
+        else
+        {
+            // Load raw binary at loadSegment:0000
+            _mem.LoadData(loadSegment, 0x0000, data);
+        }
+
+        _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        _log.Info("DOS", $"EXEC overlay loaded at {loadSegment:X4}:0000 ({data.Length} bytes)");
+    }
+
+    /// <summary>
+    /// Terminate the current child process (called from INT 21h/4Ch or INT 20h).
+    /// If an EXEC parent state exists, restores it; otherwise fires ProcessTerminated.
+    /// </summary>
+    internal void TerminateChildProcess(byte returnCode)
+    {
+        _lastReturnCode = returnCode;
+
+        if (_execStack.Count > 0)
+        {
+            var parent = _execStack.Pop();
+            _log.Info("DOS", $"EXEC child terminated (code={returnCode}), restoring parent PSP={parent.ParentPSP:X4}");
+
+            // Free child memory
+            if (_memoryManager != null)
+                _memoryManager.Free(parent.ChildMemorySegment);
+
+            // Restore parent CPU state
+            _cpu.Regs.SS = parent.ParentSS;
+            _cpu.Regs.SP = parent.ParentSP;
+            _cpu.Regs.CS = parent.ParentCS;
+            _cpu.Regs.IP = parent.ParentIP;
+            _cpu.Regs.DS = parent.ParentDS;
+            _cpu.Regs.ES = parent.ParentES;
+            _cpu.Regs.SI = parent.ParentSI;
+            _cpu.Regs.DI = parent.ParentDI;
+            _cpu.Regs.BP = parent.ParentBP;
+            _cpu.Regs.Flags = parent.ParentFlags;
+
+            // Set return values as per DOS EXEC documentation
+            _cpu.Regs.AX = 0; // Success
+            _cpu.Regs.BX = parent.ParentBX;
+            _cpu.Regs.CX = parent.ParentCX;
+            _cpu.Regs.DX = parent.ParentDX;
+            _cpu.Regs.Flags &= ~CpuFlags.Carry; // Clear carry = success
+
+            // Restore parent PSP
+            CurrentPSP = parent.ParentPSP;
+            DtaSegment = parent.ParentPSP;
+            DtaOffset = 0x0080;
+        }
+        else
+        {
+            // No parent — top-level process termination
+            ProcessTerminated?.Invoke(returnCode);
+        }
+    }
+
+    /// <summary>Saved state for a parent process during EXEC.</summary>
+    private sealed class ExecState
+    {
+        public ushort ParentPSP;
+        public ushort ParentSS, ParentSP;
+        public ushort ParentCS, ParentIP;
+        public ushort ParentAX, ParentBX, ParentCX, ParentDX;
+        public ushort ParentSI, ParentDI, ParentBP;
+        public ushort ParentDS, ParentES;
+        public CpuFlags ParentFlags;
+        public ushort ChildMemorySegment;
+        public string ProgramPath = "";
     }
 
     /// <summary>Set the current directory for a drive.</summary>
@@ -1538,17 +1896,36 @@ public sealed class DosKernel
 
     private void HandleFileDateTime()
     {
+        ushort handle = _cpu.Regs.BX;
         if (_cpu.Regs.AL == 0) // Get
         {
-            // Return current time in DOS packed format
-            var now = DateTime.Now;
-            _cpu.Regs.CX = (ushort)((now.Hour << 11) | (now.Minute << 5) | (now.Second / 2));
-            _cpu.Regs.DX = (ushort)(((now.Year - 1980) << 9) | (now.Month << 5) | now.Day);
+            if (_fileHandles.TryGetValue(handle, out var fh))
+            {
+                _cpu.Regs.CX = fh.DosTime;
+                _cpu.Regs.DX = fh.DosDate;
+            }
+            else
+            {
+                // Fallback: return current time
+                var now = DateTime.Now;
+                _cpu.Regs.CX = DosFileHandle.PackDosTime(now);
+                _cpu.Regs.DX = DosFileHandle.PackDosDate(now);
+            }
+            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+        }
+        else if (_cpu.Regs.AL == 1) // Set
+        {
+            if (_fileHandles.TryGetValue(handle, out var fh))
+            {
+                fh.DosTime = _cpu.Regs.CX;
+                fh.DosDate = _cpu.Regs.DX;
+            }
             _cpu.Regs.Flags &= ~CpuFlags.Carry;
         }
         else
         {
-            _cpu.Regs.Flags &= ~CpuFlags.Carry;
+            _cpu.Regs.AX = 0x01; // Invalid function
+            _cpu.Regs.Flags |= CpuFlags.Carry;
         }
     }
 
@@ -1556,7 +1933,635 @@ public sealed class DosKernel
     {
         public string Path { get; }
         public Stream Stream { get; }
-        public DosFileHandle(string path, Stream stream) { Path = path; Stream = stream; }
+        public ushort DosTime { get; set; }
+        public ushort DosDate { get; set; }
+
+        public DosFileHandle(string path, Stream stream)
+        {
+            Path = path;
+            Stream = stream;
+            var now = DateTime.Now;
+            DosTime = PackDosTime(now);
+            DosDate = PackDosDate(now);
+        }
+
+        public static ushort PackDosTime(DateTime dt) =>
+            (ushort)((dt.Hour << 11) | (dt.Minute << 5) | (dt.Second / 2));
+
+        public static ushort PackDosDate(DateTime dt) =>
+            (ushort)(((dt.Year - 1980) << 9) | (dt.Month << 5) | dt.Day);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  FCB HELPERS
+    // ═══════════════════════════════════════════════════════════════
+
+    // FCB structure offsets:
+    //  00: drive (0=default, 1=A, 2=B, ...)
+    //  01-08: filename (8 chars, space-padded)
+    //  09-0B: extension (3 chars, space-padded)
+    //  0C-0D: current block number (word)
+    //  0E-0F: record size (word, default 128)
+    //  10-13: file size (dword)
+    //  14-15: date
+    //  16-17: time
+    //  18-1F: reserved (8 bytes — we store our handle ID in 18-19)
+    //  20: current record within block
+    //  21-24: random record number (dword, but byte 24 is only for record size < 64)
+
+    private (ushort seg, ushort off) GetFcbAddress() => (_cpu.Regs.DS, _cpu.Regs.DX);
+
+    private string ReadFcbFilename(ushort seg, ushort off)
+    {
+        byte drive = _mem.ReadByte(seg, off);
+        char driveLetter = drive == 0 ? (char)('A' + _currentDrive) : (char)('A' + drive - 1);
+
+        var name = new char[8];
+        for (int i = 0; i < 8; i++) name[i] = (char)_mem.ReadByte(seg, (ushort)(off + 1 + i));
+        var ext = new char[3];
+        for (int i = 0; i < 3; i++) ext[i] = (char)_mem.ReadByte(seg, (ushort)(off + 9 + i));
+
+        string fname = new string(name).TrimEnd();
+        string fext = new string(ext).TrimEnd();
+
+        string filename = string.IsNullOrEmpty(fext) ? fname : $"{fname}.{fext}";
+        return $"{driveLetter}:{filename}";
+    }
+
+    private uint FcbKey(ushort seg, ushort off) => ((uint)seg << 16) | off;
+
+    private ushort ReadFcbWord(ushort seg, ushort off, int fieldOffset) =>
+        _mem.ReadWord(seg, (ushort)(off + fieldOffset));
+
+    private void WriteFcbWord(ushort seg, ushort off, int fieldOffset, ushort value) =>
+        _mem.WriteWord(seg, (ushort)(off + fieldOffset), value);
+
+    private uint ReadFcbDword(ushort seg, ushort off, int fieldOffset)
+    {
+        ushort lo = _mem.ReadWord(seg, (ushort)(off + fieldOffset));
+        ushort hi = _mem.ReadWord(seg, (ushort)(off + fieldOffset + 2));
+        return ((uint)hi << 16) | lo;
+    }
+
+    private void WriteFcbDword(ushort seg, ushort off, int fieldOffset, uint value)
+    {
+        _mem.WriteWord(seg, (ushort)(off + fieldOffset), (ushort)(value & 0xFFFF));
+        _mem.WriteWord(seg, (ushort)(off + fieldOffset + 2), (ushort)(value >> 16));
+    }
+
+    private ushort GetFcbRecordSize(ushort seg, ushort off)
+    {
+        ushort rs = ReadFcbWord(seg, off, 0x0E);
+        return rs == 0 ? (ushort)128 : rs;
+    }
+
+    private uint GetFcbSequentialPosition(ushort seg, ushort off)
+    {
+        ushort block = ReadFcbWord(seg, off, 0x0C);
+        byte rec = _mem.ReadByte(seg, (ushort)(off + 0x20));
+        return (uint)(block * 128 + rec);
+    }
+
+    private void SetFcbSequentialPosition(ushort seg, ushort off, uint recordNumber)
+    {
+        WriteFcbWord(seg, off, 0x0C, (ushort)(recordNumber / 128));
+        _mem.WriteByte(seg, (ushort)(off + 0x20), (byte)(recordNumber % 128));
+    }
+
+    private uint GetFcbRandomRecord(ushort seg, ushort off)
+    {
+        return ReadFcbDword(seg, off, 0x21);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  FCB OPERATIONS
+    // ═══════════════════════════════════════════════════════════════
+
+    private void HandleFcbOpen()
+    {
+        var (seg, off) = GetFcbAddress();
+        string path = ReadFcbFilename(seg, off);
+        _log.Debug("DOS", $"FCB Open: {path}");
+
+        try
+        {
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            var stream = provider.OpenReadWriteAsync(resolvedPath).GetAwaiter().GetResult();
+            ushort handle = _nextHandle++;
+            _fileHandles[handle] = new DosFileHandle(path, stream);
+
+            uint key = FcbKey(seg, off);
+            _fcbHandles[key] = handle;
+
+            // Fill FCB fields
+            WriteFcbWord(seg, off, 0x0C, 0);   // current block = 0
+            WriteFcbWord(seg, off, 0x0E, 128);  // record size = 128
+            long size = stream.Length;
+            WriteFcbDword(seg, off, 0x10, (uint)Math.Min(size, uint.MaxValue));
+            var now = DateTime.Now;
+            WriteFcbWord(seg, off, 0x14, DosFileHandle.PackDosDate(now));
+            WriteFcbWord(seg, off, 0x16, DosFileHandle.PackDosTime(now));
+            // Store handle in reserved area
+            WriteFcbWord(seg, off, 0x18, handle);
+            _mem.WriteByte(seg, (ushort)(off + 0x20), 0); // current record = 0
+
+            _cpu.Regs.AL = 0x00; // Success
+        }
+        catch
+        {
+            _cpu.Regs.AL = 0xFF; // Not found
+        }
+    }
+
+    private void HandleFcbClose()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint key = FcbKey(seg, off);
+
+        if (_fcbHandles.TryGetValue(key, out ushort handle))
+        {
+            if (_fileHandles.TryGetValue(handle, out var fh))
+            {
+                fh.Stream.Dispose();
+                _fileHandles.Remove(handle);
+            }
+            _fcbHandles.Remove(key);
+            _cpu.Regs.AL = 0x00;
+        }
+        else
+        {
+            // Try from reserved area
+            ushort storedHandle = ReadFcbWord(seg, off, 0x18);
+            if (_fileHandles.TryGetValue(storedHandle, out var fh2))
+            {
+                fh2.Stream.Dispose();
+                _fileHandles.Remove(storedHandle);
+                _cpu.Regs.AL = 0x00;
+            }
+            else
+            {
+                _cpu.Regs.AL = 0xFF; // FCB not found
+            }
+        }
+    }
+
+    private void HandleFcbDelete()
+    {
+        var (seg, off) = GetFcbAddress();
+        string path = ReadFcbFilename(seg, off);
+        _log.Debug("DOS", $"FCB Delete: {path}");
+
+        try
+        {
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            provider.DeleteAsync(resolvedPath).GetAwaiter().GetResult();
+            _cpu.Regs.AL = 0x00;
+        }
+        catch
+        {
+            _cpu.Regs.AL = 0xFF;
+        }
+    }
+
+    private void HandleFcbSequentialRead()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint key = FcbKey(seg, off);
+        ushort handle = _fcbHandles.TryGetValue(key, out var h) ? h : ReadFcbWord(seg, off, 0x18);
+
+        if (!_fileHandles.TryGetValue(handle, out var fh))
+        {
+            _cpu.Regs.AL = 0xFF; // FCB not opened
+            return;
+        }
+
+        ushort recordSize = GetFcbRecordSize(seg, off);
+        uint recordNum = GetFcbSequentialPosition(seg, off);
+        long offset2 = (long)recordNum * recordSize;
+
+        if (offset2 >= fh.Stream.Length)
+        {
+            _cpu.Regs.AL = 0x01; // EOF
+            return;
+        }
+
+        fh.Stream.Position = offset2;
+        byte[] buffer = new byte[recordSize];
+        int read = fh.Stream.Read(buffer, 0, recordSize);
+
+        // Write to DTA
+        for (int i = 0; i < recordSize; i++)
+            _mem.WriteByte(DtaSegment, (ushort)(DtaOffset + i), i < read ? buffer[i] : (byte)0);
+
+        SetFcbSequentialPosition(seg, off, recordNum + 1);
+        _cpu.Regs.AL = read < recordSize ? (byte)0x03 : (byte)0x00;
+    }
+
+    private void HandleFcbSequentialWrite()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint key = FcbKey(seg, off);
+        ushort handle = _fcbHandles.TryGetValue(key, out var h) ? h : ReadFcbWord(seg, off, 0x18);
+
+        if (!_fileHandles.TryGetValue(handle, out var fh))
+        {
+            _cpu.Regs.AL = 0xFF; // FCB not opened
+            return;
+        }
+
+        ushort recordSize = GetFcbRecordSize(seg, off);
+        uint recordNum = GetFcbSequentialPosition(seg, off);
+        long offset2 = (long)recordNum * recordSize;
+
+        byte[] buffer = new byte[recordSize];
+        for (int i = 0; i < recordSize; i++)
+            buffer[i] = _mem.ReadByte(DtaSegment, (ushort)(DtaOffset + i));
+
+        fh.Stream.Position = offset2;
+        fh.Stream.Write(buffer, 0, recordSize);
+        fh.Stream.Flush();
+
+        SetFcbSequentialPosition(seg, off, recordNum + 1);
+        // Update file size in FCB
+        WriteFcbDword(seg, off, 0x10, (uint)Math.Min(fh.Stream.Length, uint.MaxValue));
+        _cpu.Regs.AL = 0x00;
+    }
+
+    private void HandleFcbCreate()
+    {
+        var (seg, off) = GetFcbAddress();
+        string path = ReadFcbFilename(seg, off);
+        _log.Debug("DOS", $"FCB Create: {path}");
+
+        try
+        {
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            var stream = provider.OpenWriteAsync(resolvedPath).GetAwaiter().GetResult();
+            ushort handle = _nextHandle++;
+            _fileHandles[handle] = new DosFileHandle(path, stream);
+
+            uint key = FcbKey(seg, off);
+            _fcbHandles[key] = handle;
+
+            WriteFcbWord(seg, off, 0x0C, 0);
+            WriteFcbWord(seg, off, 0x0E, 128);
+            WriteFcbDword(seg, off, 0x10, 0);
+            var now = DateTime.Now;
+            WriteFcbWord(seg, off, 0x14, DosFileHandle.PackDosDate(now));
+            WriteFcbWord(seg, off, 0x16, DosFileHandle.PackDosTime(now));
+            WriteFcbWord(seg, off, 0x18, handle);
+            _mem.WriteByte(seg, (ushort)(off + 0x20), 0);
+
+            _cpu.Regs.AL = 0x00;
+        }
+        catch
+        {
+            _cpu.Regs.AL = 0xFF;
+        }
+    }
+
+    private void HandleFcbRename()
+    {
+        var (seg, off) = GetFcbAddress();
+        string oldPath = ReadFcbFilename(seg, off);
+
+        // New name is at offset 0x11 in the modified FCB
+        var newName = new char[8];
+        for (int i = 0; i < 8; i++) newName[i] = (char)_mem.ReadByte(seg, (ushort)(off + 0x11 + i));
+        var newExt = new char[3];
+        for (int i = 0; i < 3; i++) newExt[i] = (char)_mem.ReadByte(seg, (ushort)(off + 0x19 + i));
+
+        string fname = new string(newName).TrimEnd();
+        string fext = new string(newExt).TrimEnd();
+        string newFilename = string.IsNullOrEmpty(fext) ? fname : $"{fname}.{fext}";
+
+        // Get drive from old path
+        string drivePart = oldPath.Length >= 2 && oldPath[1] == ':' ? oldPath[..2] : "";
+        string newPath = $"{drivePart}{newFilename}";
+
+        _log.Debug("DOS", $"FCB Rename: {oldPath} → {newPath}");
+
+        try
+        {
+            var (provider, resolvedOld) = ResolveFilePath(oldPath);
+            var (_, resolvedNew) = ResolveFilePath(newPath);
+            provider.RenameAsync(resolvedOld, resolvedNew).GetAwaiter().GetResult();
+            _cpu.Regs.AL = 0x00;
+        }
+        catch
+        {
+            _cpu.Regs.AL = 0xFF;
+        }
+    }
+
+    private void HandleFcbRandomRead()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint key = FcbKey(seg, off);
+        ushort handle = _fcbHandles.TryGetValue(key, out var h) ? h : ReadFcbWord(seg, off, 0x18);
+
+        if (!_fileHandles.TryGetValue(handle, out var fh))
+        {
+            _cpu.Regs.AL = 0xFF; // FCB not opened
+            return;
+        }
+
+        ushort recordSize = GetFcbRecordSize(seg, off);
+        uint recordNum = GetFcbRandomRecord(seg, off);
+        long offset2 = (long)recordNum * recordSize;
+
+        if (offset2 >= fh.Stream.Length)
+        {
+            _cpu.Regs.AL = 0x01;
+            return;
+        }
+
+        fh.Stream.Position = offset2;
+        byte[] buffer = new byte[recordSize];
+        int read = fh.Stream.Read(buffer, 0, recordSize);
+
+        for (int i = 0; i < recordSize; i++)
+            _mem.WriteByte(DtaSegment, (ushort)(DtaOffset + i), i < read ? buffer[i] : (byte)0);
+
+        // Update sequential position from random
+        SetFcbSequentialPosition(seg, off, recordNum);
+        _cpu.Regs.AL = read < recordSize ? (byte)0x03 : (byte)0x00;
+    }
+
+    private void HandleFcbRandomWrite()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint key = FcbKey(seg, off);
+        ushort handle = _fcbHandles.TryGetValue(key, out var h) ? h : ReadFcbWord(seg, off, 0x18);
+
+        if (!_fileHandles.TryGetValue(handle, out var fh))
+        {
+            _cpu.Regs.AL = 0xFF; // FCB not opened
+            return;
+        }
+
+        ushort recordSize = GetFcbRecordSize(seg, off);
+        uint recordNum = GetFcbRandomRecord(seg, off);
+        long offset2 = (long)recordNum * recordSize;
+
+        byte[] buffer = new byte[recordSize];
+        for (int i = 0; i < recordSize; i++)
+            buffer[i] = _mem.ReadByte(DtaSegment, (ushort)(DtaOffset + i));
+
+        fh.Stream.Position = offset2;
+        fh.Stream.Write(buffer, 0, recordSize);
+        fh.Stream.Flush();
+
+        SetFcbSequentialPosition(seg, off, recordNum);
+        WriteFcbDword(seg, off, 0x10, (uint)Math.Min(fh.Stream.Length, uint.MaxValue));
+        _cpu.Regs.AL = 0x00;
+    }
+
+    private void HandleFcbGetFileSize()
+    {
+        var (seg, off) = GetFcbAddress();
+        string path = ReadFcbFilename(seg, off);
+
+        try
+        {
+            var (provider, resolvedPath) = ResolveFilePath(path);
+            long size = provider.GetFileSizeAsync(resolvedPath).GetAwaiter().GetResult();
+            ushort recordSize = GetFcbRecordSize(seg, off);
+            uint records = (uint)((size + recordSize - 1) / recordSize);
+            WriteFcbDword(seg, off, 0x21, records);
+            _cpu.Regs.AL = 0x00;
+        }
+        catch
+        {
+            _cpu.Regs.AL = 0xFF;
+        }
+    }
+
+    private void HandleFcbSetRandomRecord()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint seqPos = GetFcbSequentialPosition(seg, off);
+        WriteFcbDword(seg, off, 0x21, seqPos);
+    }
+
+    private void HandleFcbRandomBlockRead()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint key = FcbKey(seg, off);
+        ushort handle = _fcbHandles.TryGetValue(key, out var h) ? h : ReadFcbWord(seg, off, 0x18);
+        ushort count = _cpu.Regs.CX;
+
+        if (!_fileHandles.TryGetValue(handle, out var fh))
+        {
+            _cpu.Regs.AL = 0xFF; // FCB not opened
+            _cpu.Regs.CX = 0;
+            return;
+        }
+
+        ushort recordSize = GetFcbRecordSize(seg, off);
+        uint recordNum = GetFcbRandomRecord(seg, off);
+        ushort recordsRead = 0;
+        ushort dtaPos = 0;
+
+        for (ushort i = 0; i < count; i++)
+        {
+            long offset2 = (long)(recordNum + i) * recordSize;
+            if (offset2 >= fh.Stream.Length) break;
+
+            fh.Stream.Position = offset2;
+            byte[] buffer = new byte[recordSize];
+            int read = fh.Stream.Read(buffer, 0, recordSize);
+
+            for (int j = 0; j < recordSize; j++)
+                _mem.WriteByte(DtaSegment, (ushort)(DtaOffset + dtaPos + j), j < read ? buffer[j] : (byte)0);
+
+            dtaPos += recordSize;
+            recordsRead++;
+            if (read < recordSize) { recordsRead++; break; }
+        }
+
+        WriteFcbDword(seg, off, 0x21, recordNum + recordsRead);
+        SetFcbSequentialPosition(seg, off, recordNum + recordsRead);
+        _cpu.Regs.CX = recordsRead;
+        _cpu.Regs.AL = recordsRead == count ? (byte)0x00 : (byte)0x01;
+    }
+
+    private void HandleFcbRandomBlockWrite()
+    {
+        var (seg, off) = GetFcbAddress();
+        uint key = FcbKey(seg, off);
+        ushort handle = _fcbHandles.TryGetValue(key, out var h) ? h : ReadFcbWord(seg, off, 0x18);
+        ushort count = _cpu.Regs.CX;
+
+        if (!_fileHandles.TryGetValue(handle, out var fh))
+        {
+            _cpu.Regs.AL = 0xFF; // FCB not opened
+            _cpu.Regs.CX = 0;
+            return;
+        }
+
+        ushort recordSize = GetFcbRecordSize(seg, off);
+        uint recordNum = GetFcbRandomRecord(seg, off);
+
+        if (count == 0)
+        {
+            // Truncate file to current random record position
+            fh.Stream.SetLength((long)recordNum * recordSize);
+            _cpu.Regs.CX = 0;
+            _cpu.Regs.AL = 0x00;
+            return;
+        }
+
+        ushort dtaPos = 0;
+        for (ushort i = 0; i < count; i++)
+        {
+            long offset2 = (long)(recordNum + i) * recordSize;
+            byte[] buffer = new byte[recordSize];
+            for (int j = 0; j < recordSize; j++)
+                buffer[j] = _mem.ReadByte(DtaSegment, (ushort)(DtaOffset + dtaPos + j));
+
+            fh.Stream.Position = offset2;
+            fh.Stream.Write(buffer, 0, recordSize);
+            dtaPos += recordSize;
+        }
+        fh.Stream.Flush();
+
+        WriteFcbDword(seg, off, 0x21, recordNum + count);
+        SetFcbSequentialPosition(seg, off, recordNum + count);
+        WriteFcbDword(seg, off, 0x10, (uint)Math.Min(fh.Stream.Length, uint.MaxValue));
+        _cpu.Regs.CX = count;
+        _cpu.Regs.AL = 0x00;
+    }
+
+    private void HandleFcbFindFirst()
+    {
+        var (seg, off) = GetFcbAddress();
+        string path = ReadFcbFilename(seg, off);
+        _fcbFindIndex = 0;
+
+        try
+        {
+            // Parse drive:pattern
+            string dir = "";
+            string filePattern = path;
+            if (path.Length >= 2 && path[1] == ':')
+            {
+                filePattern = path[2..];
+            }
+
+            int lastSep = filePattern.LastIndexOfAny(new[] { '\\', '/' });
+            if (lastSep >= 0)
+            {
+                dir = filePattern[..lastSep];
+                filePattern = filePattern[(lastSep + 1)..];
+            }
+            _fcbFindPattern = filePattern;
+
+            // Get drive letter from FCB
+            byte drive = _mem.ReadByte(seg, off);
+            char driveLetter = drive == 0 ? (char)('A' + _currentDrive) : (char)('A' + drive - 1);
+            string fullDir = $"{driveLetter}:{(dir.Length > 0 ? dir : ".")}";
+
+            var (provider, resolvedDir) = ResolveFilePath(fullDir);
+            var entries = provider.ListEntriesAsync(resolvedDir).GetAwaiter().GetResult();
+
+            _fcbFindResults = entries
+                .Where(e => MatchWildcard(filePattern, Path.GetFileName(e.TrimEnd('\\', '/'))))
+                .ToList();
+
+            if (_fcbFindResults.Count > 0)
+            {
+                WriteFcbFindResult(_fcbFindResults[0]);
+                _fcbFindIndex = 1;
+                _cpu.Regs.AL = 0x00;
+            }
+            else
+            {
+                _cpu.Regs.AL = 0xFF;
+            }
+        }
+        catch
+        {
+            _cpu.Regs.AL = 0xFF;
+        }
+    }
+
+    private void HandleFcbFindNext()
+    {
+        if (_fcbFindResults != null && _fcbFindIndex < _fcbFindResults.Count)
+        {
+            WriteFcbFindResult(_fcbFindResults[_fcbFindIndex]);
+            _fcbFindIndex++;
+            _cpu.Regs.AL = 0x00;
+        }
+        else
+        {
+            _cpu.Regs.AL = 0xFF;
+        }
+    }
+
+    /// <summary>Write an FCB FindFirst/FindNext result to the DTA in FCB format.</summary>
+    private void WriteFcbFindResult(string filename)
+    {
+        ushort seg = DtaSegment;
+        ushort off = DtaOffset;
+
+        // Clear 44 bytes (extended FCB result)
+        for (int i = 0; i < 44; i++)
+            _mem.WriteByte(seg, (ushort)(off + i), 0);
+
+        string name = Path.GetFileName(filename.TrimEnd('\\', '/')).ToUpperInvariant();
+        bool isDir = filename.EndsWith('/') || filename.EndsWith('\\');
+
+        // Drive number at offset 0
+        _mem.WriteByte(seg, off, (byte)(_currentDrive + 1));
+
+        // Filename at offset 1-8, extension at offset 9-11
+        string baseName, ext;
+        int dotIdx = name.IndexOf('.');
+        if (dotIdx >= 0)
+        {
+            baseName = name[..dotIdx];
+            ext = name[(dotIdx + 1)..];
+        }
+        else
+        {
+            baseName = name;
+            ext = "";
+        }
+
+        for (int i = 0; i < 8; i++)
+            _mem.WriteByte(seg, (ushort)(off + 1 + i), i < baseName.Length ? (byte)baseName[i] : (byte)' ');
+        for (int i = 0; i < 3; i++)
+            _mem.WriteByte(seg, (ushort)(off + 9 + i), i < ext.Length ? (byte)ext[i] : (byte)' ');
+
+        // Attribute at offset 0x15 (21)
+        _mem.WriteByte(seg, (ushort)(off + 0x15), isDir ? (byte)0x10 : (byte)0x20);
+
+        // Time/date at offset 0x16-0x19
+        var now = DateTime.Now;
+        _mem.WriteWord(seg, (ushort)(off + 0x16), DosFileHandle.PackDosTime(now));
+        _mem.WriteWord(seg, (ushort)(off + 0x18), DosFileHandle.PackDosDate(now));
+
+        // File size at offset 0x1A-0x1D
+        if (!isDir)
+        {
+            try
+            {
+                string dir = "";
+                int lastSep = _fcbFindPattern.LastIndexOfAny(new[] { '\\', '/' });
+                if (lastSep >= 0) dir = _fcbFindPattern[..lastSep];
+
+                var (provider, resolvedDir) = ResolveFilePath(dir.Length > 0 ? dir : ".");
+                string filePath = string.IsNullOrEmpty(resolvedDir) || resolvedDir == "."
+                    ? name
+                    : Path.Combine(resolvedDir, name);
+                long size = provider.GetFileSizeAsync(filePath).GetAwaiter().GetResult();
+                _mem.WriteWord(seg, (ushort)(off + 0x1A), (ushort)(size & 0xFFFF));
+                _mem.WriteWord(seg, (ushort)(off + 0x1C), (ushort)((size >> 16) & 0xFFFF));
+            }
+            catch { /* size remains 0 */ }
+        }
     }
 
     private void HandleParseFilename()

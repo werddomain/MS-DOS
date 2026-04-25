@@ -64,11 +64,19 @@ public sealed class WinFormsRenderer : IGraphicsRenderer, IDisposable
                 ResizeBuffer(640, 400);
                 break;
             case VideoMode.Graphics320x200_4:
+            case VideoMode.Graphics320x200_16:
             case VideoMode.Graphics320x200_256:
                 ResizeBuffer(320, 200);
                 break;
             case VideoMode.Graphics640x200_2:
+            case VideoMode.Graphics640x200_16:
                 ResizeBuffer(640, 200);
+                break;
+            case VideoMode.Graphics640x350_16:
+                ResizeBuffer(640, 350);
+                break;
+            case VideoMode.Graphics640x480_16:
+                ResizeBuffer(640, 480);
                 break;
         }
         _charBuffer = new char[_textCols, _textRows];

@@ -40,23 +40,23 @@ public class DosKernelExtendedTests
         public bool IsKeyAvailable => false;
         public Task<DosKeyEventArgs> ReadKeyAsync(CancellationToken ct = default)
             => Task.FromResult(new DosKeyEventArgs());
-        public void RaiseKeyDown() => KeyDown?.Invoke(new DosKeyEventArgs());
-        public void RaiseKeyUp() => KeyUp?.Invoke(new DosKeyEventArgs());
+        public void RaiseKeyDown(DosKeyEventArgs args) => KeyDown?.Invoke(args);
+        public void RaiseKeyUp(DosKeyEventArgs args) => KeyUp?.Invoke(args);
     }
 
     private sealed class StubStreamProvider : IStreamProvider
     {
         public Task<Stream> OpenReadAsync(string path) => throw new FileNotFoundException();
-        public Task<Stream> OpenWriteAsync(string path) => Task.FromResult<Stream>(new MemoryStream());
-        public Task<Stream> OpenReadWriteAsync(string path) => Task.FromResult<Stream>(new MemoryStream());
+        public Task<Stream> OpenWriteAsync(string path) => throw new FileNotFoundException();
+        public Task<Stream> OpenReadWriteAsync(string path) => throw new FileNotFoundException();
         public Task<bool> ExistsAsync(string path) => Task.FromResult(false);
-        public Task DeleteAsync(string path) => Task.CompletedTask;
+        public Task DeleteAsync(string path) => throw new FileNotFoundException();
         public Task<IReadOnlyList<string>> ListEntriesAsync(string directoryPath) => Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
         public Task ImportBinaryAsync(string targetPath, byte[] data) => Task.CompletedTask;
         public Task CreateDirectoryAsync(string path) => Task.CompletedTask;
         public Task DeleteDirectoryAsync(string path) => Task.CompletedTask;
-        public Task RenameAsync(string oldPath, string newPath) => Task.CompletedTask;
-        public Task<long> GetFileSizeAsync(string path) => Task.FromResult(-1L);
+        public Task RenameAsync(string oldPath, string newPath) => throw new FileNotFoundException();
+        public Task<long> GetFileSizeAsync(string path) => throw new FileNotFoundException();
     }
 
     private readonly MemoryBus _mem = new();
@@ -203,7 +203,6 @@ public class DosKernelExtendedTests
     [InlineData(0x21)] // Random read FCB
     [InlineData(0x22)] // Random write FCB
     [InlineData(0x23)] // Get file size FCB
-    [InlineData(0x24)] // Set random record FCB
     [InlineData(0x27)] // Random block read FCB
     [InlineData(0x28)] // Random block write FCB
     public void Handle_FcbStubs_ReturnAL_FF(byte func)

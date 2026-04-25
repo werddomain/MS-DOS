@@ -24,6 +24,9 @@ public sealed class BiosDiskService
     /// </summary>
     private readonly Dictionary<byte, (byte heads, byte spt, ushort cylinders, ushort bps)> _geometry = new();
 
+    /// <summary>Tracks whether a disk was changed (inserted/ejected) per drive, for INT 13h AH=16h.</summary>
+    private readonly HashSet<byte> _diskChanged = new();
+
     private byte _lastStatus;
 
     public BiosDiskService(Cpu8086 cpu, MemoryBus mem, EmulatorLog log)
@@ -41,7 +44,17 @@ public sealed class BiosDiskService
     {
         _diskImages[driveNumber] = imageData;
         _geometry[driveNumber] = (heads, sectorsPerTrack, cylinders, bytesPerSector);
+        _diskChanged.Add(driveNumber); // Signal disk change for AH=16h
         _log.Info("INT13", $"Registered drive 0x{driveNumber:X2}: {imageData.Length} bytes, C={cylinders} H={heads} S={sectorsPerTrack}");
+    }
+
+    /// <summary>Unregister a disk image from the given BIOS drive number.</summary>
+    public void UnregisterDisk(byte driveNumber)
+    {
+        _diskImages.Remove(driveNumber);
+        _geometry.Remove(driveNumber);
+        _diskChanged.Add(driveNumber); // Signal disk change for AH=16h
+        _log.Info("INT13", $"Unregistered drive 0x{driveNumber:X2}");
     }
 
     /// <summary>Auto-register a disk image with geometry guessed from size.</summary>
@@ -63,8 +76,26 @@ public sealed class BiosDiskService
             1228800 => (2, 15, 80),  // 1.2M
             1474560 => (2, 18, 80),  // 1.44M
             2949120 => (2, 36, 80),  // 2.88M
-            _ => (2, 18, (ushort)(size / (2 * 18 * 512)))
+            _ => GuessHardDiskGeometry(size)
         };
+    }
+
+    private static (byte heads, byte spt, ushort cylinders) GuessHardDiskGeometry(int size)
+    {
+        int totalSectors = size / 512;
+
+        // For images > ~3MB, use hard-drive-style CHS (16 heads, 63 spt)
+        if (totalSectors > 5760)
+        {
+            const byte heads = 16;
+            const byte spt = 63;
+            ushort cyls = (ushort)(totalSectors / (heads * spt));
+            if (cyls < 1) cyls = 1;
+            return (heads, spt, cyls);
+        }
+
+        // Small image — fall back to floppy-like geometry
+        return (2, 18, (ushort)(totalSectors / (2 * 18)));
     }
 
     public void Handle()
@@ -76,6 +107,7 @@ public sealed class BiosDiskService
         {
             case 0x00: // Reset disk system
                 _lastStatus = 0;
+                _diskChanged.Remove(drive); // Acknowledge disk change
                 _cpu.Regs.AH = 0;
                 _cpu.Regs.Flags &= ~CpuFlags.Carry;
                 break;
@@ -162,8 +194,18 @@ public sealed class BiosDiskService
                 break;
 
             case 0x16: // Detect disk change
-                _cpu.Regs.AH = 0x00; // No change
-                _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                if (_diskChanged.Contains(drive))
+                {
+                    _diskChanged.Remove(drive);
+                    _cpu.Regs.AH = 0x06; // Disk changed
+                    _cpu.Regs.Flags |= CpuFlags.Carry;
+                    _log.Debug("INT13", $"Disk change detected on drive 0x{drive:X2}");
+                }
+                else
+                {
+                    _cpu.Regs.AH = 0x00; // No change
+                    _cpu.Regs.Flags &= ~CpuFlags.Carry;
+                }
                 break;
 
             default:
@@ -197,7 +239,7 @@ public sealed class BiosDiskService
         long lba = ((long)cylinder * geo.heads + head) * geo.spt + (sector - 1);
         long byteOffset = lba * geo.bps;
 
-        _log.Debug("INT13", $"Read {sectors} sector(s): C={cylinder} H={head} S={sector} → LBA={lba} → offset=0x{byteOffset:X}");
+        _log.Debug("INT13", $"Read {sectors} sector(s) drive=0x{drive:X2}: C={cylinder} H={head} S={sector} → LBA={lba} → offset=0x{byteOffset:X}");
 
         int bytesRead = 0;
         for (int i = 0; i < sectors; i++)
@@ -246,7 +288,7 @@ public sealed class BiosDiskService
         long lba = ((long)cylinder * geo.heads + head) * geo.spt + (sector - 1);
         long byteOffset = lba * geo.bps;
 
-        _log.Debug("INT13", $"Write {sectors} sector(s): C={cylinder} H={head} S={sector} → LBA={lba}");
+        _log.Debug("INT13", $"Write {sectors} sector(s) drive=0x{drive:X2}: C={cylinder} H={head} S={sector} → LBA={lba}");
 
         int bytesWritten = 0;
         for (int i = 0; i < sectors; i++)
@@ -288,7 +330,19 @@ public sealed class BiosDiskService
         _cpu.Regs.CH = (byte)((geo.cylinders - 1) & 0xFF);
         _cpu.Regs.CL = (byte)(((( geo.cylinders - 1) >> 2) & 0xC0) | (geo.spt & 0x3F));
         _cpu.Regs.DH = (byte)(geo.heads - 1);
-        _cpu.Regs.DL = (byte)(drive < 0x80 ? 1 : 1); // Number of drives
+        // Return count of drives — always report 2 floppy bays (standard PC)
+        // to prevent DOS phantom B: aliasing where B: mirrors A:
+        if (drive < 0x80)
+        {
+            _cpu.Regs.DL = 2;  // Always 2 floppy drives (A: and B:)
+        }
+        else
+        {
+            int hddCount = 0;
+            foreach (var d in _geometry.Keys)
+                if (d >= 0x80) hddCount++;
+            _cpu.Regs.DL = (byte)hddCount;
+        }
         _cpu.Regs.Flags &= ~CpuFlags.Carry;
     }
 }

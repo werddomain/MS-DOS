@@ -38,6 +38,18 @@ public sealed class WinFormsEventRegistry : IEventRegistry
         return key ?? new DosKeyEventArgs();
     }
 
+    public void RaiseKeyDown(DosKeyEventArgs args)
+    {
+        _keyBuffer.Enqueue(args);
+        _keySemaphore.Release();
+        KeyDown?.Invoke(args);
+    }
+
+    public void RaiseKeyUp(DosKeyEventArgs args)
+    {
+        KeyUp?.Invoke(args);
+    }
+
     private void OnKeyDown(object? sender, KeyEventArgs e)
     {
         var dosKey = MapKey(e);
