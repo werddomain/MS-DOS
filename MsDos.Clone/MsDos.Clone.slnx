@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MsDos.Blazor/MsDos.Blazor.csproj" />
+    <Project Path="src/MsDos.Core/MsDos.Core.csproj" />
+    <Project Path="src/MsDos.Tests/MsDos.Tests.csproj" />
+    <Project Path="src/MsDos.WinForms/MsDos.WinForms.csproj" />
+  </Folder>
+</Solution>

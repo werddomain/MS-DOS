@@ -1,0 +1,236 @@
+using MsDos.Core.Cpu;
+using MsDos.Core.Memory;
+
+namespace MsDos.Core.Dos;
+
+/// <summary>
+/// Loads DOS binary executables (COM and EXE format) into memory
+/// and prepares the CPU state for execution.
+/// </summary>
+public sealed class BinaryLoader
+{
+    private readonly MemoryBus _mem;
+    private readonly Cpu8086 _cpu;
+
+    /// <summary>Default load segment for COM files.</summary>
+    private const ushort DefaultLoadSegment = 0x1000;
+
+    /// <summary>
+    /// Environment variables to write into the PSP environment block.
+    /// If null or empty, defaults (COMSPEC, PATH) are derived from the program path.
+    /// </summary>
+    public Dictionary<string, string>? EnvironmentVariables { get; set; }
+
+    public BinaryLoader(MemoryBus mem, Cpu8086 cpu)
+    {
+        _mem = mem;
+        _cpu = cpu;
+    }
+
+    /// <summary>
+    /// Load and prepare a binary file for execution.
+    /// Detects format from header (EXE has 'MZ' signature) or defaults to COM.
+    /// </summary>
+    /// <param name="data">Raw binary file data.</param>
+    /// <param name="loadSegment">Segment to load at (default 0x1000).</param>
+    /// <param name="programPath">Full path of the program (e.g., "A:\RUNME.EXE") for the environment block.</param>
+    /// <returns>True if loaded successfully.</returns>
+    public bool Load(ReadOnlySpan<byte> data, ushort loadSegment = DefaultLoadSegment, string? programPath = null)
+    {
+        _programPath = programPath;
+
+        if (data.Length < 1)
+            return false;
+
+        // Check for MZ (EXE) header - need at least 2 bytes
+        if (data.Length >= 2 && data[0] == 0x4D && data[1] == 0x5A)
+            return LoadExe(data, loadSegment);
+
+        return LoadCom(data, loadSegment);
+    }
+
+    private string? _programPath;
+
+    /// <summary>
+    /// Load a COM file. COM files are loaded at segment:0100h and
+    /// execution begins at CS:IP = segment:0100h.
+    /// </summary>
+    private bool LoadCom(ReadOnlySpan<byte> data, ushort loadSegment)
+    {
+        if (data.Length > 0xFF00) // COM files max ~64KB
+            return false;
+
+        // Build PSP at segment:0000h
+        BuildPSP(loadSegment);
+
+        // Load program at segment:0100h
+        _mem.LoadData(loadSegment, 0x0100, data);
+
+        // Set up CPU state
+        _cpu.Regs.CS = loadSegment;
+        _cpu.Regs.DS = loadSegment;
+        _cpu.Regs.ES = loadSegment;
+        _cpu.Regs.SS = loadSegment;
+        _cpu.Regs.SP = 0xFFFE; // Stack at top of segment
+        _cpu.Regs.IP = 0x0100; // COM entry point
+
+        // Push 0x0000 onto stack (return address for INT 20h termination)
+        _cpu.Regs.SP -= 2;
+        _mem.WriteWord(loadSegment, _cpu.Regs.SP, 0x0000);
+
+        return true;
+    }
+
+    /// <summary>
+    /// Load an EXE (MZ) file with relocation support.
+    /// </summary>
+    private bool LoadExe(ReadOnlySpan<byte> data, ushort loadSegment)
+    {
+        if (data.Length < 28) return false;
+
+        // Parse MZ header
+        ushort lastPageSize = (ushort)(data[2] | (data[3] << 8));
+        ushort totalPages = (ushort)(data[4] | (data[5] << 8));
+        ushort relocCount = (ushort)(data[6] | (data[7] << 8));
+        ushort headerParagraphs = (ushort)(data[8] | (data[9] << 8));
+        // ushort minAlloc = (ushort)(data[10] | (data[11] << 8));
+        // ushort maxAlloc = (ushort)(data[12] | (data[13] << 8));
+        ushort initSS = (ushort)(data[14] | (data[15] << 8));
+        ushort initSP = (ushort)(data[16] | (data[17] << 8));
+        // ushort checksum = (ushort)(data[18] | (data[19] << 8));
+        ushort initIP = (ushort)(data[20] | (data[21] << 8));
+        ushort initCS = (ushort)(data[22] | (data[23] << 8));
+        ushort relocOffset = (ushort)(data[24] | (data[25] << 8));
+
+        int headerSize = headerParagraphs * 16;
+        int imageSize = totalPages * 512;
+        if (lastPageSize > 0) imageSize -= (512 - lastPageSize);
+        imageSize -= headerSize;
+
+        if (headerSize >= data.Length) return false;
+
+        // Build PSP
+        BuildPSP(loadSegment);
+        ushort codeSegment = (ushort)(loadSegment + 0x10); // Skip PSP (256 bytes = 16 paragraphs)
+
+        // Load program image after PSP
+        var imageData = data.Slice(headerSize, Math.Min(imageSize, data.Length - headerSize));
+        _mem.LoadData(codeSegment, 0x0000, imageData);
+
+        // Apply relocations
+        for (int i = 0; i < relocCount; i++)
+        {
+            int relocAddr = relocOffset + i * 4;
+            if (relocAddr + 4 > data.Length) break;
+
+            ushort relOff = (ushort)(data[relocAddr] | (data[relocAddr + 1] << 8));
+            ushort relSeg = (ushort)(data[relocAddr + 2] | (data[relocAddr + 3] << 8));
+
+            uint physAddr = Registers.PhysicalAddress((ushort)(codeSegment + relSeg), relOff);
+            ushort origVal = _mem.ReadWord(physAddr);
+            _mem.WriteWord(physAddr, (ushort)(origVal + codeSegment));
+        }
+
+        // Set up CPU state
+        _cpu.Regs.CS = (ushort)(codeSegment + initCS);
+        _cpu.Regs.IP = initIP;
+        _cpu.Regs.SS = (ushort)(codeSegment + initSS);
+        _cpu.Regs.SP = initSP;
+        _cpu.Regs.DS = loadSegment;
+        _cpu.Regs.ES = loadSegment;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Build a minimal Program Segment Prefix (PSP) at the given segment.
+    /// Sets up the environment block with environment variables and program pathname
+    /// (DOS 3.0+ format: env strings \0\0 WORD(count) pathname\0).
+    /// </summary>
+    private void BuildPSP(ushort segment)
+    {
+        // Clear PSP area (256 bytes)
+        for (int i = 0; i < 256; i++)
+            _mem.WriteByte(segment, (ushort)i, 0);
+
+        // INT 20h at PSP:0000 (program termination)
+        _mem.WriteByte(segment, 0x0000, 0xCD); // INT
+        _mem.WriteByte(segment, 0x0001, 0x20); // 20h
+
+        // Memory size (top of memory in paragraphs)
+        _mem.WriteWord(segment, 0x0002, 0xA000); // 640KB
+
+        // Far call to DOS dispatcher at PSP:0005
+        _mem.WriteByte(segment, 0x0005, 0xCD); // INT
+        _mem.WriteByte(segment, 0x0006, 0x21); // 21h
+        _mem.WriteByte(segment, 0x0007, 0xCB); // RETF
+
+        // Default DTA at PSP:0080
+        // Command tail length at PSP:0080 = 0 (empty)
+        _mem.WriteByte(segment, 0x0080, 0x00);
+        _mem.WriteByte(segment, 0x0081, 0x0D); // CR terminator
+
+        // Environment segment (point to a small env block)
+        ushort envSegment = (ushort)(segment - 0x10);
+        _mem.WriteWord(segment, 0x002C, envSegment);
+
+        // Build environment block:
+        // 1. Environment strings (null-terminated, ending with double-null)
+        // 2. WORD: string count (DOS 3.0+)
+        // 3. Full program pathname (null-terminated)
+        ushort envOffset = 0;
+
+        // Determine the drive letter for default COMSPEC/PATH from the program path
+        string defaultDrive = "C";
+        if (_programPath != null && _programPath.Length >= 2 && _programPath[1] == ':')
+            defaultDrive = _programPath[..1].ToUpperInvariant();
+
+        // Build environment variables - use caller-provided ones or derive defaults
+        var envVars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (EnvironmentVariables != null && EnvironmentVariables.Count > 0)
+        {
+            foreach (var kv in EnvironmentVariables)
+                envVars[kv.Key] = kv.Value;
+        }
+        // Ensure COMSPEC and PATH are always present
+        if (!envVars.ContainsKey("COMSPEC"))
+            envVars["COMSPEC"] = $"{defaultDrive}:\\COMMAND.COM";
+        if (!envVars.ContainsKey("PATH"))
+            envVars["PATH"] = $"{defaultDrive}:\\";
+
+        // Write all environment variables
+        foreach (var kv in envVars)
+        {
+            string envString = $"{kv.Key}={kv.Value}";
+            byte[] envBytes = System.Text.Encoding.ASCII.GetBytes(envString);
+            _mem.LoadData(envSegment, envOffset, envBytes);
+            envOffset += (ushort)envBytes.Length;
+            _mem.WriteByte(envSegment, envOffset++, 0); // null terminator
+        }
+
+        // Double-null: end of environment strings
+        _mem.WriteByte(envSegment, envOffset++, 0);
+
+        // DOS 3.0+ program pathname: WORD count + pathname
+        string progPath = _programPath ?? "C:\\PROGRAM.EXE";
+        _mem.WriteByte(envSegment, envOffset++, 0x01); // low byte of count (1)
+        _mem.WriteByte(envSegment, envOffset++, 0x00); // high byte of count (0)
+        byte[] pathBytes = System.Text.Encoding.ASCII.GetBytes(progPath.ToUpperInvariant());
+        _mem.LoadData(envSegment, envOffset, pathBytes);
+        envOffset += (ushort)pathBytes.Length;
+        _mem.WriteByte(envSegment, envOffset, 0); // null terminator for pathname
+    }
+
+    /// <summary>
+    /// Set a command line tail in the PSP for the loaded program.
+    /// </summary>
+    public void SetCommandTail(ushort pspSegment, string args)
+    {
+        byte[] bytes = System.Text.Encoding.ASCII.GetBytes(args);
+        int len = Math.Min(bytes.Length, 126);
+        _mem.WriteByte(pspSegment, 0x0080, (byte)len);
+        for (int i = 0; i < len; i++)
+            _mem.WriteByte(pspSegment, (ushort)(0x0081 + i), bytes[i]);
+        _mem.WriteByte(pspSegment, (ushort)(0x0081 + len), 0x0D);
+    }
+}

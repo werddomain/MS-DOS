@@ -1,0 +1,787 @@
+@page "/"
+@using MsDos.Core
+@using MsDos.Core.Dos
+@using MsDos.Core.Memory
+@using MsDos.Core.Platform
+@using MsDos.Blazor.Platform
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div class="dos-emulator">
+    <div class="toolbar">
+        <h3>MS-DOS Emulator (.NET WebAssembly)</h3>
+        <div class="controls">
+            <button class="btn @(_poweredOn ? "btn-danger" : "btn-success")" @onclick="OnTogglePower">
+                @(_poweredOn ? "⏻ Power Off" : "⏻ Power On")
+            </button>
+            <label class="btn btn-secondary">
+                Load Binary
+                <InputFile OnChange="OnFileSelected" accept=".com,.exe,.COM,.EXE" style="display:none" />
+            </label>
+            <label class="btn btn-secondary">
+                Upload File
+                <InputFile OnChange="OnUploadFile" accept="*" style="display:none" />
+            </label>
+            <button class="btn btn-secondary" @onclick="OnDownloadFile">Download File</button>
+            <label class="btn btn-secondary">
+                Import C:
+                <InputFile OnChange="OnImportCDrive" accept=".img,.raw,.ima,.dsk,.IMG,.RAW,.IMA,.DSK" style="display:none" />
+            </label>
+            <button class="btn btn-secondary" @onclick="OnExportCDrive">Export C:</button>
+            <button class="btn btn-primary" @onclick="OnStartShell" disabled="@(_running)">Shell</button>
+            <button class="btn btn-primary" @onclick="OnReset" disabled="@(!_loaded && !_running)">Reset</button>
+            <button class="btn btn-danger" @onclick="OnStop" disabled="@(!_running)">Stop</button>
+        </div>
+    </div>
+
+    @* ── Floppy Drive Panel ── *@
+    <div class="floppy-panel">
+        @* Drive A: (explicit — no foreach to avoid InputFile closure issues) *@
+        <div class="floppy-slot">
+            <div class="floppy-led @(_slotAWriting ? "led-write" : _slotAReading ? "led-read" : _slotAHasDisk ? "led-idle" : "led-off")"></div>
+            <span class="floppy-label">A: [@_slotALabel]</span>
+            <select class="floppy-type" @onchange="(e) => OnDriveTypeChanged('A', e)">
+                <option selected>1.44 MB</option>
+                <option>720 KB</option>
+                <option>1.2 MB</option>
+                <option>360 KB</option>
+            </select>
+            <label class="btn btn-sm btn-green">
+                Insert
+                <InputFile OnChange="OnInsertFloppyA" accept=".img,.raw,.ima,.dsk" style="display:none" />
+            </label>
+            <button class="btn btn-sm btn-orange" disabled="@(!_slotAHasDisk)" @onclick="() => OnEjectFloppy('A')">Eject</button>
+            <button class="btn btn-sm btn-blue" disabled="@(!_slotAHasDisk)" @onclick="() => OnSaveFloppy('A')">Save</button>
+            <button class="btn btn-sm" @onclick="() => OnInsertBlankFloppy('A')">Blank</button>
+        </div>
+        @* Drive B: *@
+        <div class="floppy-slot">
+            <div class="floppy-led @(_slotBWriting ? "led-write" : _slotBReading ? "led-read" : _slotBHasDisk ? "led-idle" : "led-off")"></div>
+            <span class="floppy-label">B: [@_slotBLabel]</span>
+            <select class="floppy-type" @onchange="(e) => OnDriveTypeChanged('B', e)">
+                <option selected>1.44 MB</option>
+                <option>720 KB</option>
+                <option>1.2 MB</option>
+                <option>360 KB</option>
+            </select>
+            <label class="btn btn-sm btn-green">
+                Insert
+                <InputFile OnChange="OnInsertFloppyB" accept=".img,.raw,.ima,.dsk" style="display:none" />
+            </label>
+            <button class="btn btn-sm btn-orange" disabled="@(!_slotBHasDisk)" @onclick="() => OnEjectFloppy('B')">Eject</button>
+            <button class="btn btn-sm btn-blue" disabled="@(!_slotBHasDisk)" @onclick="() => OnSaveFloppy('B')">Save</button>
+            <button class="btn btn-sm" @onclick="() => OnInsertBlankFloppy('B')">Blank</button>
+        </div>
+    </div>
+
+    <div class="screen-container" @onkeydown="OnKeyDown" @onkeyup="OnKeyUp"
+         @onkeydown:preventDefault @onkeyup:preventDefault tabindex="0" @ref="_containerRef">
+        <canvas id="dosCanvas" width="640" height="400"></canvas>
+    </div>
+
+    @* ── Virtual Keyboard Toggle + Panel ── *@
+    <div class="vkb-toggle-bar">
+        <button class="btn btn-sm @(_showVirtualKeyboard ? "btn-active" : "")" @onclick="() => _showVirtualKeyboard = !_showVirtualKeyboard">
+            ⌨ Virtual Keyboard
+        </button>
+        <button class="btn btn-sm" @onclick="OnEnterBiosSetup" disabled="@(!_poweredOn)">
+            ⚙ BIOS Setup
+        </button>
+        <label class="btn btn-sm btn-secondary">
+            Load BIOS ROM
+            <InputFile OnChange="OnLoadBiosRom" accept=".bin,.rom,.BIN,.ROM" style="display:none" />
+        </label>
+    </div>
+    @if (_showVirtualKeyboard && _machine != null)
+    {
+        <VirtualKeyboardPanel Keyboard="_machine.VirtualKbd" />
+    }
+
+    <div class="status-bar">
+        <div class="activity-leds">
+            <span class="activity-led @(_hddActive ? "led-hdd-active" : "led-off")" title="HDD">● HDD</span>
+            <span class="activity-led @(_cpuActive ? "led-cpu-active" : "led-off")" title="CPU">● CPU</span>
+        </div>
+        <span>@_statusText</span>
+        @if (_biosWaitPending)
+        {
+            <span class="status-wait">BIOS WAIT…</span>
+        }
+    </div>
+
+    @* ── Debug Toolbar ── *@
+    <div class="debug-toolbar">
+        <label class="debug-toggle">
+            <input type="checkbox" @bind="_manualClock" @bind:event="onchange" @bind:after="OnManualClockToggle" />
+            Manual Clock
+        </label>
+        <button class="btn btn-sm" disabled="@(!_manualClock)" @onclick="OnStepClick">Step (F10)</button>
+        <label class="debug-toggle">
+            <input type="checkbox" @bind="_traceEnabled" @bind:event="onchange" @bind:after="OnTraceToggle" />
+            Trace
+        </label>
+        <select class="log-level-select" @onchange="OnLogLevelChanged">
+            <option>Trace</option>
+            <option>Debug</option>
+            <option selected>Info</option>
+            <option>Warning</option>
+            <option>Error</option>
+        </select>
+        <button class="btn btn-sm" @onclick="ClearLog">Clear Log</button>
+        <div class="debug-tab-buttons">
+            <button class="btn btn-sm @(_activeDebugTab == 0 ? "active-tab" : "")" @onclick="() => _activeDebugTab = 0">Log</button>
+            <button class="btn btn-sm @(_activeDebugTab == 1 ? "active-tab" : "")" @onclick="() => _activeDebugTab = 1">Memory</button>
+        </div>
+    </div>
+
+    @* ── Log / Memory Panel ── *@
+    @if (_activeDebugTab == 0)
+    {
+        <div class="log-panel">
+            <div class="log-content" id="logContent">
+                @foreach (var entry in _logEntries.TakeLast(100))
+                {
+                    <div class="log-@entry.Level.ToString().ToLower()">@entry</div>
+                }
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="memory-panel">
+            <div class="register-bar">@_registerText</div>
+            <div class="memory-content">
+                @if (_memoryDiffHtml != null)
+                {
+                    @((MarkupString)_memoryDiffHtml)
+                }
+                else
+                {
+                    <span class="mem-muted">Enable Manual Clock and press Step to see memory diffs</span>
+                }
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    private ElementReference _containerRef;
+    private DosMachine? _machine;
+    private BlazorCanvasRenderer? _renderer;
+    private BlazorEventRegistry? _events;
+    private BlazorStreamProvider? _streams;
+    private CancellationTokenSource? _cts;
+    private CancellationTokenSource? _uiPumpCts;
+    private Task? _uiPumpTask;
+    private bool _loaded;
+    private bool _running;
+    private string _statusText = "Ready - Upload a COM/EXE file or start Shell";
+    private readonly List<LogEntry> _logEntries = new();
+
+    // Floppy drive state
+    private string _slotALabel = "Empty";
+    private string _slotBLabel = "Empty";
+    private bool _slotAReading, _slotAWriting, _slotAHasDisk;
+    private bool _slotBReading, _slotBWriting, _slotBHasDisk;
+
+    // Activity LED state
+    private bool _hddActive;
+    private bool _cpuActive;
+    private bool _poweredOn;
+
+    // Debug state
+    private bool _manualClock;
+    private bool _traceEnabled;
+    private int _activeDebugTab;
+    private string _registerText = "Registers: (load a program to see register state)";
+    private string? _memoryDiffHtml;
+    private bool _biosWaitPending;
+
+    // Virtual keyboard / BIOS state
+    private bool _showVirtualKeyboard;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await JS.InvokeVoidAsync("dosRenderer.init", "dosCanvas");
+            InitializeMachine();
+            StartUiWaitPump();
+            await _containerRef.FocusAsync();
+        }
+    }
+
+    private void StartUiWaitPump()
+    {
+        _uiPumpCts?.Cancel();
+        _uiPumpCts = new CancellationTokenSource();
+        var token = _uiPumpCts.Token;
+
+        _uiPumpTask = UiWaitPumpLoopAsync(token);
+    }
+
+    private async Task UiWaitPumpLoopAsync(CancellationToken token)
+    {
+        var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(token))
+            {
+                _machine?.PumpBiosWaitFromHostClock();
+                _machine?.PumpActivityLeds();
+
+                bool pending = _machine?.IsBiosWaitPending == true;
+                if (pending != _biosWaitPending)
+                {
+                    _biosWaitPending = pending;
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown
+        }
+        finally
+        {
+            timer.Dispose();
+        }
+    }
+
+    private void InitializeMachine()
+    {
+        _renderer = new BlazorCanvasRenderer(JS);
+        _events = new BlazorEventRegistry();
+        _streams = new BlazorStreamProvider();
+
+        _machine = new DosMachine(_renderer, _events, _streams);
+        _machine.OnProcessExit += code =>
+        {
+            _running = false;
+            _statusText = $"Process exited with code {code}";
+            InvokeAsync(StateHasChanged);
+        };
+        _machine.Log.EntryAdded += entry =>
+        {
+            _logEntries.Add(entry);
+            if (_logEntries.Count > 500)
+                _logEntries.RemoveAt(0);
+            if (entry.Level >= LogLevel.Warning)
+            {
+                _statusText = entry.ToString();
+                InvokeAsync(StateHasChanged);
+            }
+        };
+        _machine.OnManualStep += diff =>
+        {
+            InvokeAsync(() =>
+            {
+                UpdateMemoryDiffView(diff);
+                StateHasChanged();
+            });
+        };
+
+        // Wire floppy activity
+        _machine.Floppy.SlotA.ActivityChanged += slot =>
+            InvokeAsync(() => { _slotAReading = slot.IsReading; _slotAWriting = slot.IsWriting; StateHasChanged(); });
+        _machine.Floppy.SlotB.ActivityChanged += slot =>
+            InvokeAsync(() => { _slotBReading = slot.IsReading; _slotBWriting = slot.IsWriting; StateHasChanged(); });
+        _machine.Floppy.SlotA.DiskChanged += slot =>
+            InvokeAsync(() => { _slotAHasDisk = slot.HasDisk; _slotALabel = slot.DiskLabel ?? "Empty"; StateHasChanged(); });
+        _machine.Floppy.SlotB.DiskChanged += slot =>
+            InvokeAsync(() => { _slotBHasDisk = slot.HasDisk; _slotBLabel = slot.DiskLabel ?? "Empty"; StateHasChanged(); });
+
+        // Wire HDD / CPU activity LEDs
+        _machine.OnDiskActivity += active =>
+            InvokeAsync(() => { _hddActive = active; StateHasChanged(); });
+        _machine.OnCpuActivity += active =>
+            InvokeAsync(() => { _cpuActive = active; StateHasChanged(); });
+        _machine.OnPowerStateChanged += powered =>
+            InvokeAsync(() => { _poweredOn = powered; StateHasChanged(); });
+
+        _machine.Reset();
+    }
+
+    // ── Memory diff rendering (git-diff style) ──
+    private void UpdateMemoryDiffView(MemoryDiff diff)
+    {
+        var rb = diff.RegistersBefore;
+        var ra = diff.RegistersAfter;
+        string RD(string n, ushort b, ushort a) => b != a ? $"<span class='reg-changed'>{n}:{b:X4}→{a:X4}</span>" : $"{n}:{a:X4}";
+        _registerText = ""; // use HTML instead
+        var regHtml = $"{RD("AX",rb.AX,ra.AX)} {RD("BX",rb.BX,ra.BX)} {RD("CX",rb.CX,ra.CX)} {RD("DX",rb.DX,ra.DX)} " +
+                      $"{RD("SI",rb.SI,ra.SI)} {RD("DI",rb.DI,ra.DI)} {RD("SP",rb.SP,ra.SP)} {RD("BP",rb.BP,ra.BP)} " +
+                      $"{RD("CS",rb.CS,ra.CS)} {RD("DS",rb.DS,ra.DS)} {RD("ES",rb.ES,ra.ES)} {RD("SS",rb.SS,ra.SS)} " +
+                      $"{RD("IP",rb.IP,ra.IP)} {RD("FL",rb.Flags,ra.Flags)}";
+
+        var changedAddrs = new HashSet<uint>(diff.Changes.Select(c => c.Address));
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"<div class='register-line'>{regHtml}</div>");
+
+        int bytesPerLine = 16;
+        for (int offset = 0; offset < diff.After.Length; offset += bytesPerLine)
+        {
+            uint addr = diff.After.StartAddress + (uint)offset;
+            sb.Append($"<span class='mem-addr'>{addr:X5}</span>  ");
+            for (int i = 0; i < bytesPerLine && offset + i < diff.After.Length; i++)
+            {
+                uint ba = addr + (uint)i;
+                byte val = diff.After.Data[offset + i];
+                if (changedAddrs.Contains(ba))
+                {
+                    byte ov = diff.Before.Data[offset + i];
+                    sb.Append($"<span class='mem-old'>{ov:X2}</span><span class='mem-new'>→{val:X2}</span> ");
+                }
+                else
+                    sb.Append($"<span class='mem-byte'>{val:X2}</span> ");
+            }
+            sb.Append(" ");
+            for (int i = 0; i < bytesPerLine && offset + i < diff.After.Length; i++)
+            {
+                byte val = diff.After.Data[offset + i];
+                char c = (val >= 0x20 && val < 0x7F) ? (char)val : '.';
+                uint ba = addr + (uint)i;
+                if (changedAddrs.Contains(ba))
+                    sb.Append($"<span class='mem-ascii-changed'>{System.Net.WebUtility.HtmlEncode(c.ToString())}</span>");
+                else
+                    sb.Append($"<span class='mem-ascii'>{System.Net.WebUtility.HtmlEncode(c.ToString())}</span>");
+            }
+            sb.Append("<br/>");
+        }
+        _memoryDiffHtml = sb.ToString();
+        _activeDebugTab = 1; // switch to memory tab
+    }
+
+    // ── Floppy drive operations ──
+    // Dedicated handlers for A: and B: to avoid InputFile closure issues in loops
+    private Task OnInsertFloppyA(InputFileChangeEventArgs e) => OnInsertFloppy('A', e);
+    private Task OnInsertFloppyB(InputFileChangeEventArgs e) => OnInsertFloppy('B', e);
+
+    private async Task OnInsertFloppy(char drive, InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            bool ok = _machine!.InsertFloppyDisk(drive, data, file.Name);
+            _statusText = ok ? $"Disk inserted into {drive}: ({file.Name})" : $"Failed to load disk image into {drive}";
+            // Explicitly update slot display state (don't rely only on async DiskChanged event)
+            if (ok)
+            {
+                if (drive == 'A') { _slotAHasDisk = true; _slotALabel = file.Name; }
+                else { _slotBHasDisk = true; _slotBLabel = file.Name; }
+            }
+            StateHasChanged();
+        }
+        catch (Exception ex) { _statusText = $"Error: {ex.Message}"; }
+    }
+
+    private async Task OnEjectFloppy(char drive)
+    {
+        var data = _machine?.EjectFloppyDisk(drive);
+        _statusText = $"Disk ejected from {drive}";
+        // Explicitly clear slot display state
+        if (drive == 'A') { _slotAHasDisk = false; _slotALabel = "Empty"; }
+        else { _slotBHasDisk = false; _slotBLabel = "Empty"; }
+        StateHasChanged();
+    }
+
+    private async Task OnSaveFloppy(char drive)
+    {
+        var data = _machine?.SaveFloppyState(drive);
+        if (data != null)
+        {
+            var base64 = Convert.ToBase64String(data);
+            await JS.InvokeVoidAsync("dosRenderer.downloadFile", $"drive_{char.ToLower(drive)}.img", base64);
+            _statusText = $"Drive {drive}: saved";
+        }
+    }
+
+    private void OnDriveTypeChanged(char drive, ChangeEventArgs e)
+    {
+        if (_machine == null) return;
+        var diskType = (e.Value?.ToString()) switch
+        {
+            "720 KB" => FloppyDiskType.Floppy720K,
+            "1.2 MB" => FloppyDiskType.Floppy1200K,
+            "360 KB" => FloppyDiskType.Floppy360K,
+            _ => FloppyDiskType.Floppy1440K,
+        };
+        _machine.Floppy.SetDiskType(drive, diskType);
+    }
+
+    private void OnInsertBlankFloppy(char drive)
+    {
+        if (_machine == null) return;
+
+        // Default to 1.44MB; ideally pick from the drive type selector
+        var diskType = _machine.Floppy.GetSlot(drive)?.DiskType ?? FloppyDiskType.Floppy1440K;
+        bool ok = _machine.InsertBlankFloppyDisk(drive, diskType);
+        if (ok)
+        {
+            _statusText = $"Blank {diskType} disk inserted into {drive}:";
+            // Update floppy slot display state
+            if (drive == 'A') { _slotAHasDisk = true; _slotALabel = "Blank Floppy"; }
+            else { _slotBHasDisk = true; _slotBLabel = "Blank Floppy"; }
+        }
+        else
+        {
+            _statusText = $"Failed to create blank disk for {drive}:";
+        }
+        StateHasChanged();
+    }
+
+    // ── Power On/Off ──
+    private async Task OnTogglePower()
+    {
+        if (_machine == null) return;
+
+        if (_machine.IsPoweredOn)
+        {
+            _cts?.Cancel();
+            _machine.PowerOff();
+            _running = false;
+            _statusText = "Power OFF — insert a floppy and press Power On";
+            StateHasChanged();
+        }
+        else
+        {
+            _cts?.Cancel();
+            _cts = new CancellationTokenSource();
+            _running = true;
+            _loaded = true;
+            _statusText = "Power ON — booting...";
+            StateHasChanged();
+
+            await _containerRef.FocusAsync();
+
+            try
+            {
+                await _machine.PowerOnAsync(_cts.Token);
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                _running = false;
+                StateHasChanged();
+            }
+        }
+    }
+
+    // ── File Upload / Download ──
+    private async Task OnUploadFile(InputFileChangeEventArgs e)
+    {
+        if (_machine == null) return;
+        var file = e.File;
+        if (file == null) return;
+
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+
+            // Upload to the current active drive (prefer A: if mounted, else C:)
+            var drives = _machine.GetMountedDrives();
+            char targetDrive = drives.Contains('A') ? 'A' : 'C';
+
+            string? dosName = await _machine.UploadFileToDriveAsync(targetDrive, file.Name, data);
+            _statusText = dosName != null
+                ? $"Uploaded '{file.Name}' → '{dosName}' to {targetDrive}:"
+                : $"Failed to upload file to {targetDrive}:";
+            StateHasChanged();
+        }
+        catch (Exception ex) { _statusText = $"Upload error: {ex.Message}"; }
+    }
+
+    private async Task OnDownloadFile()
+    {
+        if (_machine == null) return;
+
+        // Get first available drive
+        var drives = _machine.GetMountedDrives();
+        if (drives.Count == 0) { _statusText = "No drives mounted"; return; }
+
+        char drive = drives[0];
+        var files = await _machine.ListDriveFilesAsync(drive);
+        if (files == null || files.Count == 0)
+        {
+            _statusText = $"No files on {drive}:";
+            StateHasChanged();
+            return;
+        }
+
+        // Prompt user for which file to download
+        string fileList = string.Join(", ", files);
+        string filename = await JS.InvokeAsync<string>("prompt",
+            $"Enter filename to download from {drive}: (available: {fileList}):", files[0]);
+
+        if (string.IsNullOrWhiteSpace(filename))
+        {
+            _statusText = "Download cancelled";
+            StateHasChanged();
+            return;
+        }
+
+        byte[]? data = await _machine.DownloadFileFromDriveAsync(drive, filename.Trim());
+        if (data != null)
+        {
+            var base64 = Convert.ToBase64String(data);
+            await JS.InvokeVoidAsync("dosRenderer.downloadFile", filename.Trim(), base64);
+            _statusText = $"Downloaded '{filename.Trim()}' from {drive}: ({data.Length} bytes)";
+        }
+        else
+        {
+            _statusText = $"File '{filename.Trim()}' not found on {drive}:";
+        }
+        StateHasChanged();
+    }
+
+    // ── Debug controls ──
+    private void OnManualClockToggle()
+    {
+        if (_machine == null) return;
+        _machine.ManualClockMode = _manualClock;
+        _statusText = _manualClock ? "Manual clock — press Step to execute" : "Automatic clock";
+    }
+
+    private void OnStepClick()
+    {
+        if (_machine == null || !_manualClock) return;
+        _machine.StepInstruction();
+    }
+
+    private void OnTraceToggle()
+    {
+        if (_machine == null) return;
+        _machine.Log.TraceInstructions = _traceEnabled;
+        if (_traceEnabled)
+            _machine.Log.MinLevel = LogLevel.Trace;
+    }
+
+    private void OnLogLevelChanged(ChangeEventArgs e)
+    {
+        if (_machine == null) return;
+        _machine.Log.MinLevel = (e.Value?.ToString()) switch
+        {
+            "Trace" => LogLevel.Trace,
+            "Debug" => LogLevel.Debug,
+            "Warning" => LogLevel.Warning,
+            "Error" => LogLevel.Error,
+            _ => LogLevel.Info,
+        };
+    }
+
+    // ── File operations ──
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        try
+        {
+            _cts?.Cancel();
+
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            string fileName = file.Name.ToUpperInvariant();
+
+            await _streams!.ImportBinaryAsync(fileName, data);
+
+            bool loaded = _machine!.LoadBinary(data);
+            if (!loaded)
+            {
+                _statusText = "Failed to load binary. Unsupported format.";
+                return;
+            }
+
+            _loaded = true;
+            _running = true;
+            _statusText = $"Running: {fileName}";
+            StateHasChanged();
+
+            _cts = new CancellationTokenSource();
+            await _containerRef.FocusAsync();
+
+            try
+            {
+                await _machine.RunAsync(_cts.Token);
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                _running = false;
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error: {ex.Message}";
+        }
+    }
+
+    private void OnReset()
+    {
+        _cts?.Cancel();
+        _machine?.Reset();
+        _running = false;
+
+        // Show which drives are still attached after reset
+        var drives = _machine?.GetMountedDrives();
+        if (drives != null && drives.Count > 1) // More than just default C:
+        {
+            var driveList = string.Join(", ", drives.Select(c => $"{c}:"));
+            _statusText = $"Machine reset - Drives still attached: {driveList}";
+        }
+        else
+        {
+            _statusText = "Machine reset - Upload a file or start Shell";
+        }
+    }
+
+    private async Task OnStartShell()
+    {
+        try
+        {
+            _cts?.Cancel();
+
+            // Only initialize the machine if it doesn't exist yet;
+            // preserve existing machine (and its mounted disks) on subsequent calls
+            if (_machine == null)
+            {
+                InitializeMachine();
+            }
+
+            await JS.InvokeVoidAsync("dosRenderer.init", "dosCanvas");
+
+            _running = true;
+            _loaded = true;
+            _statusText = "Shell running (COMMAND.COM)";
+            StateHasChanged();
+
+            _cts = new CancellationTokenSource();
+            await _containerRef.FocusAsync();
+
+            try
+            {
+                // RunShellAsync calls Reset() internally, which preserves mounted drives
+                await _machine!.RunShellAsync(_cts.Token);
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                _running = false;
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error: {ex.Message}";
+        }
+    }
+
+    private void OnStop()
+    {
+        _cts?.Cancel();
+        _machine?.Stop();
+        _running = false;
+        _statusText = "Stopped";
+    }
+
+    private async Task OnImportCDrive(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 10 * 1024 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            bool mounted = _machine!.MountDiskImage('C', data);
+            _statusText = mounted
+                ? $"C: drive loaded from {file.Name}"
+                : "Failed to load disk image as C: drive";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error: {ex.Message}";
+        }
+    }
+
+    private async Task OnExportCDrive()
+    {
+        try
+        {
+            _statusText = "Exporting C: drive...";
+            StateHasChanged();
+            byte[] image = await MsDos.Core.Dos.DiskImageWriter.ExportDriveAsImageAsync(_streams!, _machine!.Log);
+            var base64 = Convert.ToBase64String(image);
+            await JS.InvokeVoidAsync("dosRenderer.downloadFile", "drive_c.img", base64);
+            _statusText = "C: drive exported as drive_c.img";
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            _statusText = $"Error exporting: {ex.Message}";
+        }
+    }
+
+    private void ClearLog()
+    {
+        _logEntries.Clear();
+        _machine?.Log.Clear();
+    }
+
+    private void OnEnterBiosSetup()
+    {
+        _machine?.EnterBiosSetup();
+    }
+
+    private async Task OnLoadBiosRom(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        try
+        {
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(maxAllowedSize: 256 * 1024).CopyToAsync(ms);
+            byte[] data = ms.ToArray();
+            _machine?.LoadBiosRom(data);
+            _statusText = $"BIOS ROM loaded: {file.Name} ({data.Length} bytes) — active on next boot";
+            StateHasChanged();
+        }
+        catch (Exception ex) { _statusText = $"Error loading BIOS ROM: {ex.Message}"; }
+    }
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        // F10 = step in manual mode
+        if (e.Key == "F10" && _manualClock)
+        {
+            _machine?.StepInstruction();
+            return;
+        }
+        _events?.OnKeyDown(e.Key, e.Code, e.ShiftKey, e.CtrlKey, e.AltKey);
+    }
+
+    private void OnKeyUp(KeyboardEventArgs e)
+    {
+        _events?.OnKeyUp(e.Key, e.Code, e.ShiftKey, e.CtrlKey, e.AltKey);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _uiPumpCts?.Cancel();
+        if (_uiPumpTask != null)
+        {
+            try { await _uiPumpTask; } catch (OperationCanceledException) { }
+        }
+        _cts?.Cancel();
+        _machine?.Stop();
+    }
+}
